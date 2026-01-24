@@ -1,4 +1,4 @@
-# NetApp ONTAP SAN/iSCSI 儲存外掛程式 - Proxmox VE 專用
+# NetApp ONTAP SAN/iSCSI Storage Plugin for Proxmox VE
 
 **[English](README.md)** | **[繁體中文](README_zh-TW.md)**
 

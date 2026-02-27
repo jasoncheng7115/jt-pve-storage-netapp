@@ -1,0 +1,162 @@
+#!/bin/bash
+set -e
+
+# Marker comment to identify our configuration
+MULTIPATH_MARKER_BEGIN="# BEGIN jt-pve-storage-netapp"
+MULTIPATH_MARKER_END="# END jt-pve-storage-netapp"
+MULTIPATH_CONF="/etc/multipath.conf"
+
+# Function to add NetApp multipath configuration
+add_netapp_multipath_config() {
+    # Ensure /etc exists (should always exist, but be safe)
+    if [ ! -d "/etc" ]; then
+        echo "ERROR: /etc directory does not exist!"
+        return 1
+    fi
+
+    # Check if our configuration already exists
+    if [ -f "$MULTIPATH_CONF" ] && grep -q "$MULTIPATH_MARKER_BEGIN" "$MULTIPATH_CONF" 2>/dev/null; then
+        echo "NetApp multipath configuration already exists in $MULTIPATH_CONF"
+        return 0
+    fi
+
+    # Check if any NetApp device configuration already exists (manual setup)
+    if [ -f "$MULTIPATH_CONF" ] && grep -q 'vendor.*"NETAPP"' "$MULTIPATH_CONF" 2>/dev/null; then
+        echo "Existing NetApp configuration found in $MULTIPATH_CONF, skipping auto-configuration."
+        echo "Note: Manual configuration will be preserved."
+        return 0
+    fi
+
+    echo "Adding NetApp multipath configuration to $MULTIPATH_CONF..."
+
+    # Create backup if file exists
+    if [ -f "$MULTIPATH_CONF" ]; then
+        cp "$MULTIPATH_CONF" "${MULTIPATH_CONF}.bak.$(date +%Y%m%d%H%M%S)"
+        echo "Backup created: ${MULTIPATH_CONF}.bak.$(date +%Y%m%d%H%M%S)"
+    fi
+
+    # If multipath.conf doesn't exist, create with defaults
+    if [ ! -f "$MULTIPATH_CONF" ]; then
+        echo "Creating new $MULTIPATH_CONF..."
+        cat > "$MULTIPATH_CONF" << 'DEFAULTS_EOF'
+# Multipath configuration file
+# Created by jt-pve-storage-netapp package
+
+defaults {
+    user_friendly_names yes
+    find_multipaths yes
+}
+
+DEFAULTS_EOF
+    fi
+
+    # Add our configuration
+    cat >> "$MULTIPATH_CONF" << 'EOF'
+
+# BEGIN jt-pve-storage-netapp
+# NetApp ONTAP device configuration
+# Added automatically by jt-pve-storage-netapp package
+# This section will be removed when the package is purged
+devices {
+    device {
+        vendor "NETAPP"
+        product "LUN"
+        path_grouping_policy group_by_prio
+        path_selector "queue-length 0"
+        path_checker tur
+        features "3 queue_if_no_path pg_init_retries 50"
+        hardware_handler "1 alua"
+        prio alua
+        failback immediate
+        rr_weight uniform
+        rr_min_io_rq 1
+        dev_loss_tmo infinity
+    }
+}
+# END jt-pve-storage-netapp
+EOF
+
+    echo "NetApp multipath configuration added successfully."
+
+    # Reload multipathd if running
+    if systemctl is-active --quiet multipathd 2>/dev/null; then
+        echo "Reloading multipathd configuration..."
+        timeout 10 multipathd reconfigure 2>/dev/null || true
+    else
+        echo "Note: multipathd is not running. Start it with: systemctl start multipathd"
+    fi
+
+    return 0
+}
+
+case "$1" in
+    configure)
+        echo "=============================================="
+        echo "NetApp ONTAP Storage Plugin for Proxmox VE"
+        echo "=============================================="
+        echo ""
+
+        # Add NetApp multipath configuration
+        add_netapp_multipath_config
+        echo ""
+
+        echo "To add storage, use:"
+        echo ""
+        echo "  pvesm add netappontap <storage-id> \\"
+        echo "    --ontap-portal <ontap-mgmt-ip> \\"
+        echo "    --ontap-svm <svm-name> \\"
+        echo "    --ontap-aggregate <aggregate-name> \\"
+        echo "    --ontap-username <api-user> \\"
+        echo "    --ontap-password <api-password> \\"
+        echo "    --content images --shared 1"
+        echo ""
+
+        # Ensure required services are enabled (with timeout to prevent hang)
+        echo "Checking required services..."
+
+        if timeout 5 systemctl is-active --quiet iscsid 2>/dev/null; then
+            echo "  [OK] iSCSI initiator daemon (iscsid) is running."
+        else
+            echo "  [WARN] iscsid is not running. Starting..."
+            timeout 10 systemctl enable iscsid 2>/dev/null || true
+            timeout 10 systemctl start iscsid 2>/dev/null || echo "  [FAIL] Could not start iscsid"
+        fi
+
+        if timeout 5 systemctl is-active --quiet multipathd 2>/dev/null; then
+            echo "  [OK] Multipath daemon (multipathd) is running."
+        else
+            echo "  [WARN] multipathd is not running. Starting..."
+            timeout 10 systemctl enable multipathd 2>/dev/null || true
+            timeout 10 systemctl start multipathd 2>/dev/null || echo "  [FAIL] Could not start multipathd"
+        fi
+
+        # Restart PVE services to load the new storage plugin
+        echo "Restarting PVE services to load plugin..."
+        if timeout 30 systemctl restart pvedaemon 2>/dev/null; then
+            echo "  [OK] pvedaemon restarted."
+        else
+            echo "  [WARN] Could not restart pvedaemon. Please run: systemctl restart pvedaemon"
+        fi
+
+        if timeout 30 systemctl restart pveproxy 2>/dev/null; then
+            echo "  [OK] pveproxy restarted."
+        else
+            echo "  [WARN] Could not restart pveproxy. Please run: systemctl restart pveproxy"
+        fi
+
+        echo ""
+        echo "Installation complete."
+        echo "See /usr/share/doc/jt-pve-storage-netapp/ for documentation."
+        echo "=============================================="
+        ;;
+    abort-upgrade|abort-remove|abort-deconfigure)
+        ;;
+    *)
+        echo "postinst called with unknown argument \`$1'" >&2
+        exit 1
+        ;;
+esac
+
+#DEBHELPER#
+
+exit 0

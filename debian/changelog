@@ -1,0 +1,278 @@
+jt-pve-storage-netapp (0.1.9-1) stable; urgency=medium
+
+  * Safety Audit Release - Security & Reliability Fixes
+  * Requirements: Proxmox VE 9.1 or later
+  * Critical Security Fixes:
+    - Fixed command injection vulnerability in Multipath.pm is_device_in_use()
+      (shell-form system() replaced with list-form, device path untainted)
+    - Fixed IPC::Open3 deadlock in both ISCSI.pm and Multipath.pm _run_cmd()
+      (sequential read replaced with IO::Select non-blocking I/O)
+    - Fixed zombie processes on _run_cmd() timeout (child process now killed)
+    - Fixed $@ clobbering in alloc_image error paths (cleanup eval overwrote
+      original error message)
+  * Data Integrity Fixes:
+    - Snapshot rollback now checks device in-use status and flushes buffers
+      before ONTAP rollback to prevent data corruption
+    - Removed unsafe WWID substring matching in get_multipath_device() that
+      could return wrong device on partial WWID collisions
+    - Fixed clone_image disk ID race condition with retry loop and ONTAP
+      volume existence check
+    - Fixed glob() metacharacter injection in device serial lookups
+      (ISCSI.pm wait_for_device, get_device_by_serial, Multipath.pm
+      get_device_by_wwid)
+    - Fixed regex injection in _find_multipath_device() serial matching
+  * Reliability Improvements:
+    - Temp clone state file now uses flock() for concurrent access safety
+    - activate_storage now detects and reports portal connection failures
+      instead of silently continuing
+    - list_images wraps per-volume snapshot_get in eval to prevent one
+      volume failure from breaking entire listing
+    - lun_unmap_all collects all errors and warns instead of dying on first
+    - free_image now warns on LUN delete failure instead of silently ignoring
+    - deactivate_volume checks sync/flushbufs return codes
+    - FC rescan adds proper error handling on open/opendir calls
+  * Online Resize Support:
+    - volume_resize now supports online resize (removed VM-must-be-stopped
+      restriction), uses 64MB overhead, triggers device rescan when running
+  * Renamed SG_INVERT constant to SG_INQ in Multipath.pm
+  * Documentation:
+    - README_zh-TW.md synced with English README (added Module Architecture,
+      PVE Version Upgrade Compatibility, additional Troubleshooting sections)
+    - Updated disk resize documentation to reflect online resize support
+
+ -- Jason Cheng (Jason Tools) <jason@jason.tools>  Thu, 27 Feb 2026 00:00:00 +0800
+
+jt-pve-storage-netapp (0.1.8-1) stable; urgency=medium
+
+  * Bug Fix Release - FC SAN & General Fixes
+  * Requirements: Proxmox VE 9.1 or later
+  * Critical Bug Fixes:
+    - Fixed is_fc_available() always returning true when /sys/class/fc_host
+      exists but no valid FC HBA present (arrayref vs array comparison)
+    - Added missing lun_unmap_all() method in API.pm - temporary FlexClone
+      LUN mappings were never cleaned up, causing ONTAP mapping accumulation
+    - Fixed deactivate_storage logout_target() call passing wrong parameters
+      (hashref instead of address/target args), iSCSI target logout was
+      silently failing on storage deactivation
+  * FC SAN Improvements:
+    - clone_image now filters igroups by protocol type, preventing
+      cross-protocol LUN mapping errors in mixed FC/iSCSI environments
+    - Eliminated redundant SCSI host rescans in FC paths - rescan_fc_hosts()
+      already includes SCSI host scanning internally, reducing unnecessary
+      latency in activate_volume, path, snapshot_rollback, and snapshot_path
+  * Code Quality:
+    - Removed shadowed $protocol variable declaration in _get_snapshot_path()
+
+ -- Jason Cheng (Jason Tools) <jason@jason.tools>  Wed, 12 Feb 2026 00:00:00 +0800
+
+jt-pve-storage-netapp (0.1.7-1) stable; urgency=medium
+
+  * RAM Snapshot (vmstate) Support Release
+  * Requirements: Proxmox VE 9.1 or later
+  * New Feature: RAM Snapshot ("Include RAM" option) Support
+    - Full support for VM snapshots with RAM state
+    - Allocates vm-{vmid}-state-{snapname} volumes for RAM state storage
+    - Works with both iSCSI and FC protocols
+    - Enables full VM state preservation during snapshots
+  * New Feature: Automatic Multipath Configuration
+    - postinst: Automatically adds NetApp device config to /etc/multipath.conf
+    - Skips if existing NetApp configuration detected (manual setup respected)
+    - Creates backup before modifying multipath.conf
+    - postrm purge: Removes auto-added configuration (only if no storages exist)
+  * New Feature: Automatic PVE Service Restart
+    - postinst: Automatically restarts pvedaemon and pveproxy after install
+    - No manual service restart required
+  * Storage Removal Enhancement:
+    - deactivate_storage cleans up only this storage's multipath devices
+    - Other storages' devices are not affected
+    - Properly flushes buffers and removes SCSI devices
+    - Handles ONTAP unreachable scenarios gracefully
+  * Technical Implementation:
+    - alloc_image now handles vmstate and cloudinit volume types
+    - list_images properly enumerates vmstate volumes
+    - Naming module already supported vmstate patterns
+  * Documentation:
+    - Added README_zh-TW.md (Traditional Chinese)
+    - Language switch links in both README files
+    - License changed to MIT
+    - Updated installation instructions (simplified)
+
+ -- Jason Cheng (Jason Tools) <jason@jason.tools>  Sat, 25 Jan 2026 03:00:00 +0800
+
+jt-pve-storage-netapp (0.1.6-1) stable; urgency=medium
+
+  * Full Clone Support Release
+  * New Feature: Full Clone from VM Snapshot
+    - Clone a VM from any specific snapshot to create independent VM
+    - Uses temporary FlexClone for snapshot data access
+    - Automatic cleanup of temporary FlexClones (1 hour expiry)
+    - Works with both iSCSI and FC protocols
+  * New Feature: Full Clone from Current State
+    - Full Clone of running or stopped VMs
+    - PVE/qemu-img reads directly from current volume
+  * Technical Implementation:
+    - path() creates temporary FlexClone when snapshot access needed
+    - Temporary FlexClone LUN automatically mapped to igroup
+    - State tracking in /var/run/pve-storage-netapp-temp-clones.json
+    - Cleanup runs automatically during storage status checks
+  * New API Methods:
+    - volume_is_splitting(): Check if clone split is in progress
+    - volume_wait_clone_split(): Wait for clone split to complete
+  * Linked Clone Improvement:
+    - Linked Clone from template now stays space-efficient (no auto-split)
+  * Storage Deactivation:
+    - deactivate_storage now properly cleans up iSCSI sessions
+    - Flushes device buffers and removes multipath devices
+    - Logs out from iSCSI targets when storage is disabled/removed
+    - Safety check: skips cleanup for devices still in use
+  * Bug Fixes:
+    - Fixed list_images incorrectly showing FlexClones as templates
+    - Fixed igroup name lookup in temp FlexClone creation
+    - Fixed wait_for_multipath_device parameter format
+    - Added retry logic for stale has_flexclone metadata during template deletion
+  * Documentation Updates:
+    - Updated installation SOP with multipath.conf configuration
+    - Added security documentation (password storage, API permissions)
+    - Added ONTAP account setup options (Cluster vs SVM level)
+
+ -- Jason Cheng (Jason Tools) <jason@jason.tools>  Fri, 24 Jan 2026 19:21:00 +0800
+
+jt-pve-storage-netapp (0.1.5-1) stable; urgency=medium
+
+  * Template Support Release
+  * New Feature: Full Template Support
+    - Implemented create_base method for VM-to-template conversion
+    - Implemented rename_volume method for volume renaming
+    - Added find_free_diskname helper for disk allocation
+    - Uses __pve_base__ snapshot as template marker
+  * Fixed: "storage definition has no path" error on template creation
+    - Plugin now handles block storage template creation natively
+    - No longer falls back to file-based create_base implementation
+  * Fixed: list_images now correctly identifies template volumes
+    - Template volumes return base-XXX-disk-X instead of vm-XXX-disk-X
+    - Detection based on presence of __pve_base__ snapshot
+  * Fixed: path() now handles missing LUNs gracefully
+    - Returns synthetic path when LUN doesn't exist (orphaned volume)
+    - Allows deletion of orphaned volumes via PVE UI
+  * Added API.pm volume_rename method for ONTAP volume renaming
+
+ -- Jason Cheng (Jason Tools) <jason@jason.tools>  Fri, 03 Jan 2025 22:00:00 +0000
+
+jt-pve-storage-netapp (0.1.4-1) stable; urgency=medium
+
+  * FC SAN Support Release
+  * New Feature: Fibre Channel (FC) SAN Protocol Support
+    - New configuration option: ontap-protocol (iscsi|fc)
+    - Automatic FC HBA WWPN discovery from /sys/class/fc_host
+    - FC igroup creation with 'fcp' protocol
+    - Support for multiple FC HBA ports per node
+    - FC LIP (Loop Initialization Primitive) for LUN rescan
+  * New Module: FC.pm
+    - get_fc_wwpns(): Get all FC HBA port WWPNs
+    - is_fc_available(): Check if FC HBA exists
+    - rescan_fc_hosts(): Trigger FC and SCSI rescan
+    - format_wwn(): Convert WWN to standard format
+  * Robustness Improvements:
+    - Concurrent disk allocation now retries with next available ID
+    - Aggregate validation on storage activation
+    - Configurable device discovery timeout (ontap-device-timeout)
+    - Improved error messages with actionable hints
+  * Performance Improvements:
+    - Batch LUN query in list_images (reduces API calls significantly)
+  * Bug Fixes:
+    - Fixed path() and snapshot_rollback to support FC protocol
+    - Fixed protocol-aware device rescanning throughout codebase
+    - Fixed async job handling for DELETE and PATCH API calls
+    - Volume deletion now properly waits for ONTAP job completion
+    - Fixed template (base-xxx-disk-x) volume name handling
+    - parse_volname now correctly returns isBase flag for templates
+  * Compatibility:
+    - FC and iSCSI use same multipath configuration
+    - FC and iSCSI use same WWID-based device identification
+    - Existing iSCSI configurations continue to work (default protocol)
+  * Documentation:
+    - Added FC SAN configuration examples
+    - Updated CONFIGURATION.md with ontap-protocol option
+
+ -- Jason Cheng (Jason Tools) <jason@jason.tools>  Fri, 03 Jan 2025 12:00:00 +0000
+
+jt-pve-storage-netapp (0.1.3-1) stable; urgency=medium
+
+  * FlexClone Support Release
+  * New Feature: Linked Clone via NetApp FlexClone
+    - Template and linked clone now supported
+    - Instant clone creation (no data copy needed)
+    - Space-efficient: clones share unchanged blocks with parent
+    - Automatic LUN identity for cloned volumes
+    - FlexClone license check with helpful error message
+  * Safety Improvements:
+    - Prevent deletion of templates with clone children
+    - Clear error message listing dependent clones
+  * Bug Fixes:
+    - Fixed path() method causing system hangs when device not accessible
+    - path() now returns synthetic path when device not found locally
+    - Allows deletion of VMs whose devices were never activated
+    - Prevents kernel hung tasks caused by faulty multipath devices
+  * Package Installation Improvements:
+    - Fixed prerm script hanging during upgrade (added 5s timeout for pvesm)
+    - Fixed postinst script potential hang (added timeout for systemctl calls)
+    - All deb maintainer scripts now have proper timeout protection
+  * Volume Sizing:
+    - Enabled volume autogrow (expands automatically when needed)
+    - Reduced initial overhead to 64MB
+    - Volume max size set to 2x LUN size
+
+ -- Jason Cheng (Jason Tools) <jason@jason.tools>  Fri, 03 Jan 2025 00:15:00 +0000
+
+jt-pve-storage-netapp (0.1.2-1) stable; urgency=medium
+
+  * Bug Fix & Dependency Release
+  * Critical Bug Fix:
+    - Enabled volume autogrow: volume automatically expands when needed
+    - Reduced initial overhead to 64MB (was 5GB)
+    - Volume max size set to 2x LUN size for safety
+  * Added missing dependency:
+    - psmisc: provides 'fuser' command for device-in-use detection
+      (required by is_device_in_use() function in Multipath.pm)
+  * Documentation updates:
+    - Added psmisc to installation instructions
+    - Added lsscsi to recommended packages for troubleshooting
+
+ -- Jason Cheng (Jason Tools) <jason@jason.tools>  Thu, 02 Jan 2025 18:00:00 +0000
+
+jt-pve-storage-netapp (0.1.1-1) stable; urgency=medium
+
+  * Safety Improvements Release
+  * Data Protection:
+    - Added shrink protection to prevent data loss during resize
+    - Added in-use device check before volume deletion
+    - Added volume name collision detection before creation
+    - Added snapshot name collision detection before creation
+    - Added capacity pre-check for thick provisioning
+  * Operational Safety:
+    - Added API cache TTL (5 minutes) to prevent stale data
+    - Added SSL verification warning when disabled
+    - Fixed taint mode compatibility for PVE's qemu-img operations
+  * Bug Fixes:
+    - Fixed "Insecure dependency in exec" error during disk migration
+    - Device paths now properly untainted for PVE taint mode
+    - Improved Makefile test target with proper include paths
+
+ -- Jason Cheng (Jason Tools) <jason@jason.tools>  Thu, 02 Jan 2025 12:00:00 +0000
+
+jt-pve-storage-netapp (0.1.0-1) stable; urgency=medium
+
+  * Initial release
+  * Milestone 1: Provisioning & Attach
+    - FlexVol and LUN creation
+    - igroup management
+    - iSCSI discovery and login
+    - Multipath device handling
+  * Milestone 2: Snapshot operations
+    - snapshot_create via ONTAP Volume Snapshot
+    - snapshot_delete
+    - snapshot_rollback
+  * Milestone 3: Capacity reporting
+    - Real-time storage status from ONTAP
+
+ -- Jason Cheng (Jason Tools) <jason@jason.tools>  Thu, 02 Jan 2025 00:00:00 +0000

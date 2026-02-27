@@ -108,7 +108,7 @@ systemctl enable --now multipathd
 
 # 步驟 4：安裝外掛程式套件
 # （自動配置 multipath 並重新啟動 PVE 服務）
-dpkg -i jt-pve-storage-netapp_0.1.7-1_all.deb
+dpkg -i jt-pve-storage-netapp_0.1.9-1_all.deb
 ```
 
 > **注意：** 外掛程式會自動：
@@ -153,7 +153,7 @@ apt install -y open-iscsi multipath-tools sg3-utils psmisc \
 systemctl enable --now iscsid multipathd
 
 # 安裝外掛程式（自動配置 multipath 並重新啟動 PVE 服務）
-dpkg -i jt-pve-storage-netapp_0.1.7-1_all.deb
+dpkg -i jt-pve-storage-netapp_0.1.9-1_all.deb
 ```
 
 **叢集安裝順序：**
@@ -293,13 +293,12 @@ qm delsnapshot 100 backup1
 ### 調整磁碟大小
 
 ```bash
-# 先停止 VM（建議）
-qm stop 100
-
-# 調整大小（增加 10GB）
+# 線上調整大小（VM 可以在執行中）
 qm resize 100 scsi0 +10G
 
-# 啟動 VM
+# 或在 VM 停止時調整大小
+qm stop 100
+qm resize 100 scsi0 +10G
 qm start 100
 ```
 
@@ -324,6 +323,50 @@ pvesm status
 ```
 
 > **注意：** 停用儲存不會自動中斷 iSCSI 工作階段或 API 連線。外掛程式保持 iSCSI 工作階段活躍以便快速重新啟用。
+
+### iSCSI 工作階段管理
+
+```bash
+# 檢視目前 iSCSI 工作階段
+iscsiadm -m session
+
+# 檢視 multipath 裝置
+multipathd show maps
+
+# 手動登出所有 iSCSI 目標（選用，停用儲存後）
+iscsiadm -m node --logout
+
+# 手動重新掃描 iSCSI 工作階段
+iscsiadm -m session --rescan
+
+# 重新掃描 SCSI 主機以偵測新裝置
+for host in /sys/class/scsi_host/host*/scan; do echo "- - -" > $host; done
+
+# 重新載入 multipath 配置
+multipathd reconfigure
+```
+
+### 完整斷線程序
+
+若需完全中斷與 NetApp 儲存的連線：
+
+```bash
+# 1. 先停止所有使用此儲存的 VM！
+qm list | grep netapp1  # 檢查哪些 VM 使用此儲存
+
+# 2. 停用儲存
+pvesm set netapp1 --disable 1
+
+# 3. 登出 iSCSI 目標
+iscsiadm -m node --logout
+
+# 4. 驗證工作階段已關閉
+iscsiadm -m session  # 應顯示 "No active sessions"
+
+# 5. 若要稍後重新連線，只需啟用儲存
+pvesm set netapp1 --disable 0
+# 外掛程式會自動重新探索並登入 iSCSI 目標
+```
 
 ## 架構
 
@@ -364,6 +407,32 @@ Proxmox VE 叢集                      NetApp ONTAP
 
 詳細命名規範請參閱 [docs/NAMING_CONVENTIONS.md](docs/NAMING_CONVENTIONS.md)。
 
+### 資料流程
+
+**Volume 建立：**
+1. PVE 呼叫 `alloc_image()`，傳入 vmid 和大小
+2. 外掛程式透過 Naming 模組產生 ONTAP volume 名稱
+3. 建立 FlexVol，大小為指定大小 + 64MB 開銷
+   - Volume autogrow 已啟用（需要時自動擴展，最大至 2 倍大小）
+4. 在 FlexVol 中建立 LUN
+5. 將 LUN 對應到節點的 igroup
+6. 回傳 PVE volume 名稱（`vm-{vmid}-disk-{diskid}`）
+
+**Volume 啟用：**
+1. PVE 呼叫 `activate_volume()`，傳入 volname
+2. 確保 LUN 已對應到目前節點的 igroup
+3. 重新掃描 iSCSI 工作階段和 SCSI 主機
+4. 重新載入 multipath 配置
+5. 等待裝置出現（最多 60 秒）
+6. 回傳裝置路徑
+
+**快照回復：**
+1. PVE 呼叫 `volume_snapshot_rollback()`，傳入 volname 和 snapname
+2. 外掛程式將名稱轉換為 ONTAP 格式
+3. 呼叫 ONTAP REST API 將 volume 還原至快照
+4. 重新掃描 SCSI 主機以偵測大小變更
+5. 重新載入 multipath 配置
+
 ## igroup 模式
 
 ### per-node（預設）
@@ -384,12 +453,101 @@ Proxmox VE 叢集                      NetApp ONTAP
 - 所有節點必須是可信任的
 - 適合小型叢集
 
+## 模組架構
+
+```
+PVE::Storage::Plugin (Proxmox VE 基礎類別)
+    |
+    +-- PVE::Storage::Custom::NetAppONTAPPlugin (主外掛程式)
+            |
+            +-- uses: API.pm        (ONTAP REST API 客戶端)
+            +-- uses: Naming.pm     (PVE <-> ONTAP 名稱對應)
+            +-- uses: ISCSI.pm      (iSCSI 目標/工作階段管理)
+            +-- uses: Multipath.pm  (Linux multipath 與 SCSI 處理)
+```
+
+### 模組詳細資訊
+
+| 模組 | 行數 | 說明 |
+|------|------|------|
+| **NetAppONTAPPlugin.pm** | 825 | 主外掛程式 - 儲存操作、volume 管理、快照 |
+| **API.pm** | 787 | ONTAP REST API 客戶端 - volumes、LUNs、igroups、快照 |
+| **Multipath.pm** | 482 | Multipath I/O 和 SCSI 裝置管理 |
+| **ISCSI.pm** | 412 | iSCSI initiator 管理（iscsiadm 包裝器）|
+| **Naming.pm** | 300 | 命名規範工具程式和驗證 |
+| **合計** | **2,806** | 完整外掛程式實作 |
+
+### API.pm 函式
+
+**Volume 操作：**
+- `volume_create()` - 建立 FlexVol（支援精簡/完整佈建）
+- `volume_get()` / `volume_list()` - 查詢 volumes
+- `volume_delete()` / `volume_resize()` - 管理 volumes
+- `volume_space()` - 取得空間使用量
+- `volume_clone()` - 從父 volume 建立 FlexClone
+- `volume_clone_split()` - 分離 clone 為獨立 volume
+- `volume_is_clone()` / `volume_get_clone_parent()` - 查詢 clone 資訊
+- `volume_get_clone_children()` - 列出相依的 clones
+- `license_has_flexclone()` - 檢查 FlexClone 授權可用性
+
+**LUN 操作：**
+- `lun_create()` - 在 volume 中建立 LUN
+- `lun_get()` / `lun_delete()` / `lun_resize()` - 管理 LUNs
+- `lun_get_serial()` / `lun_get_wwid()` - 取得識別碼
+- `lun_map()` / `lun_unmap()` / `lun_is_mapped()` - igroup 對應
+
+**快照操作：**
+- `snapshot_create()` / `snapshot_delete()` - 管理快照
+- `snapshot_list()` / `snapshot_get()` - 查詢快照
+- `snapshot_rollback()` - 還原至快照
+
+**igroup 操作：**
+- `igroup_create()` / `igroup_get()` / `igroup_get_or_create()`
+- `igroup_add_initiator()` / `igroup_remove_initiator()`
+- `igroup_list()` - 列出 SVM 中的所有 igroups
+
+**其他：**
+- `iscsi_get_portals()` - 取得 iSCSI LIF 位址
+- `get_managed_capacity()` - 取得儲存容量
+- `wait_for_job()` - 處理非同步操作
+
+### ISCSI.pm 函式
+
+- `get_initiator_name()` / `set_initiator_name()` - 管理本機 IQN
+- `discover_targets()` - SendTargets 探索
+- `login_target()` / `logout_target()` - 工作階段管理
+- `get_sessions()` / `is_target_logged_in()` - 查詢工作階段
+- `rescan_sessions()` - 重新掃描以偵測新 LUNs
+- `wait_for_device()` - 等待裝置出現
+- `delete_node()` - 移除 iSCSI node 配置
+
+### Multipath.pm 函式
+
+- `rescan_scsi_hosts()` - 觸發 SCSI 匯流排重新掃描
+- `multipath_reload()` / `multipath_flush()` - 管理 multipathd
+- `get_multipath_device()` - 透過 WWID 尋找裝置
+- `get_device_by_wwid()` - 尋找裝置路徑
+- `wait_for_multipath_device()` - 帶逾時等待
+- `get_scsi_devices_by_serial()` - 透過序號尋找裝置
+- `remove_scsi_device()` / `rescan_scsi_device()` - 裝置生命週期
+- `cleanup_lun_devices()` - LUN 刪除後清理
+
+### Naming.pm 函式
+
+- `encode_volume_name()` / `decode_volume_name()` - FlexVol 名稱
+- `encode_lun_path()` / `decode_lun_path()` - LUN 路徑
+- `encode_snapshot_name()` / `decode_snapshot_name()` - 快照名稱
+- `encode_igroup_name()` - igroup 名稱
+- `sanitize_for_ontap()` - 清理字串以符合 ONTAP 規範
+- `pve_volname_to_ontap()` / `ontap_to_pve_volname()` - 完整轉換
+- `is_pve_managed_volume()` - 驗證受管理的 volumes
+
 ## 支援功能
 
 | 功能 | 狀態 | 備註 |
 |------|------|------|
 | 磁碟建立/刪除 | 支援 | FlexVol + LUN 建立 |
-| 磁碟調整大小 | 支援 | VM 必須停止 |
+| 磁碟調整大小 | 支援 | 支援線上調整大小 |
 | 快照 | 支援 | ONTAP Volume Snapshots |
 | 快照回復 | 支援 | VM 必須停止 |
 | 線上遷移 | 支援 | 透過共享 iSCSI 存取 |
@@ -428,6 +586,127 @@ Proxmox VE 叢集                      NetApp ONTAP
    - 自訂外掛程式無法透過 Web UI「新增儲存」下拉選單新增
    - 必須使用 CLI (`pvesm add`) 新增儲存
    - 新增後，儲存會正常顯示在 Web UI 中
+
+## PVE 版本升級相容性
+
+本節說明 Proxmox VE 版本升級對本外掛程式的影響。
+
+### Storage API 版本相依性
+
+外掛程式在 `NetAppONTAPPlugin.pm` 中宣告其 API 版本：
+
+```perl
+use constant APIVERSION => 13;
+use constant MIN_APIVERSION => 9;
+```
+
+| 情境 | 影響 |
+|------|------|
+| PVE Storage API 維持 13 | 完全相容 |
+| PVE Storage API 升級至 14+ | **可能需要更新外掛程式** |
+| PVE Storage API 降級 | 不相容（升級時不會發生）|
+
+### PVE 內部模組相依性
+
+外掛程式依賴以下 PVE 內部模組：
+
+| 模組 | 用途 | 穩定性風險 |
+|------|------|------------|
+| `PVE::Storage::Plugin` | 儲存外掛程式基礎類別 | 中（核心 API）|
+| `PVE::Tools` | 工具函式（`run_command`）| 低 |
+| `PVE::JSONSchema` | Schema 驗證 | 低 |
+| `PVE::Cluster` | 叢集配置 | 低 |
+| `PVE::INotify` | 取得節點名稱 | 低 |
+| `PVE::ProcFSTools` | 程序工具 | 低 |
+
+### 系統層級相依性
+
+這些與 PVE 版本無關，但可能受 Debian 基礎系統升級影響：
+
+| 相依性 | 套件 | 風險 |
+|--------|------|------|
+| `iscsiadm` | open-iscsi | 低（穩定介面）|
+| `multipathd` | multipath-tools | 低（穩定介面）|
+| `sg_inq` | sg3-utils | 低（穩定介面）|
+| Perl 模組 | libwww-perl、libjson-perl、liburi-perl | 低 |
+
+### 升級相容性矩陣
+
+| 升級路徑 | 預期相容性 | 風險等級 |
+|----------|------------|----------|
+| 9.1 → 9.2 | 相容 | 低 |
+| 9.x → 10.x | **需要測試** | 中 |
+
+### 潛在中斷變更
+
+| 情境 | 可能性 | 影響 | 解決方案 |
+|------|--------|------|----------|
+| Storage API 方法簽章變更 | 中 | 外掛程式故障 | 更新外掛程式程式碼 |
+| 新增必要方法 | 低 | 外掛程式無法載入 | 實作新方法 |
+| 移除 PVE 函式 | 低 | 執行時錯誤 | 更新外掛程式程式碼 |
+| Perl 版本升級 | 低 | 語法問題 | 測試並修復 |
+
+### 建議升級程序
+
+```bash
+# 1. 升級前：備份配置
+cp /etc/pve/storage.cfg /root/storage.cfg.bak
+pvesm status > /root/storage-status-before.txt
+
+# 2. 執行 PVE 升級
+apt update && apt dist-upgrade
+
+# 3. 升級後：驗證外掛程式功能
+pvesm status                              # 檢查儲存狀態
+journalctl -xeu pvedaemon --since "5 min" # 檢查錯誤
+
+# 4. 若發生問題：重新安裝外掛程式
+dpkg -i jt-pve-storage-netapp_*.deb
+systemctl restart pvedaemon pveproxy
+
+# 5. 驗證 Perl 語法（若需要）
+perl -c /usr/share/perl5/PVE/Storage/Custom/NetAppONTAPPlugin.pm
+perl -c /usr/share/perl5/PVE/Storage/Custom/NetAppONTAP/API.pm
+perl -c /usr/share/perl5/PVE/Storage/Custom/NetAppONTAP/ISCSI.pm
+perl -c /usr/share/perl5/PVE/Storage/Custom/NetAppONTAP/Multipath.pm
+perl -c /usr/share/perl5/PVE/Storage/Custom/NetAppONTAP/Naming.pm
+```
+
+### 主要版本升級最佳實踐
+
+1. **先在非生產環境測試**
+   - 將 PVE 配置複製到測試系統
+   - 執行升級並驗證外掛程式功能
+
+2. **檢查 Proxmox 發行說明**
+   - 查找「BREAKING CHANGES」章節
+   - 檢查 Storage API 版本變更
+   - 檢視 Perl 版本變更
+
+3. **監控官方管道**
+   - [Proxmox VE Roadmap](https://pve.proxmox.com/wiki/Roadmap)
+   - [Storage Plugin Development Wiki](https://pve.proxmox.com/wiki/Storage_Plugin_Development)
+   - Proxmox Forum 公告
+
+4. **準備回復計畫**
+   - 保留 `/etc/pve/storage.cfg` 備份
+   - 記錄目前正常運作的外掛程式版本
+   - 準備好先前 PVE 版本的還原計畫
+
+### 升級後驗證外掛程式
+
+```bash
+# 檢查外掛程式是否已載入
+pvesm pluginhelp netappontap
+
+# 測試儲存啟用
+pvesm set netapp1 --disable 0
+pvesm status
+
+# 測試基本操作（在測試 VM 上）
+pvesm alloc netapp1 9999 vm-9999-disk-0 1G
+pvesm free netapp1:vm-9999-disk-0
+```
 
 ## 疑難排解
 
@@ -485,6 +764,95 @@ journalctl -u multipathd --since "10 minutes ago"
 | `Cannot get WWID` | LUN 無法存取 | 檢查 iSCSI 工作階段 |
 | `Cannot shrink LUN` | 調整大小請求小於目前大小 | 只支援擴展 |
 | `device is still in use` | VM 執行中或裝置已掛載 | 刪除磁碟前先停止 VM |
+| `Insecure dependency in exec` | Taint 模式問題（舊版外掛程式）| 更新至 v0.1.2+ |
+| `Device for LUN ... not found` | Volume 存在於 ONTAP 但裝置無法存取 | 啟動 VM 或檢查 iSCSI 連線 |
+
+### 外掛程式未安裝在所有節點
+
+若在叢集中存取某節點時看到此錯誤：
+```
+Parameter verification failed. (400)
+storage: No such storage
+```
+
+**原因：** NetApp 儲存已配置在 `/etc/pve/storage.cfg`（叢集共享），但此特定節點未安裝外掛程式。
+
+**解決方案：**
+```bash
+# 在受影響的節點上安裝
+dpkg -i jt-pve-storage-netapp_0.1.9-1_all.deb
+apt install -f
+systemctl restart pvedaemon pveproxy
+```
+
+### 核心任務掛起（vgs 阻塞）
+
+若在 `dmesg` 中看到以下錯誤：
+```
+INFO: task vgs:12345 blocked for more than 120 seconds
+```
+
+**原因：** multipath 裝置有失敗路徑，等待 I/O 的程序卡在核心 D 狀態。
+
+**解決方案：**
+```bash
+# 檢查 multipath 狀態
+multipath -ll
+
+# 尋找 "failed faulty" 路徑如：
+# `- 4:0:0:1 sdd 8:48 failed faulty running
+
+# 移除故障的 SCSI 裝置
+echo 1 > /sys/block/sdd/device/delete
+
+# 清除孤立的 multipath 裝置
+multipath -f <WWID>
+
+# 重新配置 multipath
+multipathd reconfigure
+```
+
+**預防：** 在建立/啟用 volumes 前確保 iSCSI 目標可存取。
+
+### 連結複製裝置無法存取
+
+當使用從未啟動過的連結複製 VM 時，本機裝置可能不存在。
+
+**行為（v0.1.3+）：** 外掛程式回傳合成路徑（`/dev/mapper/$wwid`），刪除等操作透過 ONTAP API 正常執行。
+
+**舊版本可能看到：**
+```
+Device for LUN /vol/pve_netapp1_xxx_disk0/lun0 not found
+```
+
+**舊版本解決方案：**
+```bash
+# 升級至 v0.1.3+ 會自動處理此情況
+# 或透過 REST API 或 System Manager 手動從 ONTAP 刪除
+```
+
+### Multipath WWID 不符
+
+若 `scsi_id` 和 `multipath` 對同一裝置顯示不同的 WWID：
+```bash
+# 檢查實際裝置 WWID
+/lib/udev/scsi_id -g -u /dev/sdX
+
+# 檢查 multipath WWID
+multipathd show maps raw format "%w"
+```
+
+**原因：** LUN 替換或重建後的過時 multipath 快取。
+
+**解決方案：**
+```bash
+# 移除過時的 multipath 裝置
+multipathd del map <old_wwid>
+
+# 清除並重新配置
+multipath -F
+multipathd reconfigure
+```
 
 詳細疑難排解請參閱 [docs/TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md)。
 
@@ -501,43 +869,6 @@ apt remove jt-pve-storage-netapp
 
 # 4. 重新啟動服務
 systemctl restart pvedaemon pveproxy
-```
-
-## 開發
-
-### 從原始碼建置
-
-```bash
-git clone https://github.com/jasoncheng7115/jt-pve-storage-netapp.git
-cd jt-pve-storage-netapp
-
-# 語法檢查
-make test
-
-# 建置 deb 套件
-make deb
-
-# 直接安裝（開發用）
-make install
-```
-
-### 專案結構
-
-```
-jt-pve-storage-netapp/
-├── lib/PVE/Storage/Custom/
-│   ├── NetAppONTAPPlugin.pm      # 主外掛程式（儲存操作）
-│   └── NetAppONTAP/
-│       ├── API.pm                # ONTAP REST API 用戶端
-│       ├── ISCSI.pm              # iSCSI 工作階段管理
-│       ├── Multipath.pm          # Multipath 裝置管理
-│       └── Naming.pm             # 命名規範工具程式
-├── debian/                       # Debian 打包檔案
-├── docs/                         # 文件
-├── tests/                        # 測試目錄
-├── Makefile                      # 建置和安裝規則
-├── README.md                     # 英文說明文件
-└── README_zh-TW.md               # 繁體中文說明文件（本文件）
 ```
 
 ## 安全功能
@@ -562,6 +893,31 @@ jt-pve-storage-netapp/
 | **API 快取 TTL** | 5 分鐘快取過期防止過時資料問題 |
 | **Taint 模式相容** | 所有裝置路徑正確 untaint 以相容 PVE |
 | **失敗時清理** | 自動回復部分操作（例如 volume 建立）|
+
+### 錯誤訊息
+
+外掛程式提供清晰、可操作的錯誤訊息：
+
+```
+# 縮小嘗試
+Cannot shrink LUN: current size 32.00GB, requested 16.00GB. Shrinking would cause data loss.
+
+# 裝置使用中
+Cannot delete volume 'vm-100-disk-0': device /dev/mapper/xxx is still in use
+(mounted, has holders, or open by process). Please stop the VM and unmount first.
+
+# Volume 已存在
+Volume 'pve_netapp1_100_disk0' already exists on ONTAP. This may indicate a
+naming conflict or orphaned volume.
+
+# 空間不足
+Insufficient space in aggregate 'aggr1': available 10.50GB, required 32.00GB
+
+# 範本有連結複製
+Cannot delete volume 'vm-100-disk-0': it has FlexClone children depending on it.
+Dependent volumes: pve_netapp1_101_disk0, pve_netapp1_102_disk0.
+Please delete or split the clones first.
+```
 
 ## 授權
 

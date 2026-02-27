@@ -1,0 +1,13 @@
+#!/usr/bin/make -f
+
+%:
+	dh $@
+
+override_dh_auto_build:
+	# No build step needed for pure Perl
+
+override_dh_auto_install:
+	# Install handled by debian/install file
+
+override_dh_auto_test:
+	# Skip tests during package build

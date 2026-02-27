@@ -1,0 +1,121 @@
+#!/bin/bash
+set -e
+
+# Marker comment to identify our configuration
+MULTIPATH_MARKER_BEGIN="# BEGIN jt-pve-storage-netapp"
+MULTIPATH_MARKER_END="# END jt-pve-storage-netapp"
+MULTIPATH_CONF="/etc/multipath.conf"
+PVE_STORAGE_CFG="/etc/pve/storage.cfg"
+
+# Function to check if any netappontap storages still exist
+check_netapp_storages_exist() {
+    if [ -f "$PVE_STORAGE_CFG" ]; then
+        if grep -q "^netappontap:" "$PVE_STORAGE_CFG" 2>/dev/null; then
+            return 0  # storages exist
+        fi
+    fi
+    return 1  # no storages
+}
+
+# Function to remove NetApp multipath configuration
+remove_netapp_multipath_config() {
+    # Check if config file exists
+    if [ ! -f "$MULTIPATH_CONF" ]; then
+        echo "No $MULTIPATH_CONF file found, nothing to remove."
+        return 0
+    fi
+
+    # Check if our configuration exists
+    if ! grep -qF "$MULTIPATH_MARKER_BEGIN" "$MULTIPATH_CONF" 2>/dev/null; then
+        echo "No auto-configured NetApp multipath configuration found in $MULTIPATH_CONF"
+        return 0
+    fi
+
+    # Check if marker end exists (for safety)
+    if ! grep -qF "$MULTIPATH_MARKER_END" "$MULTIPATH_CONF" 2>/dev/null; then
+        echo "WARNING: Found BEGIN marker but no END marker in $MULTIPATH_CONF"
+        echo "Manual cleanup may be required."
+        return 0
+    fi
+
+    # Check if any netappontap storages still exist
+    if check_netapp_storages_exist; then
+        echo "WARNING: NetApp ONTAP storages still exist in $PVE_STORAGE_CFG"
+        echo "Multipath configuration will NOT be removed to prevent storage issues."
+        echo "Remove all netappontap storages first, then run: apt purge jt-pve-storage-netapp"
+        return 0
+    fi
+
+    echo "Removing NetApp multipath configuration from $MULTIPATH_CONF..."
+
+    # Create backup
+    cp "$MULTIPATH_CONF" "${MULTIPATH_CONF}.bak.$(date +%Y%m%d%H%M%S)"
+    echo "Backup created: ${MULTIPATH_CONF}.bak.$(date +%Y%m%d%H%M%S)"
+
+    # Remove our configuration block using awk (more reliable than sed for multi-line)
+    awk -v begin="$MULTIPATH_MARKER_BEGIN" -v end="$MULTIPATH_MARKER_END" '
+        $0 ~ begin { skip = 1; next }
+        $0 ~ end { skip = 0; next }
+        !skip { print }
+    ' "$MULTIPATH_CONF" > "${MULTIPATH_CONF}.tmp"
+
+    # Replace original with cleaned version
+    mv "${MULTIPATH_CONF}.tmp" "$MULTIPATH_CONF"
+
+    # Remove trailing blank lines
+    sed -i -e :a -e '/^\s*$/{ $d; N; ba; }' "$MULTIPATH_CONF" 2>/dev/null || true
+
+    echo "NetApp multipath configuration removed."
+
+    # Reload multipathd if running
+    if systemctl is-active --quiet multipathd 2>/dev/null; then
+        echo "Reloading multipathd configuration..."
+        timeout 10 multipathd reconfigure 2>/dev/null || true
+    fi
+
+    return 0
+}
+
+case "$1" in
+    purge)
+        echo "=============================================="
+        echo "Purging NetApp ONTAP Storage Plugin"
+        echo "=============================================="
+        echo ""
+
+        # Remove multipath configuration on purge
+        remove_netapp_multipath_config
+
+        echo ""
+        echo "Note: Storage configurations in $PVE_STORAGE_CFG are NOT automatically removed."
+        echo "      Remove them manually with: pvesm remove <storage-id>"
+        echo ""
+        echo "Note: Multipath device mappings for existing LUNs are NOT removed."
+        echo "      They will be cleaned up when the storage is removed or devices are unmapped."
+        echo "=============================================="
+        ;;
+    remove)
+        echo "=============================================="
+        echo "Removing NetApp ONTAP Storage Plugin"
+        echo "=============================================="
+        echo ""
+        echo "Package removed but configuration preserved."
+        echo ""
+        echo "Note: Multipath configuration in $MULTIPATH_CONF is preserved."
+        echo "      To remove it, use: apt purge jt-pve-storage-netapp"
+        echo ""
+        echo "Note: Storage configurations in $PVE_STORAGE_CFG are NOT removed."
+        echo "      Remove them manually with: pvesm remove <storage-id>"
+        echo "=============================================="
+        ;;
+    upgrade|failed-upgrade|abort-install|abort-upgrade|disappear)
+        ;;
+    *)
+        echo "postrm called with unknown argument \`$1'" >&2
+        exit 1
+        ;;
+esac
+
+#DEBHELPER#
+
+exit 0

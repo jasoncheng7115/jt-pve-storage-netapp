@@ -1,0 +1,27 @@
+#!/bin/bash
+set -e
+
+case "$1" in
+    remove|upgrade|deconfigure)
+        echo "Removing NetApp ONTAP Storage Plugin..."
+
+        # Check if any storage is still using this plugin (with timeout to prevent hang)
+        if command -v pvesm &> /dev/null; then
+            # Use timeout to prevent hanging if pvesm status blocks
+            if timeout 5 pvesm status 2>/dev/null | grep -q 'netappontap'; then
+                echo "WARNING: Storage configurations using 'netappontap' type still exist."
+                echo "Consider removing them first with: pvesm remove <storage-id>"
+            fi
+        fi
+        ;;
+    failed-upgrade)
+        ;;
+    *)
+        echo "prerm called with unknown argument \`$1'" >&2
+        exit 1
+        ;;
+esac
+
+#DEBHELPER#
+
+exit 0

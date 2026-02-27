@@ -108,7 +108,7 @@ systemctl enable --now multipathd
 
 # Step 4: Install the plugin package
 # (Automatically configures multipath and restarts PVE services)
-dpkg -i jt-pve-storage-netapp_0.1.7-1_all.deb
+dpkg -i jt-pve-storage-netapp_0.1.9-1_all.deb
 ```
 
 > **Note:** The plugin automatically:
@@ -153,7 +153,7 @@ apt install -y open-iscsi multipath-tools sg3-utils psmisc \
 systemctl enable --now iscsid multipathd
 
 # Install plugin (auto-configures multipath and restarts PVE services)
-dpkg -i jt-pve-storage-netapp_0.1.7-1_all.deb
+dpkg -i jt-pve-storage-netapp_0.1.9-1_all.deb
 ```
 
 **Installation Order for Clusters:**
@@ -295,13 +295,12 @@ qm delsnapshot 100 backup1
 ### Resize Disk
 
 ```bash
-# Stop VM first (recommended)
-qm stop 100
-
-# Resize (add 10GB)
+# Online resize (VM can be running)
 qm resize 100 scsi0 +10G
 
-# Start VM
+# Or resize while VM is stopped
+qm stop 100
+qm resize 100 scsi0 +10G
 qm start 100
 ```
 
@@ -550,7 +549,7 @@ PVE::Storage::Plugin (Proxmox VE base class)
 | Feature | Status | Notes |
 |---------|--------|-------|
 | Disk create/delete | Supported | FlexVol + LUN creation |
-| Disk resize | Supported | VM must be stopped |
+| Disk resize | Supported | Online resize supported |
 | Snapshots | Supported | ONTAP Volume Snapshots |
 | Snapshot rollback | Supported | VM must be stopped |
 | Live migration | Supported | Via shared iSCSI access |
@@ -793,7 +792,7 @@ storage: No such storage
 **Solution:**
 ```bash
 # Install on the affected node
-dpkg -i jt-pve-storage-netapp_0.1.7-1_all.deb
+dpkg -i jt-pve-storage-netapp_0.1.9-1_all.deb
 apt install -f
 systemctl restart pvedaemon pveproxy
 ```

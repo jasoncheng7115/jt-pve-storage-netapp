@@ -1,0 +1,6 @@
+lib/PVE/Storage/Custom/NetAppONTAPPlugin.pm usr/share/perl5/PVE/Storage/Custom/
+lib/PVE/Storage/Custom/NetAppONTAP/API.pm usr/share/perl5/PVE/Storage/Custom/NetAppONTAP/
+lib/PVE/Storage/Custom/NetAppONTAP/ISCSI.pm usr/share/perl5/PVE/Storage/Custom/NetAppONTAP/
+lib/PVE/Storage/Custom/NetAppONTAP/Multipath.pm usr/share/perl5/PVE/Storage/Custom/NetAppONTAP/
+lib/PVE/Storage/Custom/NetAppONTAP/Naming.pm usr/share/perl5/PVE/Storage/Custom/NetAppONTAP/
+lib/PVE/Storage/Custom/NetAppONTAP/FC.pm usr/share/perl5/PVE/Storage/Custom/NetAppONTAP/

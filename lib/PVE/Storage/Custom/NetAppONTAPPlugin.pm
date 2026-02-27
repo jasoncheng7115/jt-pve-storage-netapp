@@ -1,0 +1,1713 @@
+package PVE::Storage::Custom::NetAppONTAPPlugin;
+
+use strict;
+use warnings;
+
+use base qw(PVE::Storage::Plugin);
+
+use JSON;
+use PVE::Tools qw(run_command);
+use PVE::JSONSchema qw(get_standard_option);
+use Fcntl qw(:flock);
+use PVE::Cluster qw(cfs_read_file);
+use PVE::ProcFSTools;
+
+use PVE::Storage::Custom::NetAppONTAP::API;
+use PVE::Storage::Custom::NetAppONTAP::Naming qw(
+    encode_volume_name
+    decode_volume_name
+    encode_lun_path
+    encode_snapshot_name
+    decode_snapshot_name
+    encode_igroup_name
+    pve_volname_to_ontap
+    ontap_to_pve_volname
+    is_pve_managed_volume
+);
+use PVE::Storage::Custom::NetAppONTAP::ISCSI qw(
+    get_initiator_name
+    discover_targets
+    login_target
+    logout_target
+    rescan_sessions
+    wait_for_device
+);
+use PVE::Storage::Custom::NetAppONTAP::Multipath qw(
+    rescan_scsi_hosts
+    multipath_reload
+    get_multipath_device
+    get_device_by_wwid
+    wait_for_multipath_device
+    cleanup_lun_devices
+    is_device_in_use
+);
+use PVE::Storage::Custom::NetAppONTAP::FC qw(
+    get_fc_wwpns
+    is_fc_available
+    rescan_fc_hosts
+);
+
+# Plugin API version - bump for compatibility
+use constant APIVERSION => 13;
+use constant MIN_APIVERSION => 9;
+
+# Mark as shared storage (accessible from multiple nodes)
+push @PVE::Storage::Plugin::SHARED_STORAGE, 'netappontap';
+
+#
+# Plugin registration
+#
+
+sub api {
+    return APIVERSION;
+}
+
+sub type {
+    return 'netappontap';
+}
+
+sub plugindata {
+    return {
+        content => [
+            { images => 1, rootdir => 1 },
+            { images => 1 },
+        ],
+        format => [
+            { raw => 1 },
+            'raw',
+        ],
+    };
+}
+
+sub properties {
+    return {
+        'ontap-portal' => {
+            description => "NetApp ONTAP management IP address or hostname.",
+            type => 'string',
+        },
+        'ontap-svm' => {
+            description => "Storage Virtual Machine (SVM/Vserver) name.",
+            type => 'string',
+        },
+        'ontap-aggregate' => {
+            description => "Aggregate name for volume creation.",
+            type => 'string',
+        },
+        'ontap-username' => {
+            description => "API username for ONTAP REST API.",
+            type => 'string',
+        },
+        'ontap-password' => {
+            description => "API password for ONTAP REST API.",
+            type => 'string',
+        },
+        'ontap-ssl-verify' => {
+            description => "Verify SSL certificate.",
+            type => 'boolean',
+            default => 1,
+        },
+        'ontap-thin' => {
+            description => "Use thin provisioning for volumes.",
+            type => 'boolean',
+            default => 1,
+        },
+        'ontap-igroup-mode' => {
+            description => "igroup mode: 'per-node' or 'shared'.",
+            type => 'string',
+            enum => ['per-node', 'shared'],
+            default => 'per-node',
+        },
+        'ontap-cluster-name' => {
+            description => "PVE cluster name for igroup naming.",
+            type => 'string',
+            optional => 1,
+        },
+        'ontap-protocol' => {
+            description => "SAN protocol: 'iscsi' or 'fc' (Fibre Channel).",
+            type => 'string',
+            enum => ['iscsi', 'fc'],
+            default => 'iscsi',
+        },
+        'ontap-device-timeout' => {
+            description => "Timeout in seconds for device discovery after LUN mapping.",
+            type => 'integer',
+            minimum => 10,
+            maximum => 300,
+            default => 60,
+        },
+    };
+}
+
+sub options {
+    return {
+        'ontap-portal'       => { fixed => 1 },
+        'ontap-svm'          => { fixed => 1 },
+        'ontap-aggregate'    => { fixed => 1 },
+        'ontap-username'     => { fixed => 1 },
+        'ontap-password'     => { fixed => 1 },
+        'ontap-ssl-verify'   => { optional => 1 },
+        'ontap-thin'         => { optional => 1 },
+        'ontap-igroup-mode'  => { optional => 1 },
+        'ontap-cluster-name' => { optional => 1 },
+        'ontap-protocol'     => { optional => 1 },
+        'ontap-device-timeout' => { optional => 1 },
+        nodes                => { optional => 1 },
+        disable              => { optional => 1 },
+        content              => { optional => 1 },
+        shared               => { optional => 1 },
+    };
+}
+
+#
+# Helper methods
+#
+
+# Get API client instance (cached per storage config)
+my %api_cache;
+use constant API_CACHE_TTL => 300;  # 5 minutes cache TTL
+
+# Temporary FlexClone state tracking
+my $TEMP_CLONE_STATE_FILE = '/var/run/pve-storage-netapp-temp-clones.json';
+my $TEMP_CLONE_LOCK_FILE = '/var/run/pve-storage-netapp-temp-clones.lock';
+my $TEMP_CLONE_MAX_AGE = 3600;  # 1 hour - cleanup clones older than this
+
+sub _get_api {
+    my ($scfg) = @_;
+
+    my $storeid = $scfg->{storage} // $scfg->{'ontap-portal'} // 'unknown';
+
+    # Return cached client if available, config hasn't changed, and cache is fresh
+    if (my $cached = $api_cache{$storeid}) {
+        my $cache_age = time() - ($cached->{timestamp} // 0);
+        if ($cache_age < API_CACHE_TTL &&
+            $cached->{host} eq $scfg->{'ontap-portal'} &&
+            $cached->{svm} eq $scfg->{'ontap-svm'}) {
+            return $cached->{api};
+        }
+    }
+
+    my $ssl_verify = $scfg->{'ontap-ssl-verify'} // 1;
+
+    my $api = PVE::Storage::Custom::NetAppONTAP::API->new(
+        host       => $scfg->{'ontap-portal'},
+        username   => $scfg->{'ontap-username'},
+        password   => $scfg->{'ontap-password'},
+        svm        => $scfg->{'ontap-svm'},
+        aggregate  => $scfg->{'ontap-aggregate'},
+        ssl_verify => $ssl_verify,
+    );
+
+    $api_cache{$storeid} = {
+        api       => $api,
+        host      => $scfg->{'ontap-portal'},
+        svm       => $scfg->{'ontap-svm'},
+        timestamp => time(),
+    };
+
+    return $api;
+}
+
+# Get igroup name for current node
+sub _get_igroup_name {
+    my ($scfg) = @_;
+
+    my $cluster_name = $scfg->{'ontap-cluster-name'} // 'pve';
+    my $mode = $scfg->{'ontap-igroup-mode'} // 'per-node';
+
+    if ($mode eq 'shared') {
+        return encode_igroup_name($cluster_name, undef);
+    } else {
+        my $nodename = PVE::INotify::nodename();
+        return encode_igroup_name($cluster_name, $nodename);
+    }
+}
+
+# Get initiators based on protocol (iSCSI IQN or FC WWPN)
+sub _get_initiators {
+    my ($scfg) = @_;
+
+    my $protocol = $scfg->{'ontap-protocol'} // 'iscsi';
+
+    if ($protocol eq 'fc') {
+        my $wwpns = get_fc_wwpns(online_only => 1);
+        die "No FC HBA WWPNs found on this node. Is FC HBA installed and online?" unless @$wwpns;
+        return @$wwpns;
+    } else {
+        return (get_initiator_name());
+    }
+}
+
+# Get ONTAP igroup protocol name
+sub _get_ontap_protocol {
+    my ($scfg) = @_;
+
+    my $protocol = $scfg->{'ontap-protocol'} // 'iscsi';
+    return $protocol eq 'fc' ? 'fcp' : 'iscsi';
+}
+
+# Ensure igroup exists and has current node's initiator
+sub _ensure_igroup {
+    my ($scfg, $api) = @_;
+
+    my $igroup_name = _get_igroup_name($scfg);
+    my @initiators = _get_initiators($scfg);
+    my $ontap_protocol = _get_ontap_protocol($scfg);
+
+    my $igroup = $api->igroup_get_or_create(
+        name       => $igroup_name,
+        protocol   => $ontap_protocol,
+        os_type    => 'linux',
+        initiators => \@initiators,
+    );
+
+    # Verify all initiators are in igroup
+    my %existing_initiators;
+    if ($igroup->{initiators}) {
+        for my $init (@{$igroup->{initiators}}) {
+            $existing_initiators{lc($init->{name})} = 1;
+        }
+    }
+
+    # Add missing initiators
+    for my $initiator (@initiators) {
+        unless ($existing_initiators{lc($initiator)}) {
+            eval { $api->igroup_add_initiator($igroup_name, $initiator); };
+            # Ignore error if already exists
+        }
+    }
+
+    return $igroup_name;
+}
+
+# Parse PVE volname to components
+sub _parse_volname {
+    my ($volname) = @_;
+
+    # Format: images/vm-100-disk-0 or vm-100-disk-0 or base-100-disk-0
+    $volname =~ s|^images/||;
+
+    # VM disk: vm-100-disk-0
+    if ($volname =~ /^vm-(\d+)-disk-(\d+)$/) {
+        return {
+            vmid   => $1,
+            diskid => $2,
+            format => 'raw',
+            type   => 'disk',
+            isBase => 0,
+        };
+    # Template base disk: base-100-disk-0
+    } elsif ($volname =~ /^base-(\d+)-disk-(\d+)$/) {
+        return {
+            vmid   => $1,
+            diskid => $2,
+            format => 'raw',
+            type   => 'disk',
+            isBase => 1,
+        };
+    # Cloud-init: vm-100-cloudinit
+    } elsif ($volname =~ /^vm-(\d+)-cloudinit$/) {
+        return {
+            vmid   => $1,
+            format => 'raw',
+            type   => 'cloudinit',
+            isBase => 0,
+        };
+    # VM state: vm-100-state-snapname
+    } elsif ($volname =~ /^vm-(\d+)-state-(.+)$/) {
+        return {
+            vmid     => $1,
+            snapname => $2,
+            format   => 'raw',
+            type     => 'state',
+            isBase   => 0,
+        };
+    }
+
+    return undef;
+}
+
+# Get next available disk ID for a VM
+sub _find_free_diskid {
+    my ($scfg, $storeid, $vmid) = @_;
+
+    my $api = _get_api($scfg);
+
+    # List existing volumes for this VM
+    my $prefix = pve_volname_to_ontap($storeid, "vm-${vmid}-disk-0");
+    $prefix =~ s/_disk\d+$/_disk/;
+
+    my $volumes = $api->volume_list("${prefix}*");
+
+    my %used_ids;
+    for my $vol (@$volumes) {
+        my $decoded = decode_volume_name($vol->{name});
+        if ($decoded && $decoded->{vmid} == $vmid && defined $decoded->{diskid}) {
+            $used_ids{$decoded->{diskid}} = 1;
+        }
+    }
+
+    # Find first unused ID
+    for (my $id = 0; $id < 1000; $id++) {
+        return $id unless $used_ids{$id};
+    }
+
+    die "No free disk ID found for VM $vmid";
+}
+
+#
+# Storage operations
+#
+
+sub activate_storage {
+    my ($class, $storeid, $scfg, $cache) = @_;
+
+    # Verify ONTAP connectivity
+    my $api = _get_api($scfg);
+    $api->get_svm_uuid();
+
+    # Verify aggregate exists and is available
+    my $aggregate = $scfg->{'ontap-aggregate'};
+    my $aggr_info = $api->aggregate_get($aggregate);
+    unless ($aggr_info) {
+        die "Aggregate '$aggregate' not found on ONTAP cluster. " .
+            "Please verify the aggregate name in storage configuration.";
+    }
+
+    my $protocol = $scfg->{'ontap-protocol'} // 'iscsi';
+
+    if ($protocol eq 'fc') {
+        # FC: Verify FC HBA is available
+        unless (is_fc_available()) {
+            die "FC protocol selected but no FC HBA found on this node. " .
+                "Please install FC HBA or use 'ontap-protocol iscsi'.";
+        }
+
+        # FC: Rescan for any existing LUNs
+        rescan_fc_hosts(delay => 1);
+
+    } else {
+        # iSCSI: Get portals and login
+        my $portals = $api->iscsi_get_portals();
+        die "No iSCSI portals found on SVM $scfg->{'ontap-svm'}" unless @$portals;
+
+        # Discover and login to targets
+        my $portal_success = 0;
+        for my $portal (@$portals) {
+            eval {
+                discover_targets($portal->{address}, port => $portal->{port});
+                login_target($portal->{address}, $portal->{target}, port => $portal->{port});
+                $portal_success++;
+            };
+            # Continue on error - some portals might not be reachable
+            warn "Failed to connect to portal $portal->{address}: $@" if $@;
+        }
+        die "Failed to connect to any iSCSI portal on SVM '$scfg->{'ontap-svm'}'. " .
+            "Check network connectivity and iSCSI LIF configuration." unless $portal_success;
+    }
+
+    # Ensure igroup exists (common for both protocols)
+    _ensure_igroup($scfg, $api);
+
+    return 1;
+}
+
+sub deactivate_storage {
+    my ($class, $storeid, $scfg, $cache) = @_;
+
+    # Cleanup iSCSI sessions and multipath devices for this storage
+    # This is called when storage is disabled or removed
+
+    warn "Deactivating storage '$storeid': cleaning up connections...\n";
+
+    my $protocol = $scfg->{'ontap-protocol'} // 'iscsi';
+    my $cleanup_count = 0;
+    my $skip_count = 0;
+
+    # Step 1: Force cleanup temporary FlexClones for this storage (from state file)
+    # This works even if ONTAP is unreachable - we just clear the local state
+    eval { _cleanup_temp_clones_for_storage($storeid); };
+    warn "Temp FlexClone state cleanup: $@\n" if $@;
+
+    # Step 2: Try to connect to ONTAP API
+    my $api = eval { _get_api($scfg); };
+    if (!$api) {
+        warn "WARNING: Cannot connect to ONTAP API.\n";
+        warn "  - Local multipath devices cannot be identified for cleanup.\n";
+        warn "  - Manual cleanup may be required: multipath -F\n";
+        warn "  - iSCSI sessions not logged out.\n";
+        multipath_reload();
+        return 1;
+    }
+
+    # Step 3: Get all volumes for this storage and cleanup their devices
+    my $san_storeid = $storeid;
+    $san_storeid =~ s/-/_/g;
+    my $prefix = "pve_${san_storeid}_*";
+    my $volumes = eval { $api->volume_list($prefix); } // [];
+
+    warn "Found " . scalar(@$volumes) . " volumes for storage '$storeid'\n" if @$volumes;
+
+    # Cleanup each volume's device
+    for my $vol (@$volumes) {
+        my $lun_path = encode_lun_path($vol->{name});
+        my $wwid = eval { $api->lun_get_wwid($lun_path); };
+        next unless $wwid;
+
+        my $device = get_device_by_wwid($wwid);
+        if ($device && -b $device) {
+            # Check if device is in use
+            if (is_device_in_use($device)) {
+                warn "  [SKIP] $vol->{name}: device $device still in use\n";
+                $skip_count++;
+                next;
+            }
+
+            # Flush and cleanup
+            eval {
+                system('sync');
+                system('blockdev', '--flushbufs', $device);
+                cleanup_lun_devices($wwid);
+                warn "  [OK] $vol->{name}: device cleaned up\n";
+                $cleanup_count++;
+            };
+            if ($@) {
+                warn "  [FAIL] $vol->{name}: $@\n";
+            }
+        }
+    }
+
+    # Step 4: For iSCSI - logout from this SVM's targets
+    if ($protocol eq 'iscsi') {
+        my $portals = eval { $api->iscsi_get_portals(); } // [];
+        for my $portal (@$portals) {
+            eval {
+                logout_target($portal->{address}, $portal->{target}, port => $portal->{port});
+                warn "  [OK] Logged out from iSCSI target: $portal->{address}\n";
+            };
+            # Ignore logout errors - target might already be logged out
+        }
+    }
+
+    # Step 5: Reload multipath to reflect changes
+    multipath_reload();
+
+    warn "Storage '$storeid' deactivated: $cleanup_count devices cleaned, $skip_count skipped (in use)\n";
+    return 1;
+}
+
+# File locking for temp clone state
+sub _with_temp_clone_lock {
+    my ($code) = @_;
+    open(my $lock_fh, '>', $TEMP_CLONE_LOCK_FILE) or do {
+        warn "Cannot open lock file $TEMP_CLONE_LOCK_FILE: $!\n";
+        return $code->();
+    };
+    flock($lock_fh, LOCK_EX) or do {
+        warn "Cannot acquire lock on $TEMP_CLONE_LOCK_FILE: $!\n";
+        close($lock_fh);
+        return $code->();
+    };
+    my $result = eval { $code->() };
+    my $err = $@;
+    flock($lock_fh, LOCK_UN);
+    close($lock_fh);
+    die $err if $err;
+    return $result;
+}
+
+sub _read_temp_clone_state {
+    return {} unless -f $TEMP_CLONE_STATE_FILE;
+    my $json = do { local $/; open my $fh, '<', $TEMP_CLONE_STATE_FILE or return {}; <$fh> };
+    return eval { JSON::decode_json($json) } // {};
+}
+
+sub _write_temp_clone_state {
+    my ($state) = @_;
+    open my $fh, '>', $TEMP_CLONE_STATE_FILE or do {
+        warn "Cannot write temp clone state: $!\n";
+        return;
+    };
+    print $fh JSON::encode_json($state);
+    close $fh;
+}
+
+# Force cleanup temp FlexClones for a specific storage (clear local state)
+sub _cleanup_temp_clones_for_storage {
+    my ($storeid) = @_;
+
+    _with_temp_clone_lock(sub {
+        my $state = _read_temp_clone_state();
+        if (exists $state->{$storeid}) {
+            my $count = scalar(keys %{$state->{$storeid}});
+            delete $state->{$storeid};
+            _write_temp_clone_state($state);
+            warn "Cleared $count temp FlexClone entries for storage '$storeid'\n" if $count;
+        }
+    });
+}
+
+sub status {
+    my ($class, $storeid, $scfg, $cache) = @_;
+
+    my $api = _get_api($scfg);
+
+    # Cleanup old temporary FlexClones (non-blocking, errors ignored)
+    eval { _cleanup_temp_clones($api, $storeid); };
+
+    eval {
+        my $capacity = $api->get_managed_capacity();
+
+        $cache->{total}     = $capacity->{total};
+        $cache->{used}      = $capacity->{used};
+        $cache->{avail}     = $capacity->{available};
+    };
+    if ($@) {
+        warn "Failed to get storage status: $@";
+        return (0, 0, 0, 0);
+    }
+
+    return ($cache->{total}, $cache->{avail}, $cache->{used}, 1);
+}
+
+#
+# Volume management
+#
+
+sub alloc_image {
+    my ($class, $storeid, $scfg, $vmid, $fmt, $name, $size) = @_;
+
+    die "unsupported format '$fmt'" if $fmt ne 'raw';
+
+    my $api = _get_api($scfg);
+
+    # Parse the requested volume name to determine type
+    my $parsed;
+    my $voltype = 'disk';  # Default type
+    my $diskid;
+    my $snapname;
+
+    if ($name) {
+        $parsed = _parse_volname($name);
+        if ($parsed) {
+            $voltype = $parsed->{type} // 'disk';
+            $diskid = $parsed->{diskid} if defined $parsed->{diskid};
+            $snapname = $parsed->{snapname} if defined $parsed->{snapname};
+        }
+    }
+
+    # For disk type, find free disk ID if not specified
+    if ($voltype eq 'disk') {
+        $diskid //= _find_free_diskid($scfg, $storeid, $vmid);
+    }
+
+    # Size is in kilobytes, convert to bytes
+    my $size_bytes = $size * 1024;
+
+    # Volume size: LUN size + minimal overhead
+    # With autogrow enabled on volume, we only need minimal initial overhead
+    # for WAFL metadata. Volume will automatically expand if more space needed.
+    # Minimum 64MB to cover LUN metadata and WAFL indirect blocks
+    my $overhead = 64 * 1024 * 1024;  # 64MB fixed overhead
+
+    my $vol_size = $size_bytes + $overhead;
+    my $min_vol_size = 20 * 1024 * 1024;  # ONTAP minimum 20MB
+    $vol_size = $min_vol_size if $vol_size < $min_vol_size;
+
+    # Generate ONTAP volume name based on volume type
+    my $ontap_volname;
+    my $lun_path;
+    my $pve_volname;  # The PVE volume name to return
+
+    if ($voltype eq 'state') {
+        # VM state volume: vm-{vmid}-state-{snapname}
+        die "snapname is required for vmstate volume" unless $snapname;
+        $pve_volname = "vm-${vmid}-state-${snapname}";
+        $ontap_volname = pve_volname_to_ontap($storeid, $pve_volname);
+        $lun_path = encode_lun_path($ontap_volname);
+
+        # Check if volume already exists
+        my $existing_vol = $api->volume_get($ontap_volname);
+        if ($existing_vol) {
+            die "Volume '$ontap_volname' already exists on ONTAP. " .
+                "This may indicate a duplicate vmstate volume.";
+        }
+    } elsif ($voltype eq 'cloudinit') {
+        # Cloud-init volume: vm-{vmid}-cloudinit
+        $pve_volname = "vm-${vmid}-cloudinit";
+        $ontap_volname = pve_volname_to_ontap($storeid, $pve_volname);
+        $lun_path = encode_lun_path($ontap_volname);
+
+        # Check if volume already exists
+        my $existing_vol = $api->volume_get($ontap_volname);
+        if ($existing_vol) {
+            die "Volume '$ontap_volname' already exists on ONTAP. " .
+                "This may indicate a duplicate cloudinit volume.";
+        }
+    } else {
+        # Standard disk volume: vm-{vmid}-disk-{diskid}
+        # Use retry logic for concurrent allocation
+        my $max_retries = 5;
+
+        for my $retry (0 .. $max_retries) {
+            $ontap_volname = encode_volume_name($storeid, $vmid, $diskid);
+            $lun_path = encode_lun_path($ontap_volname);
+
+            # Check if volume already exists
+            my $existing_vol = $api->volume_get($ontap_volname);
+            if (!$existing_vol) {
+                last;  # Volume name is available
+            }
+
+            # Volume exists - try next disk ID (handles concurrent allocation)
+            if ($retry < $max_retries) {
+                $diskid++;
+                next;
+            }
+
+            # All retries exhausted
+            die "Volume '$ontap_volname' already exists on ONTAP. " .
+                "This may indicate a naming conflict or orphaned volume. " .
+                "Please check ONTAP and remove the existing volume if it's not in use.";
+        }
+        $pve_volname = "vm-${vmid}-disk-${diskid}";
+    }
+
+    # Safety check: Verify aggregate has sufficient space (for thick provisioning)
+    my $thin = $scfg->{'ontap-thin'} // 1;
+    if (!$thin) {
+        my $aggr = $api->aggregate_get($scfg->{'ontap-aggregate'});
+        if ($aggr && $aggr->{space} && $aggr->{space}{block_storage}) {
+            my $available = $aggr->{space}{block_storage}{available} // 0;
+            if ($available < $vol_size) {
+                my $avail_gb = sprintf("%.2f", $available / (1024*1024*1024));
+                my $need_gb = sprintf("%.2f", $vol_size / (1024*1024*1024));
+                die "Insufficient space in aggregate '$scfg->{'ontap-aggregate'}': " .
+                    "available ${avail_gb}GB, required ${need_gb}GB";
+            }
+        }
+    }
+
+    # Create FlexVol
+    $api->volume_create(
+        name      => $ontap_volname,
+        aggregate => $scfg->{'ontap-aggregate'},
+        size      => $vol_size,
+        thin      => $scfg->{'ontap-thin'} // 1,
+    );
+
+    # Create LUN
+    eval {
+        $api->lun_create(
+            name    => 'lun0',
+            volume  => $ontap_volname,
+            size    => $size_bytes,
+            os_type => 'linux',
+            thin    => $scfg->{'ontap-thin'} // 1,
+        );
+    };
+    if ($@) {
+        my $err = $@;
+        # Cleanup volume on failure
+        eval { $api->volume_delete($ontap_volname); };
+        die "Failed to create LUN: $err";
+    }
+
+    # Map LUN to igroup
+    eval {
+        my $igroup = _get_igroup_name($scfg);
+        $api->lun_map($lun_path, $igroup);
+    };
+    if ($@) {
+        my $err = $@;
+        # Cleanup on failure
+        eval { $api->lun_delete($lun_path); };
+        eval { $api->volume_delete($ontap_volname); };
+        die "Failed to map LUN: $err";
+    }
+
+    # Return PVE volume name
+    return $pve_volname;
+}
+
+sub free_image {
+    my ($class, $storeid, $scfg, $volname, $isBase, $format) = @_;
+
+    my $api = _get_api($scfg);
+    my $ontap_volname = pve_volname_to_ontap($storeid, $volname);
+    my $lun_path = encode_lun_path($ontap_volname);
+
+    # Get LUN WWID for cleanup and in-use check
+    my $wwid = eval { $api->lun_get_wwid($lun_path); };
+
+    # Safety check: Verify device is not in use before deletion
+    if ($wwid) {
+        my $device = get_device_by_wwid($wwid);
+        if ($device && -b $device) {
+            if (is_device_in_use($device)) {
+                die "Cannot delete volume '$volname': device $device is still in use " .
+                    "(mounted, has holders, or open by process). " .
+                    "Please stop the VM and unmount the device first.";
+            }
+        }
+    }
+
+    # Safety check: Verify no FlexClone children depend on this volume
+    my $clone_children = eval { $api->volume_get_clone_children($ontap_volname); };
+    if ($clone_children && @$clone_children) {
+        my @child_names = map { $_->{name} } @$clone_children;
+        die "Cannot delete volume '$volname': it has FlexClone children depending on it. " .
+            "Dependent volumes: " . join(', ', @child_names) . ". " .
+            "Please delete or split the clones first.";
+    }
+
+    # IMPORTANT: Cleanup local devices BEFORE deleting on ONTAP
+    # This ensures no pending I/O when the storage-side resources are removed
+    if ($wwid) {
+        eval { cleanup_lun_devices($wwid); };
+    }
+
+    # Unmap LUN from all igroups
+    my $lun = $api->lun_get($lun_path);
+    if ($lun && $lun->{lun_maps}) {
+        for my $map (@{$lun->{lun_maps}}) {
+            eval { $api->lun_unmap($lun_path, $map->{igroup}{name}); };
+        }
+    }
+
+    # Delete LUN
+    eval { $api->lun_delete($lun_path); };
+    warn "Failed to delete LUN '$lun_path': $@\n" if $@;
+
+    # Delete volume (and all snapshots)
+    # Retry logic for stale has_flexclone metadata after clone deletion
+    my $max_retries = 5;
+    my $retry_delay = 2;
+    my $deleted = 0;
+
+    for my $attempt (1 .. $max_retries) {
+        eval { $api->volume_delete($ontap_volname); };
+        if (!$@) {
+            $deleted = 1;
+            last;
+        }
+
+        # Check if error is due to clone dependency
+        if ($@ =~ /clone|child|depend/i) {
+            # Verify no actual clones exist
+            my $children = eval { $api->volume_get_clone_children($ontap_volname); };
+            if ($children && @$children) {
+                # Real clones exist, don't retry
+                die "Cannot delete volume '$volname': it has FlexClone children. " .
+                    "Dependent volumes: " . join(', ', map { $_->{name} } @$children);
+            }
+
+            # Stale metadata - wait and retry
+            warn "Volume delete failed (attempt $attempt/$max_retries): stale clone metadata, retrying...\n"
+                if $attempt < $max_retries;
+            sleep($retry_delay);
+        } else {
+            # Other error, don't retry
+            die "Failed to delete volume '$ontap_volname': $@";
+        }
+    }
+
+    die "Failed to delete volume '$ontap_volname' after $max_retries attempts: ONTAP reports stale clone metadata"
+        unless $deleted;
+
+    return undef;
+}
+
+sub list_images {
+    my ($class, $storeid, $scfg, $vmid, $vollist, $cache) = @_;
+
+    my $api = _get_api($scfg);
+
+    my @res;
+
+    # Build filter pattern
+    my $filter = 'pve_*';
+    my $san_storage = $storeid;
+    $san_storage =~ s/-/_/g;
+    if ($vmid) {
+        $filter = "pve_${san_storage}_${vmid}_*";
+    }
+
+    my $volumes = $api->volume_list($filter);
+
+    # Batch query all LUNs for performance (instead of per-volume query)
+    my $lun_filter = "/vol/pve_${san_storage}_*/lun0";
+    if ($vmid) {
+        $lun_filter = "/vol/pve_${san_storage}_${vmid}_*/lun0";
+    }
+    my $luns = $api->lun_list($lun_filter);
+
+    # Build LUN lookup hash by volume name
+    my %lun_by_vol;
+    for my $lun (@$luns) {
+        if ($lun->{name} =~ m|^/vol/([^/]+)/|) {
+            $lun_by_vol{$1} = $lun;
+        }
+    }
+
+    # Build a set of volumes that are templates
+    # A template has __pve_base__ snapshot AND is NOT a FlexClone
+    # (FlexClones inherit parent's snapshots, so we must exclude them)
+    my %is_template;
+    for my $vol (@$volumes) {
+        # Skip if this volume is a FlexClone (clone of a template)
+        next if $vol->{clone} && $vol->{clone}{is_flexclone};
+
+        my $snap = eval { $api->snapshot_get($vol->{name}, '__pve_base__'); };
+        if ($@) {
+            warn "Failed to check template status for $vol->{name}: $@\n";
+            next;
+        }
+        $is_template{$vol->{name}} = 1 if $snap;
+    }
+
+    for my $vol (@$volumes) {
+        my $decoded = decode_volume_name($vol->{name});
+        next unless $decoded;
+
+        # Check if volume belongs to requested storage
+        next if $decoded->{storage} ne $san_storage;
+
+        # Generate PVE volume name based on volume type
+        my $pve_volname;
+        if ($decoded->{type} eq 'disk') {
+            my $prefix = $is_template{$vol->{name}} ? 'base' : 'vm';
+            $pve_volname = "${prefix}-$decoded->{vmid}-disk-$decoded->{diskid}";
+        } elsif ($decoded->{type} eq 'state') {
+            # VM state volume (RAM snapshot)
+            $pve_volname = "vm-$decoded->{vmid}-state-$decoded->{snapname}";
+        } elsif ($decoded->{type} eq 'cloudinit') {
+            # Cloud-init volume
+            $pve_volname = "vm-$decoded->{vmid}-cloudinit";
+        } else {
+            $pve_volname = ontap_to_pve_volname($vol->{name});
+        }
+        next unless $pve_volname;
+
+        my $volid = "$storeid:$pve_volname";
+
+        # Filter by vollist if provided
+        if ($vollist) {
+            my $dominated = 0;
+            foreach my $pattern (@$vollist) {
+                if ($volid =~ /^\Q$pattern\E/) {
+                    $dominated = 1;
+                    last;
+                }
+            }
+            next unless $dominated;
+        }
+
+        # Get LUN size from batch query result
+        my $lun = $lun_by_vol{$vol->{name}};
+        my $size = $lun ? $lun->{space}{size} : $vol->{size};
+
+        push @res, {
+            volid  => $volid,
+            format => 'raw',
+            size   => $size,
+            vmid   => $decoded->{vmid},
+            used   => $vol->{space}{used} // 0,
+        };
+    }
+
+    return \@res;
+}
+
+sub volume_size_info {
+    my ($class, $scfg, $storeid, $volname, $timeout) = @_;
+
+    my $api = _get_api($scfg);
+    my $ontap_volname = pve_volname_to_ontap($storeid, $volname);
+    my $lun_path = encode_lun_path($ontap_volname);
+
+    my $lun = $api->lun_get($lun_path);
+    die "LUN '$lun_path' not found" unless $lun;
+
+    return wantarray ?
+        ($lun->{space}{size}, 'raw', $lun->{space}{used}, undef) :
+        $lun->{space}{size};
+}
+
+sub volume_resize {
+    my ($class, $scfg, $storeid, $volname, $size, $running) = @_;
+
+    my $api = _get_api($scfg);
+    my $ontap_volname = pve_volname_to_ontap($storeid, $volname);
+    my $lun_path = encode_lun_path($ontap_volname);
+
+    # Get current LUN size to prevent shrinking
+    my $lun = $api->lun_get($lun_path);
+    die "LUN '$lun_path' not found" unless $lun;
+
+    my $current_size = $lun->{space}{size} // 0;
+
+    # Prevent shrinking - this would cause data loss
+    if ($size < $current_size) {
+        my $current_gb = sprintf("%.2f", $current_size / (1024*1024*1024));
+        my $requested_gb = sprintf("%.2f", $size / (1024*1024*1024));
+        die "Cannot shrink LUN: current size ${current_gb}GB, requested ${requested_gb}GB. " .
+            "Shrinking would cause data loss.";
+    }
+
+    # Skip if size unchanged
+    if ($size == $current_size) {
+        return 1;
+    }
+
+    # Size is in bytes
+    # Resize volume first (add overhead for WAFL metadata)
+    my $vol_size = $size + (64 * 1024 * 1024);
+    $api->volume_resize($ontap_volname, $vol_size);
+
+    # Resize LUN
+    $api->lun_resize($lun_path, $size);
+
+    # Rescan device if VM is running to pick up new size
+    if ($running) {
+        my $wwid = eval { $api->lun_get_wwid($lun_path); };
+        if ($wwid) {
+            my $device = get_device_by_wwid($wwid);
+            if ($device && -b $device) {
+                my $protocol = $scfg->{'ontap-protocol'} // 'iscsi';
+                if ($protocol eq 'fc') {
+                    rescan_fc_hosts(delay => 1);
+                } else {
+                    eval { rescan_sessions(); };
+                    rescan_scsi_hosts();
+                }
+                multipath_reload();
+            }
+        }
+    }
+
+    return 1;
+}
+
+#
+# Volume activation
+#
+
+sub activate_volume {
+    my ($class, $storeid, $scfg, $volname, $snapname, $cache) = @_;
+
+    my $api = _get_api($scfg);
+    my $ontap_volname = pve_volname_to_ontap($storeid, $volname);
+    my $lun_path = encode_lun_path($ontap_volname);
+
+    # Ensure LUN is mapped to this node's igroup
+    my $igroup = _get_igroup_name($scfg);
+    unless ($api->lun_is_mapped($lun_path, $igroup)) {
+        $api->lun_map($lun_path, $igroup);
+    }
+
+    # Rescan for the device based on protocol
+    my $protocol = $scfg->{'ontap-protocol'} // 'iscsi';
+
+    if ($protocol eq 'fc') {
+        # FC: Issue LIP and rescan SCSI hosts (includes SCSI host scan)
+        rescan_fc_hosts(delay => 1);
+    } else {
+        # iSCSI: Rescan sessions and SCSI hosts
+        rescan_sessions();
+        rescan_scsi_hosts();
+    }
+
+    # Reload multipath to pick up new devices
+    multipath_reload();
+
+    # Get LUN WWID for device identification
+    my $wwid = $api->lun_get_wwid($lun_path);
+    die "Cannot get WWID for LUN $lun_path" unless $wwid;
+
+    # Wait for device to appear (use configurable timeout)
+    my $timeout = $scfg->{'ontap-device-timeout'} // 60;
+    my $device = wait_for_device($wwid, timeout => $timeout);
+    die "Device for LUN $lun_path did not appear within ${timeout}s. " .
+        "Check iSCSI/FC connectivity and multipath configuration." unless $device;
+
+    return 1;
+}
+
+sub deactivate_volume {
+    my ($class, $storeid, $scfg, $volname, $snapname, $cache) = @_;
+
+    # In per-node mode, we could unmap from this node
+    # But keeping mapped is safer for migrations
+    # Just flush caches
+
+    my $api = _get_api($scfg);
+    my $ontap_volname = pve_volname_to_ontap($storeid, $volname);
+    my $lun_path = encode_lun_path($ontap_volname);
+
+    my $wwid = eval { $api->lun_get_wwid($lun_path); };
+
+    if ($wwid) {
+        my $device = get_device_by_wwid($wwid);
+        if ($device && -b $device) {
+            my $sync_rc = system('sync');
+            warn "sync failed with exit code " . ($sync_rc >> 8) . "\n" if $sync_rc != 0;
+            my $flush_rc = system('blockdev', '--flushbufs', $device);
+            warn "blockdev --flushbufs failed for $device with exit code " . ($flush_rc >> 8) . "\n" if $flush_rc != 0;
+        }
+    }
+
+    return 1;
+}
+
+#
+# Temporary FlexClone management for snapshot access
+# These are created when PVE needs to read snapshot data (e.g., Full Clone from VM snapshot)
+#
+
+sub _get_temp_clone_name {
+    my ($ontap_volname, $snapname) = @_;
+    my $ontap_snapname = encode_snapshot_name($snapname);
+    # Temp clone name format: tmpclone_<volname>_<snap>
+    my $name = "tmpclone_${ontap_volname}_${ontap_snapname}";
+    $name =~ s/[^a-zA-Z0-9_]/_/g;  # Sanitize for ONTAP naming rules
+    return substr($name, 0, 197);  # ONTAP max volume name length is 203
+}
+
+sub _track_temp_clone {
+    my ($storeid, $clone_name) = @_;
+
+    _with_temp_clone_lock(sub {
+        my $state = _read_temp_clone_state();
+        $state->{$storeid} //= {};
+        $state->{$storeid}{$clone_name} = time();
+        _write_temp_clone_state($state);
+    });
+}
+
+sub _cleanup_temp_clones {
+    my ($api, $storeid) = @_;
+
+    _with_temp_clone_lock(sub {
+        my $state = _read_temp_clone_state();
+        my $storage_clones = $state->{$storeid} // {};
+        my $now = time();
+        my $cleaned = 0;
+
+        for my $clone_name (keys %$storage_clones) {
+            my $created = $storage_clones->{$clone_name};
+            if ($now - $created > $TEMP_CLONE_MAX_AGE) {
+                warn "Cleaning up old temporary FlexClone: $clone_name\n";
+                eval {
+                    # Unmap LUN and delete volume
+                    my $lun_path = encode_lun_path($clone_name);
+                    eval { $api->lun_unmap_all($lun_path); };
+                    $api->volume_delete($clone_name);
+                    delete $storage_clones->{$clone_name};
+                    $cleaned++;
+                };
+                warn "Failed to cleanup temp clone '$clone_name': $@\n" if $@;
+            }
+        }
+
+        if ($cleaned) {
+            $state->{$storeid} = $storage_clones;
+            _write_temp_clone_state($state);
+        }
+    });
+}
+
+sub _get_snapshot_path {
+    my ($class, $scfg, $volname, $storeid, $snapname, $api, $parsed) = @_;
+
+    my $ontap_volname = pve_volname_to_ontap($storeid, $volname);
+    my $temp_clone_name = _get_temp_clone_name($ontap_volname, $snapname);
+    my $ontap_snapname = encode_snapshot_name($snapname);
+
+    # Check if temporary clone already exists
+    my $temp_vol = eval { $api->volume_get($temp_clone_name); };
+
+    if (!$temp_vol) {
+        # Create FlexClone from snapshot
+        warn "Creating temporary FlexClone '$temp_clone_name' for snapshot '$snapname' access\n";
+
+        # Create FlexClone from the snapshot
+        $api->volume_clone(
+            clone_name      => $temp_clone_name,
+            parent_name     => $ontap_volname,
+            parent_snapshot => $ontap_snapname,
+        );
+
+        # Track for cleanup
+        _track_temp_clone($storeid, $temp_clone_name);
+    }
+
+    # Always ensure LUN is mapped and device is discovered
+    # (handles case where previous attempt failed after clone creation)
+    my $lun_path = encode_lun_path($temp_clone_name);
+    my $protocol = $scfg->{'ontap-protocol'} // 'iscsi';
+    my $igroup_name = _get_igroup_name($scfg);
+
+    # Try to map LUN (may already be mapped)
+    eval { $api->lun_map($lun_path, $igroup_name); };
+    if ($@) {
+        # Only warn if not "already mapped" error
+        warn "LUN map info: $@\n" unless $@ =~ /already mapped|already exists/i;
+    }
+
+    # Rescan to discover the LUN
+    if ($protocol eq 'fc') {
+        rescan_fc_hosts();
+    } else {
+        rescan_sessions();
+        rescan_scsi_hosts();
+    }
+    multipath_reload();
+
+    # Get WWID and device path
+    my $timeout = $scfg->{'ontap-device-timeout'} // 30;
+
+    my $wwid = eval { $api->lun_get_wwid($lun_path); };
+    die "Failed to get WWID for temporary clone LUN: $@" unless $wwid;
+
+    # Wait for device to appear
+    my $device = wait_for_multipath_device($wwid, timeout => $timeout);
+    $device //= get_device_by_wwid($wwid);
+
+    if (!$device || ! -b $device) {
+        # One more rescan attempt
+        if ($protocol eq 'fc') {
+            rescan_fc_hosts(delay => 2);
+        } else {
+            rescan_sessions();
+            rescan_scsi_hosts();
+        }
+        multipath_reload();
+        sleep(3);
+
+        $device = get_multipath_device($wwid);
+        $device //= get_device_by_wwid($wwid);
+    }
+
+    die "Failed to find device for temporary clone '$temp_clone_name' (WWID: $wwid)"
+        unless $device && -b $device;
+
+    return ($device, $parsed->{vmid}, 'raw');
+}
+
+sub path {
+    my ($class, $scfg, $volname, $storeid, $snapname) = @_;
+
+    my $parsed = _parse_volname($volname);
+    die "Cannot parse volume name: $volname" unless $parsed;
+
+    my $api = _get_api($scfg);
+    my $ontap_volname = pve_volname_to_ontap($storeid, $volname);
+
+    # For snapshot access, create a temporary FlexClone that qemu-img can read
+    # This is needed for Full Clone from VM snapshot operations
+    if ($snapname) {
+        return _get_snapshot_path($class, $scfg, $volname, $storeid, $snapname, $api, $parsed);
+    }
+
+    # For current volume access (no snapshot)
+    my $lun_path = encode_lun_path($ontap_volname);
+
+    # Try to get WWID - LUN might not exist (orphaned volume, partial cleanup, etc.)
+    my $wwid = eval { $api->lun_get_wwid($lun_path); };
+    if (!$wwid) {
+        # LUN doesn't exist - return synthetic path based on volume name
+        # This allows delete operations to proceed via ONTAP API
+        my $synthetic_wwid = "3600a0980" . unpack('H*', substr($ontap_volname, 0, 12));
+        warn "LUN $lun_path not found on ONTAP, returning synthetic path for cleanup\n";
+        return ("/dev/mapper/$synthetic_wwid", $parsed->{vmid}, 'raw');
+    }
+
+    # Try multipath first
+    my $device = get_multipath_device($wwid);
+    $device //= get_device_by_wwid($wwid);
+
+    # If device not found, try a quick rescan (non-blocking)
+    if (!$device || ! -b $device) {
+        my $protocol = $scfg->{'ontap-protocol'} // 'iscsi';
+        if ($protocol eq 'fc') {
+            rescan_fc_hosts(delay => 1);
+        } else {
+            rescan_sessions();
+            rescan_scsi_hosts();
+        }
+        multipath_reload();
+        sleep(2);
+
+        $device = get_multipath_device($wwid);
+        $device //= get_device_by_wwid($wwid);
+    }
+
+    # If device still not found, return a synthetic path based on WWID
+    # This allows operations like delete to proceed (they work directly with ONTAP API)
+    # Actual I/O operations will fail appropriately when they try to access the device
+    if (!$device || ! -b $device) {
+        # Return expected multipath device path - it may appear later
+        $device = "/dev/mapper/$wwid";
+        warn "Device for LUN $lun_path not found locally, returning synthetic path: $device\n";
+    }
+
+    return ($device, $parsed->{vmid}, 'raw');
+}
+
+sub filesystem_path {
+    my ($class, $scfg, $volname, $snapname) = @_;
+
+    my ($path, $vmid, $format) = $class->path($scfg, $volname, $scfg->{storage}, $snapname);
+    return wantarray ? ($path, $vmid, $format) : $path;
+}
+
+#
+# Snapshot operations
+#
+
+sub volume_snapshot {
+    my ($class, $scfg, $storeid, $volname, $snap) = @_;
+
+    my $api = _get_api($scfg);
+    my $ontap_volname = pve_volname_to_ontap($storeid, $volname);
+    my $ontap_snapname = encode_snapshot_name($snap);
+
+    # Safety check: Verify snapshot doesn't already exist
+    my $existing_snap = $api->snapshot_get($ontap_volname, $ontap_snapname);
+    if ($existing_snap) {
+        die "Snapshot '$snap' already exists on volume '$volname'. " .
+            "Please use a different snapshot name or delete the existing snapshot first.";
+    }
+
+    $api->snapshot_create($ontap_volname, $ontap_snapname);
+
+    return 1;
+}
+
+sub volume_snapshot_delete {
+    my ($class, $scfg, $storeid, $volname, $snap, $running) = @_;
+
+    my $api = _get_api($scfg);
+    my $ontap_volname = pve_volname_to_ontap($storeid, $volname);
+    my $ontap_snapname = encode_snapshot_name($snap);
+
+    $api->snapshot_delete($ontap_volname, $ontap_snapname);
+
+    return 1;
+}
+
+sub volume_snapshot_rollback {
+    my ($class, $scfg, $storeid, $volname, $snap) = @_;
+
+    my $api = _get_api($scfg);
+    my $ontap_volname = pve_volname_to_ontap($storeid, $volname);
+    my $ontap_snapname = encode_snapshot_name($snap);
+    my $lun_path = encode_lun_path($ontap_volname);
+
+    # Quiesce device before rollback to prevent data corruption
+    my $wwid = eval { $api->lun_get_wwid($lun_path); };
+    if ($wwid) {
+        my $device = get_device_by_wwid($wwid);
+        if ($device && -b $device) {
+            if (is_device_in_use($device)) {
+                die "Cannot rollback snapshot: device $device is still in use. " .
+                    "Please stop the VM first.";
+            }
+            system('sync');
+            system('blockdev', '--flushbufs', $device);
+        }
+    }
+
+    # Rollback the volume to snapshot
+    $api->snapshot_rollback($ontap_volname, $ontap_snapname);
+
+    # Rescan to pick up any size changes based on protocol
+    my $protocol = $scfg->{'ontap-protocol'} // 'iscsi';
+    if ($protocol eq 'fc') {
+        rescan_fc_hosts(delay => 1);
+    } else {
+        eval { rescan_sessions(); };  # May fail if no active sessions
+        rescan_scsi_hosts();
+    }
+    multipath_reload();
+
+    return 1;
+}
+
+sub volume_snapshot_list {
+    my ($class, $scfg, $storeid, $volname) = @_;
+
+    my $api = _get_api($scfg);
+    my $ontap_volname = pve_volname_to_ontap($storeid, $volname);
+
+    my $snapshots = $api->snapshot_list($ontap_volname, 'pve_snap_*');
+
+    my @result;
+    for my $snap (@$snapshots) {
+        my $pve_snapname = decode_snapshot_name($snap->{name});
+        next unless $pve_snapname;
+
+        push @result, {
+            name   => $pve_snapname,
+            ctime  => $snap->{create_time},
+        };
+    }
+
+    return \@result;
+}
+
+#
+# Feature support
+#
+
+sub volume_has_feature {
+    my ($class, $scfg, $feature, $storeid, $volname, $snapname, $running, $opts) = @_;
+
+    # For clone feature, we support FlexClone for all cases
+    # When cloning from snapshot, clone_image does FlexClone + Split (independent volume)
+    # When cloning from template, clone_image does FlexClone only (linked clone)
+    if ($feature eq 'clone') {
+        return 1;  # Always allow - we handle all clone scenarios via FlexClone
+    }
+
+    # For copy feature (qemu-img based full clone):
+    # - Snapshots: Allow - we create a temporary FlexClone for qemu-img to read
+    # - Current: Allow - QEMU can read current volume directly
+    if ($feature eq 'copy') {
+        return 1;  # Allow copy - path() handles snapshot access via temp FlexClone
+    }
+
+    my $features = {
+        snapshot   => { current => 1, snap => 1 },
+        sparseinit => { base => 1, current => 1 },
+        rename     => { current => 1 },
+        template   => { current => 1 },  # Allow template creation
+    };
+
+    my $key = $snapname ? 'snap' : 'current';
+
+    return 1 if defined($features->{$feature}) && $features->{$feature}{$key};
+    return 0;
+}
+
+sub parse_volname {
+    my ($class, $volname) = @_;
+
+    my $parsed = _parse_volname($volname);
+    return undef unless $parsed;
+
+    # Return format: ($vtype, $name, $vmid, $basename, $basevmid, $isBase, $format)
+    if ($parsed->{type} eq 'disk') {
+        my $isBase = $parsed->{isBase} ? 1 : 0;
+        return ('images', $volname, $parsed->{vmid}, undef, undef, $isBase, $parsed->{format});
+    } elsif ($parsed->{type} eq 'cloudinit') {
+        return ('images', $volname, $parsed->{vmid}, undef, undef, 0, $parsed->{format});
+    } elsif ($parsed->{type} eq 'state') {
+        return ('images', $volname, $parsed->{vmid}, undef, undef, 0, $parsed->{format});
+    }
+
+    return undef;
+}
+
+#
+# Template support (create_base and rename_volume)
+#
+
+sub create_base {
+    my ($class, $storeid, $scfg, $volname) = @_;
+
+    my ($vtype, $name, $vmid, $basename, $basevmid, $isBase, $format) =
+        $class->parse_volname($volname);
+
+    die "create_base on wrong vtype '$vtype'\n" if $vtype ne 'images';
+    die "create_base not possible with base image\n" if $isBase;
+
+    my $api = _get_api($scfg);
+    my $ontap_volname = pve_volname_to_ontap($storeid, $volname);
+    my $lun_path = encode_lun_path($ontap_volname);
+
+    # Verify volume exists
+    my $vol = $api->volume_get($ontap_volname);
+    die "Volume '$ontap_volname' not found on ONTAP\n" unless $vol;
+
+    # Create __pve_base__ snapshot for future cloning
+    # This snapshot serves as the base point for linked clones
+    my $base_snapshot = '__pve_base__';
+    my $existing_snap = $api->snapshot_get($ontap_volname, $base_snapshot);
+    unless ($existing_snap) {
+        $api->snapshot_create($ontap_volname, $base_snapshot);
+    }
+
+    # Generate new PVE volume name (vm-XXX-disk-X -> base-XXX-disk-X)
+    # ONTAP volume name stays the same - only PVE naming changes
+    my $newname = $name;
+    $newname =~ s/^vm-/base-/;
+
+    return $newname;
+}
+
+sub rename_volume {
+    my ($class, $scfg, $storeid, $source_volname, $target_vmid, $target_volname) = @_;
+
+    my ($vtype, $source_name, $source_vmid, undef, undef, $isBase, $format) =
+        $class->parse_volname($source_volname);
+
+    die "rename_volume on wrong vtype '$vtype'\n" if $vtype ne 'images';
+
+    my $api = _get_api($scfg);
+
+    # Determine target volume name if not provided
+    if (!$target_volname) {
+        $target_volname = $class->find_free_diskname($storeid, $scfg, $target_vmid, $format);
+    }
+
+    # Get source ONTAP volume name
+    my $source_ontap_vol = pve_volname_to_ontap($storeid, $source_volname);
+    my $source_lun_path = encode_lun_path($source_ontap_vol);
+
+    # Get target ONTAP volume name
+    my $target_ontap_vol = pve_volname_to_ontap($storeid, $target_volname);
+    my $target_lun_path = encode_lun_path($target_ontap_vol);
+
+    # Check if source volume exists
+    my $vol = $api->volume_get($source_ontap_vol);
+    die "Source volume '$source_ontap_vol' not found on ONTAP\n" unless $vol;
+
+    # Check if target volume already exists
+    my $existing = $api->volume_get($target_ontap_vol);
+    die "Target volume '$target_ontap_vol' already exists on ONTAP\n" if $existing;
+
+    # Rename ONTAP volume
+    $api->volume_rename($source_ontap_vol, $target_ontap_vol);
+
+    return "${storeid}:${target_volname}";
+}
+
+sub find_free_diskname {
+    my ($class, $storeid, $scfg, $vmid, $fmt, $add_fmt_suffix) = @_;
+
+    # Get list of existing disks for this VM
+    my $disk_list = $class->list_images($storeid, $scfg, $vmid);
+
+    my %used_ids;
+    for my $disk (@$disk_list) {
+        if ($disk->{volid} =~ /(?:vm|base)-$vmid-disk-(\d+)/) {
+            $used_ids{$1} = 1;
+        }
+    }
+
+    # Find first unused ID
+    for (my $id = 0; $id < 1000; $id++) {
+        unless ($used_ids{$id}) {
+            return "vm-${vmid}-disk-${id}";
+        }
+    }
+
+    die "No free disk ID found for VM $vmid\n";
+}
+
+#
+# Clone support via NetApp FlexClone
+#
+
+sub clone_image {
+    my ($class, $scfg, $storeid, $volname, $vmid, $snap) = @_;
+
+    my $api = _get_api($scfg);
+
+    # Check FlexClone license
+    unless ($api->license_has_flexclone()) {
+        die "FlexClone license not found on ONTAP system. " .
+            "FlexClone is required for linked clone operations. " .
+            "Please install ONTAP One or FlexClone license.";
+    }
+
+    # Parse source volume name
+    my $parsed = _parse_volname($volname);
+    die "Cannot parse volume name: $volname" unless $parsed;
+
+    # Get parent ONTAP volume name
+    my $parent_ontap_vol = pve_volname_to_ontap($storeid, $volname);
+
+    # Determine base snapshot name for clone
+    # If $snap is provided, use it; otherwise look for __pve_base__ snapshot
+    my $base_snapshot;
+    if ($snap) {
+        $base_snapshot = encode_snapshot_name($snap);
+    } else {
+        # Check if __pve_base__ snapshot exists, create if not
+        $base_snapshot = '__pve_base__';
+        my $existing = $api->snapshot_get($parent_ontap_vol, $base_snapshot);
+        unless ($existing) {
+            # Create base snapshot for cloning
+            $api->snapshot_create($parent_ontap_vol, $base_snapshot);
+        }
+    }
+
+    # Generate new disk ID for clone (with retry for concurrent allocation)
+    my $new_diskid;
+    my $new_volname;
+    my $clone_ontap_vol;
+    my $clone_lun_path;
+    my $max_clone_retries = 5;
+
+    for my $retry (0 .. $max_clone_retries) {
+        my $disk_list = $class->list_images($storeid, $scfg, $vmid);
+        my $max_disk = -1;
+        for my $disk (@$disk_list) {
+            if ($disk->{volid} =~ /vm-$vmid-disk-(\d+)/) {
+                $max_disk = $1 if $1 > $max_disk;
+            }
+        }
+        $new_diskid = $max_disk + 1 + $retry;
+        $new_volname = "vm-${vmid}-disk-${new_diskid}";
+        $clone_ontap_vol = encode_volume_name($storeid, $vmid, $new_diskid);
+        $clone_lun_path = encode_lun_path($clone_ontap_vol);
+
+        # Check if volume already exists on ONTAP
+        my $existing = $api->volume_get($clone_ontap_vol);
+        last unless $existing;
+
+        die "Cannot find free disk ID for clone after $max_clone_retries retries"
+            if $retry == $max_clone_retries;
+    }
+
+    # Create FlexClone
+    eval {
+        $api->volume_clone(
+            clone_name      => $clone_ontap_vol,
+            parent_name     => $parent_ontap_vol,
+            parent_snapshot => $base_snapshot,
+        );
+    };
+    if ($@) {
+        die "Failed to create FlexClone: $@";
+    }
+
+    # The LUN inside the FlexClone volume is automatically cloned with new identity
+    # Wait a moment for the LUN to be ready
+    sleep(2);
+
+    # Check if LUN exists in the cloned volume
+    my $lun = $api->lun_get($clone_lun_path);
+    unless ($lun) {
+        # Cleanup and fail
+        eval { $api->volume_delete($clone_ontap_vol); };
+        die "LUN not found in cloned volume: $clone_lun_path. " .
+            "FlexClone may not have copied the LUN correctly.";
+    }
+
+    # Map cloned LUN to igroups
+    my $map_error;
+    eval {
+        my $igroup_mode = $scfg->{'ontap-igroup-mode'} // 'per-node';
+        if ($igroup_mode eq 'shared') {
+            my $igroup = _get_igroup_name($scfg);
+            $api->lun_map($clone_lun_path, $igroup);
+        } else {
+            # Per-node mode: map to all node igroups for migration support
+            my $cluster_name = $scfg->{'ontap-cluster-name'} // 'pve';
+            my $igroups = $api->igroup_list();
+            my $ontap_proto = _get_ontap_protocol($scfg);
+            my $mapped = 0;
+            for my $ig (@$igroups) {
+                next unless ($ig->{protocol} // '') eq $ontap_proto;
+                if ($ig->{name} =~ /^pve_${cluster_name}_/) {
+                    eval {
+                        $api->lun_map($clone_lun_path, $ig->{name});
+                        $mapped++;
+                    };
+                    if ($@) {
+                        $map_error = $@ unless $map_error;
+                    }
+                }
+            }
+            die "No matching igroups found for cluster '$cluster_name'" unless $mapped > 0 || $map_error;
+        }
+    };
+    if ($@ || $map_error) {
+        my $err = $@ || $map_error || "Unknown error";
+        # Cleanup on failure
+        eval { $api->volume_delete($clone_ontap_vol); };
+        die "Failed to map cloned LUN to igroup: $err";
+    }
+
+    # Note: clone_image is only called for Linked Clone from template
+    # Full Clone from VM snapshot uses the 'copy' path (temp FlexClone + qemu-img)
+    # So we keep the clone as a space-efficient FlexClone here
+
+    return $new_volname;
+}
+
+1;
+
+__END__
+
+=head1 NAME
+
+PVE::Storage::Custom::NetAppONTAPPlugin - NetApp ONTAP SAN/iSCSI Storage Plugin for Proxmox VE
+
+=head1 SYNOPSIS
+
+Add storage configuration in /etc/pve/storage.cfg:
+
+    netappontap: netapp1
+        portal 192.168.1.100
+        svm svm0
+        aggregate aggr1
+        username admin
+        password secret
+        content images
+
+=head1 DESCRIPTION
+
+This plugin enables Proxmox VE to use NetApp ONTAP storage systems via iSCSI
+protocol for VM disk storage.
+
+Key features:
+
+=over 4
+
+=item * 1 VM disk = 1 LUN = 1 FlexVol (clean snapshot semantics)
+
+=item * Snapshot create/delete/rollback via ONTAP Volume Snapshots
+
+=item * Real-time capacity reporting from ONTAP
+
+=item * Multipath I/O support
+
+=item * Cluster-aware for live migration
+
+=back
+
+=head1 CONFIGURATION OPTIONS
+
+=over 4
+
+=item B<portal> - ONTAP management IP/hostname (required)
+
+=item B<svm> - Storage Virtual Machine name (required)
+
+=item B<aggregate> - Aggregate for volume creation (required)
+
+=item B<username> - API username (required)
+
+=item B<password> - API password (required)
+
+=item B<ssl_verify> - Verify SSL certificates (default: yes)
+
+=item B<thin> - Use thin provisioning (default: yes)
+
+=item B<igroup_mode> - 'per-node' or 'shared' igroup (default: per-node)
+
+=back
+
+=head1 AUTHOR
+
+Jason Cheng (Jason Tools) <jason@jason.tools>
+
+=head1 LICENSE
+
+MIT License
+
+=cut

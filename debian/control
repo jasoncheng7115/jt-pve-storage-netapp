@@ -1,0 +1,30 @@
+Source: jt-pve-storage-netapp
+Section: admin
+Priority: optional
+Maintainer: Jason Cheng (Jason Tools) <jason@jason.tools>
+Build-Depends: debhelper (>= 12)
+Standards-Version: 4.5.0
+Homepage: https://github.com/jasoncheng7115/jt-pve-storage-netapp
+
+Package: jt-pve-storage-netapp
+Architecture: all
+Depends: ${misc:Depends},
+         proxmox-ve (>= 9.1) | pve-manager (>= 9.1),
+         libwww-perl,
+         libjson-perl,
+         liburi-perl,
+         open-iscsi,
+         multipath-tools,
+         sg3-utils,
+         psmisc
+Recommends: lsscsi
+Description: NetApp ONTAP SAN/iSCSI Storage Plugin for Proxmox VE
+ This plugin enables Proxmox VE to use NetApp ONTAP storage systems
+ via iSCSI protocol for VM disk storage.
+ .
+ Features:
+  - Automatic FlexVol and LUN provisioning
+  - Snapshot create/delete/rollback via ONTAP Volume Snapshots
+  - Real-time capacity reporting from ONTAP
+  - Multipath I/O support
+  - Cluster-aware for live migration

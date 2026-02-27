@@ -101,7 +101,7 @@ All notable changes to this project will be documented in this file.
 - Flushes device buffers and removes multipath devices
 - Safety check: skips cleanup for devices still in use
 
-## [0.1.5-1] - 2025-01-03
+## [0.1.5-1] - 2026-01-03
 
 ### Template Support Release
 
@@ -114,7 +114,7 @@ All notable changes to this project will be documented in this file.
 - `list_images` now correctly identifies template volumes
 - `path()` now handles missing LUNs gracefully (returns synthetic path for orphaned volumes)
 
-## [0.1.4-1] - 2025-01-03
+## [0.1.4-1] - 2026-01-03
 
 ### FC SAN Support Release
 
@@ -134,7 +134,7 @@ All notable changes to this project will be documented in this file.
 - Fixed async job handling for DELETE and PATCH API calls
 - Volume deletion now properly waits for ONTAP job completion
 
-## [0.1.3-1] - 2025-01-03
+## [0.1.3-1] - 2026-01-03
 
 ### FlexClone Support Release
 
@@ -148,7 +148,7 @@ All notable changes to this project will be documented in this file.
 - Fixed prerm script hanging during upgrade (added 5s timeout)
 - Fixed postinst script potential hang (added timeout for systemctl calls)
 
-## [0.1.2-1] - 2025-01-02
+## [0.1.2-1] - 2026-01-02
 
 ### Bug Fix & Dependency Release
 
@@ -156,7 +156,7 @@ All notable changes to this project will be documented in this file.
 - Reduced initial overhead to 64MB (was 5GB)
 - Added missing dependency: psmisc (provides `fuser` for device-in-use detection)
 
-## [0.1.1-1] - 2025-01-02
+## [0.1.1-1] - 2026-01-02
 
 ### Safety Improvements Release
 
@@ -164,7 +164,7 @@ All notable changes to this project will be documented in this file.
 - Added API cache TTL (5 minutes)
 - Fixed taint mode compatibility for PVE's qemu-img operations
 
-## [0.1.0-1] - 2025-01-02
+## [0.1.0-1] - 2026-01-02
 
 ### Initial Release
 

@@ -591,9 +591,9 @@ vol delete -vserver <svm> -volume <vol-name>
    ```
 
 2. **查閱文件：**
-   - [QUICKSTART.md](QUICKSTART.md)
+   - [QUICKSTART_zh-TW.md](QUICKSTART_zh-TW.md)
    - [CONFIGURATION_zh-TW.md](CONFIGURATION_zh-TW.md)
-   - [NAMING_CONVENTIONS.md](NAMING_CONVENTIONS.md)
+   - [NAMING_CONVENTIONS_zh-TW.md](NAMING_CONVENTIONS_zh-TW.md)
 
 3. **回報問題：**
    - GitHub Issues：https://github.com/jasoncheng7115/jt-pve-storage-netapp/issues

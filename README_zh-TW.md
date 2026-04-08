@@ -83,7 +83,7 @@ systemctl reload multipathd
 | `queue_if_no_path`（在 features 中）| 同上 | 從 `features` 行移除 |
 | `dev_loss_tmo infinity` | Stale 裝置永遠不會被移除 | 改為 `dev_loss_tmo 60` |
 
-Plugin 安裝時會偵測這些設定並顯示醒目警告。詳見 [docs/CONFIGURATION.md](docs/CONFIGURATION.md#multipath-configuration)。
+Plugin 安裝時會偵測這些設定並顯示醒目警告。詳見 [docs/CONFIGURATION_zh-TW.md](docs/CONFIGURATION_zh-TW.md#多重路徑-multipath-設定)。
 
 ### 規則 4：v0.2.2 之後會自動清理
 
@@ -370,7 +370,7 @@ pvesm status
 # netapp1     netappontap    active  ...     ...   ...
 ```
 
-詳細配置選項請參閱 [docs/CONFIGURATION.md](docs/CONFIGURATION.md)。
+詳細配置選項請參閱 [docs/CONFIGURATION_zh-TW.md](docs/CONFIGURATION_zh-TW.md)。
 
 ## 配置選項
 
@@ -580,7 +580,7 @@ Proxmox VE Cluster                    NetApp ONTAP
 | Cloud-init | FlexVol | `pve_{storage}_{vmid}_cloudinit` |
 | VM 狀態 | FlexVol | `pve_{storage}_{vmid}_state_{snap}` |
 
-詳細命名規範請參閱 [docs/NAMING_CONVENTIONS.md](docs/NAMING_CONVENTIONS.md)。
+詳細命名規範請參閱 [docs/NAMING_CONVENTIONS_zh-TW.md](docs/NAMING_CONVENTIONS_zh-TW.md)。
 
 ### 資料流程
 
@@ -746,7 +746,7 @@ PVE::Storage::Plugin (Proxmox VE 基礎類別)
 | **iSCSI** | 已測試 | 22 項完整測試套件通過（v0.2.1）|
 | **FC (Fibre Channel)** | 尚未完整驗證 | 基本實作已完成，需要實際 FC 環境測試 |
 
-完整測試計畫及發版測試結果：[docs/TESTING.md](docs/TESTING.md)
+完整測試計畫及發版測試結果：[docs/TESTING_zh-TW.md](docs/TESTING_zh-TW.md)
 
 ## 已知限制
 
@@ -1035,7 +1035,7 @@ multipath -F
 multipathd reconfigure
 ```
 
-詳細疑難排解請參閱 [docs/TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md)。
+詳細疑難排解請參閱 [docs/TROUBLESHOOTING_zh-TW.md](docs/TROUBLESHOOTING_zh-TW.md)。
 
 ## 解除安裝
 

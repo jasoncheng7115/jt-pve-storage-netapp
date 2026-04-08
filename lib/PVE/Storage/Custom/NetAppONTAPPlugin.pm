@@ -177,6 +177,12 @@ my $TEMP_CLONE_STATE_FILE = '/var/run/pve-storage-netapp-temp-clones.json';
 my $TEMP_CLONE_LOCK_FILE = '/var/run/pve-storage-netapp-temp-clones.lock';
 my $TEMP_CLONE_MAX_AGE = 3600;  # 1 hour - cleanup clones older than this
 
+# WWID tracking for orphan device cleanup
+# Tracks WWIDs that this node has seen as belonging to this storage.
+# Persisted across reboots so we can clean up orphans even after node restart.
+my $WWID_STATE_DIR = '/var/lib/pve-storage-netapp';
+my $WWID_LOCK_DIR  = '/var/run/pve-storage-netapp';
+
 sub _get_api {
     my ($scfg) = @_;
 
@@ -579,6 +585,178 @@ sub _cleanup_temp_clones_for_storage {
     });
 }
 
+#
+# WWID tracking for cluster-wide orphan device cleanup
+#
+# Each node maintains a state file per storage listing WWIDs it has seen.
+# When a LUN is deleted on one node, other nodes detect orphans by comparing
+# their tracked WWIDs against the current ONTAP LUN list.
+# Only WWIDs in the tracking file are eligible for cleanup, ensuring we never
+# touch devices that don't belong to this plugin.
+#
+
+sub _wwid_state_file {
+    my ($storeid) = @_;
+    my $safe_storeid = $storeid;
+    $safe_storeid =~ s/[^a-zA-Z0-9_-]/_/g;
+    return "$WWID_STATE_DIR/${safe_storeid}-wwids.json";
+}
+
+sub _wwid_lock_file {
+    my ($storeid) = @_;
+    my $safe_storeid = $storeid;
+    $safe_storeid =~ s/[^a-zA-Z0-9_-]/_/g;
+    return "$WWID_LOCK_DIR/${safe_storeid}-wwids.lock";
+}
+
+sub _ensure_wwid_state_dir {
+    if (! -d $WWID_STATE_DIR) {
+        eval { mkdir $WWID_STATE_DIR, 0700; };
+        warn "Cannot create $WWID_STATE_DIR: $@" if $@ && ! -d $WWID_STATE_DIR;
+    }
+    if (! -d $WWID_LOCK_DIR) {
+        eval { mkdir $WWID_LOCK_DIR, 0700; };
+        warn "Cannot create $WWID_LOCK_DIR: $@" if $@ && ! -d $WWID_LOCK_DIR;
+    }
+}
+
+# Acquire exclusive lock on WWID state file to serialize concurrent
+# read-modify-write operations from multiple PVE workers.
+sub _with_wwid_lock {
+    my ($storeid, $code) = @_;
+    _ensure_wwid_state_dir();
+    my $lock_file = _wwid_lock_file($storeid);
+    open(my $lock_fh, '>', $lock_file) or do {
+        warn "Cannot open WWID lock file $lock_file: $!\n";
+        return $code->();
+    };
+
+    # Non-blocking flock with retry, max 10s
+    my $deadline = time() + 10;
+    my $locked = 0;
+    while (time() < $deadline) {
+        if (flock($lock_fh, LOCK_EX | LOCK_NB)) {
+            $locked = 1;
+            last;
+        }
+        select(undef, undef, undef, 0.1);
+    }
+    unless ($locked) {
+        warn "Cannot acquire WWID lock for $storeid within 10s, proceeding without lock\n";
+        close($lock_fh);
+        return $code->();
+    }
+
+    my $result = eval { $code->() };
+    my $err = $@;
+    flock($lock_fh, LOCK_UN);
+    close($lock_fh);
+    die $err if $err;
+    return $result;
+}
+
+sub _read_wwid_state {
+    my ($storeid) = @_;
+    my $file = _wwid_state_file($storeid);
+    return {} unless -f $file;
+    my $json = do { local $/; open my $fh, '<', $file or return {}; <$fh> };
+    return eval { JSON::decode_json($json) } // {};
+}
+
+sub _write_wwid_state {
+    my ($storeid, $state) = @_;
+    _ensure_wwid_state_dir();
+    my $file = _wwid_state_file($storeid);
+    # Atomic write: write to temp file then rename
+    my $tmp = "$file.tmp.$$";
+    open my $fh, '>', $tmp or do {
+        warn "Cannot write WWID state file $tmp: $!\n";
+        return;
+    };
+    print $fh JSON::encode_json($state);
+    close $fh;
+    rename($tmp, $file) or warn "Cannot rename $tmp -> $file: $!\n";
+}
+
+sub _track_wwid {
+    my ($storeid, $wwid) = @_;
+    return unless $wwid;
+    _with_wwid_lock($storeid, sub {
+        my $state = _read_wwid_state($storeid);
+        return if $state->{lc($wwid)};  # already tracked
+        $state->{lc($wwid)} = time();
+        _write_wwid_state($storeid, $state);
+    });
+}
+
+sub _untrack_wwid {
+    my ($storeid, $wwid) = @_;
+    return unless $wwid;
+    _with_wwid_lock($storeid, sub {
+        my $state = _read_wwid_state($storeid);
+        if (delete $state->{lc($wwid)}) {
+            _write_wwid_state($storeid, $state);
+        }
+    });
+}
+
+# Find and clean up orphaned multipath devices on this node.
+# An orphan is a multipath device whose WWID:
+#   1. Is in our tracking state (we created it from this storage)
+#   2. Is no longer present on ONTAP (LUN was deleted, possibly from another node)
+# This handles the cluster-wide case: when Node A deletes a VM, Node B's stale
+# devices for the same LUN are eventually cleaned up by Node B's status() poll.
+#
+# Safety: only cleans WWIDs in our tracking file, never touches manually-managed
+# NetApp devices or devices belonging to other plugins.
+sub _cleanup_orphaned_devices {
+    my ($api, $storeid) = @_;
+
+    # Read tracked WWIDs (WWIDs we know about)
+    my $tracked = _read_wwid_state($storeid);
+    return unless %$tracked;
+
+    # Query ONTAP for currently existing LUNs in this storage
+    my $san_storage = $storeid;
+    $san_storage =~ s/-/_/g;
+    my $luns = eval { $api->lun_list("/vol/pve_${san_storage}_*/lun0"); };
+    if ($@ || !defined $luns) {
+        # API error - abort to avoid false positives
+        warn "Orphan cleanup: failed to query ONTAP LUN list: $@\n" if $@;
+        return;
+    }
+
+    # Build set of currently-alive WWIDs
+    my %alive_wwids;
+    for my $lun (@$luns) {
+        my $wwid = eval { $api->lun_get_wwid($lun->{name}); };
+        next unless $wwid;
+        $alive_wwids{lc($wwid)} = 1;
+    }
+
+    # Find orphans: tracked WWIDs that are no longer on ONTAP
+    my $cleaned = 0;
+    for my $wwid (keys %$tracked) {
+        next if $alive_wwids{$wwid};
+
+        # WWID is no longer on ONTAP. Check if there's a local multipath device
+        # to clean up. cleanup_lun_devices is idempotent and safe.
+        my $mpath = get_multipath_device($wwid);
+        if ($mpath) {
+            warn "Orphan cleanup: removing stale device for WWID $wwid (LUN deleted on ONTAP)\n";
+            eval { cleanup_lun_devices($wwid); };
+            warn "Orphan cleanup error for $wwid: $@\n" if $@;
+        }
+
+        # Untrack the WWID regardless (it's gone from ONTAP)
+        _untrack_wwid($storeid, $wwid);
+        $cleaned++;
+    }
+
+    warn "Orphan cleanup: processed $cleaned stale WWID(s) for storage '$storeid'\n"
+        if $cleaned > 0;
+}
+
 sub status {
     my ($class, $storeid, $scfg, $cache) = @_;
 
@@ -588,14 +766,28 @@ sub status {
         return (0, 0, 0, 0);
     }
 
-    # Cleanup old temporary FlexClones in background (don't block status check)
-    my $cleanup_pid = fork();
-    if (defined $cleanup_pid && $cleanup_pid == 0) {
-        eval { _cleanup_temp_clones($api, $storeid); };
+    # Background cleanup tasks (don't block status check)
+    # 1. Old temporary FlexClones
+    # 2. Orphaned multipath devices (LUNs deleted on other cluster nodes)
+    #
+    # Double-fork pattern: parent forks intermediate, intermediate forks
+    # grandchild and exits immediately. Grandchild gets reparented to init
+    # and is reaped by init -- preventing zombie accumulation in pvedaemon.
+    my $intermediate_pid = fork();
+    if (defined $intermediate_pid && $intermediate_pid == 0) {
+        # Intermediate child: fork again then exit
+        my $grandchild_pid = fork();
+        if (defined $grandchild_pid && $grandchild_pid == 0) {
+            # Grandchild: do the actual work, will be reparented to init
+            eval { _cleanup_temp_clones($api, $storeid); };
+            eval { _cleanup_orphaned_devices($api, $storeid); };
+            POSIX::_exit(0);
+        }
+        # Intermediate exits immediately, leaving grandchild orphaned
         POSIX::_exit(0);
     }
-    # Reap immediately if child already finished
-    waitpid($cleanup_pid, POSIX::WNOHANG()) if defined $cleanup_pid;
+    # Parent reaps the intermediate (which exits immediately)
+    waitpid($intermediate_pid, 0) if defined $intermediate_pid;
 
     eval {
         my $capacity = $api->get_managed_capacity();
@@ -937,6 +1129,9 @@ sub free_image {
 
     die "Failed to delete volume '$ontap_volname' after $max_retries attempts: ONTAP reports stale clone metadata"
         unless $deleted;
+
+    # Untrack WWID since LUN is now deleted
+    eval { _untrack_wwid($storeid, $wwid); } if $wwid;
 
     return undef;
 }
@@ -1407,6 +1602,9 @@ sub path {
     if (!$device || ! -b $device) {
         $device = "/dev/mapper/$wwid";
         warn "Device for LUN $lun_path not found locally after waiting, returning synthetic path: $device\n";
+    } else {
+        # Track this WWID so we can clean up orphans later if the LUN is deleted on another node
+        eval { _track_wwid($storeid, $wwid); };
     }
 
     return ($device, $parsed->{vmid}, 'raw');

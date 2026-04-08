@@ -4,6 +4,33 @@
 
 A storage plugin that enables Proxmox VE to use NetApp ONTAP storage systems via iSCSI or FC protocol for VM disk storage.
 
+## Table of Contents
+
+- [Disclaimer](#disclaimer)
+- [CRITICAL: Multipath Safety Rules](#critical-multipath-safety-rules)
+- [Features](#features)
+- [Web UI Support](#web-ui-support)
+- [Requirements](#requirements)
+- [Installation](#installation)
+- [Upgrade SOP](#upgrade-sop)
+- [Quick Start](#quick-start)
+- [Configuration Options](#configuration-options)
+- [Architecture](#architecture)
+- [Supported Features](#supported-features)
+- [Testing Status](#testing-status)
+- [Known Limitations](#known-limitations)
+
+### Documentation
+
+| Document | Description |
+|----------|-------------|
+| [docs/QUICKSTART.md](docs/QUICKSTART.md) | Step-by-step setup guide |
+| [docs/CONFIGURATION.md](docs/CONFIGURATION.md) | Full configuration reference (including multipath safety) |
+| [docs/TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md) | Common issues and recovery procedures |
+| [docs/NAMING_CONVENTIONS.md](docs/NAMING_CONVENTIONS.md) | ONTAP object naming patterns |
+| [docs/TESTING.md](docs/TESTING.md) | Test plan and release test results |
+| [CHANGELOG.md](CHANGELOG.md) | Version history |
+
 ## Disclaimer
 
 > **WARNING: This is a newly developed project. Use at your own risk.**
@@ -18,6 +45,49 @@ A storage plugin that enables Proxmox VE to use NetApp ONTAP storage systems via
 > **Recommended usage:**
 > - Start with non-critical VMs for evaluation
 > - Monitor storage operations closely
+
+## CRITICAL: Multipath Safety Rules
+
+> **READ THIS BEFORE INSTALLING.** These rules prevent PVE node hangs and accidental disconnection of other storage.
+
+### Rule 1: NEVER use `multipath -F` (capital F)
+
+`multipath -F` flushes ALL unused multipath maps system-wide. If you have other storage (manual iSCSI LVM, other vendors, etc.) and there is no active I/O on it at the moment, **it will be disconnected**. Recovery requires manual `systemctl reload multipathd` or `iscsiadm -m session --rescan`.
+
+**Use targeted flushing instead:**
+```bash
+# Identify stale WWIDs (look for "failed faulty" in all paths)
+multipath -ll
+
+# Flush ONE specific stale WWID (lowercase f)
+multipath -f 3600a09807770457a795d5a7653705853
+```
+
+### Rule 2: After editing `/etc/multipath.conf`, use `restart` not `reload`
+
+```bash
+# CORRECT - applies new settings AND flushes stale state
+systemctl restart multipathd
+
+# WRONG - only re-reads config, leaves stale maps in place
+systemctl reload multipathd
+```
+
+### Rule 3: Check your `/etc/multipath.conf` settings
+
+If your config contains any of these, the entire PVE node can hang when a LUN is deleted or becomes unavailable:
+
+| Setting | Risk | Fix |
+|---------|------|-----|
+| `no_path_retry queue` | I/O queues forever | Change to `no_path_retry 30` |
+| `queue_if_no_path` (in features) | Same | Remove from `features` line |
+| `dev_loss_tmo infinity` | Stale devices never removed | Change to `dev_loss_tmo 60` |
+
+The plugin's installer will detect these settings and show a prominent warning. See [docs/CONFIGURATION.md](docs/CONFIGURATION.md#multipath-configuration) for details.
+
+### Rule 4: v0.2.2+ handles cleanup automatically
+
+You do **not** need to manually clean stale devices after upgrading to v0.2.2. The plugin automatically detects and removes its own orphan devices in the background during normal storage status polling. It only touches WWIDs it created and never affects other storage.
 
 ## Features
 
@@ -108,7 +178,7 @@ systemctl enable --now multipathd
 
 # Step 4: Install the plugin package
 # (Automatically configures multipath and restarts PVE services)
-dpkg -i jt-pve-storage-netapp_0.2.1-1_all.deb
+dpkg -i jt-pve-storage-netapp_0.2.2-1_all.deb
 ```
 
 > **Note:** The plugin automatically:
@@ -153,12 +223,111 @@ apt install -y open-iscsi multipath-tools sg3-utils psmisc \
 systemctl enable --now iscsid multipathd
 
 # Install plugin (auto-configures multipath and restarts PVE services)
-dpkg -i jt-pve-storage-netapp_0.2.1-1_all.deb
+dpkg -i jt-pve-storage-netapp_0.2.2-1_all.deb
 ```
 
 **Installation Order for Clusters:**
 1. Install the plugin on ALL nodes first
 2. Then add the storage configuration (only once, on any node)
+
+## Upgrade SOP
+
+When upgrading from a previous version, follow these steps **on every cluster node** in sequence (one node at a time):
+
+### Step 1: Pre-upgrade backup
+
+```bash
+# Backup multipath.conf (the upgrade may show warnings recommending edits)
+cp /etc/multipath.conf /etc/multipath.conf.bak.$(date +%Y%m%d-%H%M%S)
+
+# Note current version
+dpkg -l jt-pve-storage-netapp | tail -1
+```
+
+### Step 2: Stop or migrate VMs (recommended)
+
+For safest upgrade, migrate or stop VMs that have disks on this storage. Live VMs will continue to work during upgrade (the plugin only affects new operations), but a clean state simplifies recovery if anything goes wrong.
+
+```bash
+# List VMs using netapp storage
+qm list | while read vmid name rest; do
+    [ "$vmid" = "VMID" ] && continue
+    qm config $vmid 2>/dev/null | grep -q netapp && echo "VM $vmid uses netapp storage"
+done
+```
+
+### Step 3: Install new package
+
+```bash
+# Update plugin package
+dpkg -i jt-pve-storage-netapp_0.2.2-1_all.deb
+```
+
+The postinst will automatically:
+- Skip multipath.conf modification if existing NetApp config detected
+- Restart `pvedaemon` and `pveproxy`
+- Display a **prominent warning** if dangerous multipath settings are detected
+
+### Step 4: Review postinst warnings
+
+If you see a warning about `no_path_retry queue`, `queue_if_no_path`, or `dev_loss_tmo infinity`, you **must** manually update `/etc/multipath.conf`:
+
+```bash
+# Edit multipath.conf
+nano /etc/multipath.conf
+
+# Apply changes:
+#   no_path_retry queue    -->  no_path_retry 30
+#   queue_if_no_path       -->  (remove from features line)
+#   dev_loss_tmo infinity  -->  dev_loss_tmo 60
+# Add if missing:
+#   fast_io_fail_tmo 5
+
+# Apply (use restart, NOT reload - reload does not flush stale maps)
+systemctl restart multipathd
+
+# Verify
+multipathd show config local | grep -E 'no_path_retry|dev_loss_tmo|fast_io_fail'
+```
+
+### Step 5: Verify upgrade
+
+```bash
+# Verify package version
+dpkg -l jt-pve-storage-netapp | grep ii
+
+# Verify storage status
+pvesm status | grep netapp
+
+# Verify multipath devices are healthy (no "failed faulty" paths)
+multipath -ll
+
+# Verify orphan cleanup is running (look in journal after a few minutes)
+journalctl -u pvedaemon --since "5 minutes ago" | grep -i "orphan" || echo "no orphans (OK)"
+```
+
+### Step 6: Repeat on next node
+
+Move to the next cluster node and repeat from Step 1. Do not upgrade multiple nodes simultaneously.
+
+### Rolling Back
+
+If something goes wrong, you can downgrade:
+
+```bash
+# Find previous version in apt cache or download from GitHub releases
+dpkg -i jt-pve-storage-netapp_0.2.1-1_all.deb
+
+# Restore multipath.conf if you modified it
+cp /etc/multipath.conf.bak.<timestamp> /etc/multipath.conf
+systemctl restart multipathd
+```
+
+### Critical Reminders
+
+- **NEVER** run `multipath -F` (capital F) before, during, or after upgrade -- it flushes ALL unused maps including manual storage. See [Multipath Safety Rules](#critical-multipath-safety-rules) above.
+- **Use `systemctl restart multipathd`**, not `reload`. Reload does not flush stale maps.
+- The plugin v0.2.2+ handles orphan cleanup automatically -- you do **not** need to manually clean stale devices after upgrade.
 
 ## Quick Start
 
@@ -574,8 +743,10 @@ PVE::Storage::Plugin (Proxmox VE base class)
 
 | Protocol | Status | Notes |
 |----------|--------|-------|
-| **iSCSI** | Tested | Functional testing completed, not extensively tested in production |
+| **iSCSI** | Tested | 22-item full test suite passed (v0.2.1) |
 | **FC (Fibre Channel)** | Not Fully Verified | Basic implementation exists, requires real FC environment testing |
+
+Full test plan and release test results: [docs/TESTING.md](docs/TESTING.md)
 
 ## Known Limitations
 
@@ -800,7 +971,7 @@ storage: No such storage
 **Solution:**
 ```bash
 # Install on the affected node
-dpkg -i jt-pve-storage-netapp_0.2.1-1_all.deb
+dpkg -i jt-pve-storage-netapp_0.2.2-1_all.deb
 apt install -f
 systemctl restart pvedaemon pveproxy
 ```

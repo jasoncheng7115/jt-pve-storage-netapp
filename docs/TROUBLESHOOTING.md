@@ -297,29 +297,33 @@ multipathd show maps
    systemctl enable --now multipathd
    ```
 
-2. **Add NetApp configuration:**
+2. **Add NetApp configuration (SAFE settings):**
    ```bash
    cat >> /etc/multipath.conf << 'EOF'
    devices {
        device {
            vendor "NETAPP"
-           product "LUN"
+           product "LUN C-Mode"
            path_grouping_policy group_by_prio
            path_selector "queue-length 0"
            path_checker tur
-           features "3 queue_if_no_path pg_init_retries 50"
+           features "2 pg_init_retries 50"
+           no_path_retry 30
            hardware_handler "1 alua"
            prio alua
            failback immediate
            rr_weight uniform
            rr_min_io_rq 1
-           dev_loss_tmo infinity
+           fast_io_fail_tmo 5
+           dev_loss_tmo 60
        }
    }
    EOF
 
    systemctl restart multipathd
    ```
+
+   > **WARNING:** Do NOT use `features "3 queue_if_no_path pg_init_retries 50"` or `dev_loss_tmo infinity`. These cause the entire PVE node to hang when a LUN becomes unavailable. See [CONFIGURATION.md](CONFIGURATION.md#multipath-configuration) for details.
 
 3. **Reconfigure multipath:**
    ```bash
@@ -330,21 +334,62 @@ multipathd show maps
 ### Stale Multipath Devices
 
 **Symptoms:**
-- Old devices remain after LUN deletion
-- Device shows "failed" paths
+- Old multipath devices remain after LUN deletion or VM removal
+- Device shows all paths as `failed faulty running`
+- May appear on cluster nodes that didn't perform the delete operation
+- `lsblk` and `multipath -ll` still show the deleted LUN
 
-**Solutions:**
+**Root cause:**
+- When a LUN is deleted on one node, OTHER nodes still have local SCSI devices
+- The kernel does not auto-remove SCSI devices for unmapped LUNs
+- Multipath maps persist until explicitly cleaned
+
+**v0.2.2+ Automatic Solution:**
+
+This is now handled automatically. The plugin tracks WWIDs it has seen and runs orphan cleanup on every `status()` poll (background fork, non-blocking). If you upgraded from an older version, just wait for the next status poll and stale devices will be cleaned up.
 
 ```bash
-# Flush specific device
-multipath -f <device-name>
-
-# Flush all unused maps
-multipath -F
-
-# Remove stale device
-dmsetup remove <device-name>
+# Verify orphan cleanup is working
+journalctl -u pvedaemon --since "5 minutes ago" | grep "Orphan cleanup"
+# Expected: "Orphan cleanup: processed N stale WWID(s)"
 ```
+
+**Manual Cleanup (only if needed for pre-v0.2.2 leftovers):**
+
+```bash
+# 1. Identify stale WWIDs - look for "failed faulty running" in all paths
+multipath -ll
+
+# 2. Flush ONLY specific stale WWIDs (lowercase -f)
+multipath -f 3600a09807770457a795d5a7653705853
+
+# 3. Remove residual SCSI devices for that WWID
+for sd in $(lsscsi | grep NETAPP | awk '{print $NF}'); do
+    devname=$(basename $sd)
+    wwid=$(cat /sys/block/$devname/device/wwid 2>/dev/null)
+    if [[ "$wwid" == *"3600a09807770457a795d5a7653705853"* ]]; then
+        echo 1 > /sys/block/$devname/device/delete
+    fi
+done
+```
+
+**WARNING - DO NOT USE `multipath -F`:**
+
+> `multipath -F` (capital F) flushes ALL unused multipath maps system-wide. In a mixed environment (e.g., this plugin + manually configured iSCSI LVM), it will disconnect any storage that has no active I/O at the moment. This includes:
+> - Manual iSCSI/FC LVM storage on cluster nodes that are not currently running VMs from that storage
+> - Other storage plugins' devices in idle state
+>
+> Recovery requires `systemctl reload multipathd` or `iscsiadm -m session --rescan` on each affected node, and possibly LVM rescan.
+>
+> **Always use `multipath -f <wwid>` (lowercase) to flush specific devices.**
+
+**Mixed Environment Scenario (Manual iSCSI LVM + This Plugin):**
+
+| Symptom | Cause | Fix |
+|---------|-------|-----|
+| Manual LVM disappears after `multipath -F` | `-F` flushed unused map on idle node | `systemctl reload multipathd` |
+| Migrating VM to "broken" node still shows storage offline | LVM plugin doesn't auto-rescan multipath | Same as above + `pvesm set <id> --disable 0` to re-activate |
+| Plugin orphans appear after deletion on remote node | Other nodes don't know LUN is gone | v0.2.2 handles automatically; older versions need manual cleanup |
 
 ---
 

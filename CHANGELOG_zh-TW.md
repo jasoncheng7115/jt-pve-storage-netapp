@@ -2,6 +2,25 @@
 
 NetApp ONTAP Storage Plugin for Proxmox VE 的所有重要變更都記錄在此。
 
+## [0.2.2] - 2026-04-08
+
+### 叢集孤兒裝置清理 Release
+
+**重大叢集修復：**
+- 修復在另一個節點刪除 VM 後，叢集節點上殘留 stale multipath 裝置的問題。之前當 Node A 移除 VM 時，Node B 上對應該 LUN 的 SCSI/multipath 裝置會變成孤兒並無限期保留（顯示所有路徑為 failed 狀態）。配合 multipath.conf 的 `no_path_retry queue` 設定，任何程序觸碰到孤兒裝置都可能讓整個節點掛起。
+
+**新功能：自動孤兒裝置清理**
+- 新增每儲存的 WWID 追蹤狀態檔，位於 `/var/lib/pve-storage-netapp/<storeid>-wwids.json`。每個節點記錄它看過的此儲存的 WWID。
+- `path()` 在成功解析到真實裝置後追蹤 WWID。
+- `free_image()` 在成功刪除 LUN 後取消追蹤 WWID。
+- `status()` 在每次輪詢時於背景 fork 執行孤兒清理。比對追蹤的 WWID 與 ONTAP 上目前的 LUN 列表，清理 ONTAP 上已不存在的追蹤 WWID 對應的本機裝置。
+- **安全性：** 只有追蹤檔中的 WWID 才會被清理，因此手動管理的 NetApp 裝置或其他 plugin 的裝置永遠不會被影響。
+- 若清理過程中 ONTAP API 無法連線，操作會中止以避免誤刪有效裝置。
+
+**文件：**
+- 更新 postinst 警告，建議使用 `systemctl restart multipathd` 而非 `reload`（reload 不會清除 stale map）。
+- 更新 `docs/CONFIGURATION.md` 說明 reload vs restart 的差異。
+
 ## [0.2.1] - 2026-04-08
 
 ### Production Hardening Release - 邊界條件與競爭條件修復

@@ -1,170 +1,171 @@
 # Changelog
 
-All notable changes to this project will be documented in this file.
+All notable changes to the NetApp ONTAP Storage Plugin for Proxmox VE are documented here.
 
-## [0.1.9-1] - 2026-02-27
+## [0.2.1] - 2026-04-08
+
+### Production Hardening Release - Edge Case & Race Condition Fixes
+
+**Race Condition Fixes:**
+- Fixed `alloc_image()` disk ID TOCTOU race: if `volume_create` fails due to concurrent allocation, retries with next disk ID instead of dying.
+- Fixed igroup creation race when multiple cluster nodes activate storage simultaneously. `igroup_get_or_create()` now handles 409 Conflict gracefully.
+- Fixed `_ensure_igroup()` to handle concurrent initiator add operations from multiple nodes without failing.
+
+**Multipath Safety (prevents node hang on stale devices):**
+- Changed multipath.conf template: replaced `queue_if_no_path` (infinite queue) with `no_path_retry 30` (bounded 150-second retry). Prevents PVE node from hanging indefinitely when LUN paths fail or stale devices remain.
+- Changed `dev_loss_tmo` from `infinity` to `60` seconds. SCSI devices for failed LUNs are now removed after 60s instead of kept forever.
+- Added `fast_io_fail_tmo 5` for faster path failure detection.
+- Existing installations with manual multipath.conf will see a prominent warning during upgrade with recommended changes.
+
+**Stale Device Prevention:**
+- Fixed `free_image()` operation order: now unmaps LUN from igroups BEFORE cleaning local SCSI devices, preventing iSCSI session rescans from re-discovering removed LUNs as ghost devices that generate I/O errors.
+- Pre-captures multipath slave device list before unmap, ensuring all SCSI paths are cleaned even if multipath map disappears after unmap.
+- Final multipath reload after cleanup to flush any residual stale maps.
+
+**Migration Safety:**
+- `deactivate_volume()` now skips sync/flush if device is still in use by another process, preventing I/O deadlock during live migration.
+- `deactivate_volume()` fails gracefully if API is unreachable.
+
+**Cleanup & Reliability:**
+- `alloc_image()` cleanup now calls `lun_unmap_all()` before `lun_delete()` on failure, preventing orphaned igroup mappings on ONTAP.
+- Improved error message for disk ID exhaustion to suggest checking for manually created volumes or orphaned volumes.
+
+**Performance:**
+- `list_images()` template detection now has 10-second deadline to prevent cascading API timeouts when many volumes exist on ONTAP.
+- Non-disk volumes (state, cloudinit) are skipped during template detection.
+- Skip iSCSI discovery for portals that already have active sessions, preventing 30-second discovery timeout during repeated storage activation (e.g., linked clone operations).
+
+**Thin Provisioning Safety:**
+- Added aggregate space warning when usage exceeds 85% during `alloc_image()` with thin provisioning enabled, alerting operators before overcommit.
+
+**iSCSI Session Recovery:**
+- `login_target()` now sets `node.session.timeo.replacement_timeout=120` for automatic session recovery after ONTAP failover/takeover events.
+
+**API Resilience:**
+- API client now retries on HTTP 401 with fresh authentication, handling session expiry during long-running operations.
+
+## [0.2.0] - 2026-04-07
+
+### Multipath & Migration Fix Release - Anti-Hang Protection
+
+**Critical Bug Fixes:**
+- Fixed iSCSI multipath only establishing 1 session instead of all portals. `login_target()` checked `is_target_logged_in()` by IQN only; all ONTAP LIFs share the same IQN, so after the first portal login all others were skipped. Added `is_portal_logged_in()` to check portal+target pair individually.
+- Fixed `alloc_image()` only mapping LUN to current node's igroup in per-node mode. Disk migration (move_disk) would hang because the destination node could not see the new LUN. Now maps to all node igroups, consistent with `clone_image()` behavior.
+
+**Anti-Hang Protection (prevents unkillable PVE task workers):**
+- Added `sysfs_write_with_timeout()`: all writes to `/sys/` files (SCSI host scan, device delete, device rescan, FC issue_lip) now execute in a forked child process with 10-second timeout.
+- Added `sysfs_read_with_timeout()`: all reads from `/sys/` and `/proc/` files (device WWID, VPD pages, mount table, FC port attributes) now execute in a forked child with 5-second timeout.
+- Replaced all bare `system()` calls with timeout-protected alternatives.
+- `flock(LOCK_EX)` on temp clone state file changed to non-blocking `LOCK_NB` with 10-second retry loop.
+- FC.pm `_read_file()` now uses `sysfs_read_with_timeout()` for all sysfs reads.
+
+**Migration Reliability:**
+- Fixed `activate_volume()` only mapping LUN to current node's igroup.
+- Fixed `path()` returning synthetic non-existent device path after a single failed rescan. Now retries with a proper wait loop (up to `ontap-device-timeout`, default 30s).
+
+**ONTAP Failure Resilience:**
+- Reduced API timeout from 30s to 15s and retries from 3 to 2, cutting worst-case API call blocking from ~102s to ~34s.
+- `status()` now fails fast if API is unreachable instead of blocking PVE.
+- Temp FlexClone cleanup in `status()` moved to background fork.
+
+**New Features:**
+- LXC container (rootdir) support
+- EFI Disk, Cloud-init Disk, TPM State disk support
+
+## [0.1.9] - 2026-02-27
 
 ### Safety Audit Release - Security & Reliability Fixes
 
 **Critical Security Fixes:**
-- Fixed command injection vulnerability in Multipath.pm `is_device_in_use()` (shell-form `system()` replaced with list-form, device path untainted)
-- Fixed IPC::Open3 deadlock in both ISCSI.pm and Multipath.pm `_run_cmd()` (sequential read replaced with IO::Select non-blocking I/O)
-- Fixed zombie processes on `_run_cmd()` timeout (child process now killed)
-- Fixed `$@` clobbering in `alloc_image` error paths (cleanup eval overwrote original error message)
+- Fixed command injection vulnerability in `Multipath.pm is_device_in_use()`
+- Fixed IPC::Open3 deadlock in `_run_cmd()` (both ISCSI.pm and Multipath.pm)
+- Fixed zombie processes on `_run_cmd()` timeout
 
 **Data Integrity Fixes:**
-- Snapshot rollback now checks device in-use status and flushes buffers before ONTAP rollback to prevent data corruption
-- Removed unsafe WWID substring matching in `get_multipath_device()` that could return wrong device on partial WWID collisions
-- Fixed `clone_image` disk ID race condition with retry loop and ONTAP volume existence check
-- Fixed `glob()` metacharacter injection in device serial lookups (ISCSI.pm `wait_for_device`, `get_device_by_serial`, Multipath.pm `get_device_by_wwid`)
-- Fixed regex injection in `_find_multipath_device()` serial matching
+- Snapshot rollback now checks device in-use status and flushes buffers before ONTAP rollback
+- Removed unsafe WWID substring matching in `get_multipath_device()`
+- Fixed clone_image disk ID race condition
+- Fixed glob() metacharacter injection in device serial lookups
 
 **Reliability Improvements:**
 - Temp clone state file now uses `flock()` for concurrent access safety
-- `activate_storage` now detects and reports portal connection failures instead of silently continuing
-- `list_images` wraps per-volume `snapshot_get` in eval to prevent one volume failure from breaking entire listing
-- `lun_unmap_all` collects all errors and warns instead of dying on first
-- `free_image` now warns on LUN delete failure instead of silently ignoring
-- `deactivate_volume` checks sync/flushbufs return codes
-- FC rescan adds proper error handling on open/opendir calls
+- `activate_storage` detects and reports portal connection failures
+- `list_images` wraps per-volume `snapshot_get` in eval
+- Online resize support (removed VM-must-be-stopped restriction)
 
-**Online Resize Support:**
-- `volume_resize` now supports online resize (removed VM-must-be-stopped restriction), uses 64MB overhead, triggers device rescan when running
-
-**Other Changes:**
-- Renamed `SG_INVERT` constant to `SG_INQ` in Multipath.pm
-
-**Documentation:**
-- README_zh-TW.md synced with English README (added Module Architecture, PVE Version Upgrade Compatibility, additional Troubleshooting sections)
-- Updated disk resize documentation to reflect online resize support
-
-## [0.1.8-1] - 2026-02-12
+## [0.1.8] - 2026-02-12
 
 ### Bug Fix Release - FC SAN & General Fixes
 
-**Critical Bug Fixes:**
-- Fixed `is_fc_available()` always returning true when `/sys/class/fc_host` exists but no valid FC HBA present (arrayref vs array comparison)
-- Added missing `lun_unmap_all()` method in API.pm - temporary FlexClone LUN mappings were never cleaned up, causing ONTAP mapping accumulation
-- Fixed `deactivate_storage` `logout_target()` call passing wrong parameters (hashref instead of address/target args), iSCSI target logout was silently failing on storage deactivation
+- Fixed `is_fc_available()` always returning true
+- Added missing `lun_unmap_all()` method in API.pm
+- Fixed `deactivate_storage` `logout_target()` wrong parameters
+- `clone_image` now filters igroups by protocol type
+- Eliminated redundant SCSI host rescans in FC paths
 
-**FC SAN Improvements:**
-- `clone_image` now filters igroups by protocol type, preventing cross-protocol LUN mapping errors in mixed FC/iSCSI environments
-- Eliminated redundant SCSI host rescans in FC paths - `rescan_fc_hosts()` already includes SCSI host scanning internally
-
-**Code Quality:**
-- Removed shadowed `$protocol` variable declaration in `_get_snapshot_path()`
-
-## [0.1.7-1] - 2026-01-25
+## [0.1.7] - 2026-01-25
 
 ### RAM Snapshot (vmstate) Support Release
 
-**New Features:**
 - Full support for VM snapshots with RAM state ("Include RAM" option)
-- Allocates `vm-{vmid}-state-{snapname}` volumes for RAM state storage
-- Works with both iSCSI and FC protocols
-- Automatic multipath configuration (postinst adds NetApp device config to `/etc/multipath.conf`)
-- Automatic PVE service restart after installation
-
-**Storage Removal Enhancement:**
-- `deactivate_storage` cleans up only this storage's multipath devices
-- Other storages' devices are not affected
-- Properly flushes buffers and removes SCSI devices
-- Handles ONTAP unreachable scenarios gracefully
-
-**Documentation:**
+- Automatic multipath configuration on install
+- Automatic PVE service restart on install
+- Storage deactivation cleanup improvements
 - Added README_zh-TW.md (Traditional Chinese)
-- Language switch links in both README files
 - License changed to MIT
 
-## [0.1.6-1] - 2026-01-24
+## [0.1.6] - 2026-01-24
 
 ### Full Clone Support Release
 
-**New Features:**
-- Full Clone from VM Snapshot (uses temporary FlexClone for snapshot data access)
-- Full Clone from Current State (running or stopped VMs)
+- Full Clone from VM Snapshot (via temporary FlexClone + qemu-img)
+- Full Clone from Current State
 - Automatic cleanup of temporary FlexClones (1 hour expiry)
-- State tracking in `/var/run/pve-storage-netapp-temp-clones.json`
+- Linked Clone from template stays space-efficient (no auto-split)
+- Storage deactivation with proper iSCSI session cleanup
 
-**New API Methods:**
-- `volume_is_splitting()`: Check if clone split is in progress
-- `volume_wait_clone_split()`: Wait for clone split to complete
-
-**Bug Fixes:**
-- Fixed `list_images` incorrectly showing FlexClones as templates
-- Fixed igroup name lookup in temp FlexClone creation
-- Fixed `wait_for_multipath_device` parameter format
-- Added retry logic for stale `has_flexclone` metadata during template deletion
-
-**Storage Deactivation:**
-- `deactivate_storage` now properly cleans up iSCSI sessions
-- Flushes device buffers and removes multipath devices
-- Safety check: skips cleanup for devices still in use
-
-## [0.1.5-1] - 2026-01-03
+## [0.1.5] - 2026-01-03
 
 ### Template Support Release
 
-**New Features:**
-- Full Template Support (`create_base`, `rename_volume`, `find_free_diskname`)
-- Uses `__pve_base__` snapshot as template marker
+- Full Template Support (create_base, rename_volume)
+- `list_images` correctly identifies template volumes (base-XXX-disk-X)
+- `path()` handles missing LUNs gracefully (synthetic path for cleanup)
 
-**Bug Fixes:**
-- Fixed "storage definition has no path" error on template creation
-- `list_images` now correctly identifies template volumes
-- `path()` now handles missing LUNs gracefully (returns synthetic path for orphaned volumes)
-
-## [0.1.4-1] - 2026-01-03
+## [0.1.4] - 2026-01-03
 
 ### FC SAN Support Release
 
-**New Features:**
-- Fibre Channel (FC) SAN Protocol Support (`ontap-protocol` option: iscsi|fc)
-- Automatic FC HBA WWPN discovery from `/sys/class/fc_host`
-- New Module: FC.pm
-
-**Improvements:**
-- Concurrent disk allocation retries with next available ID
-- Aggregate validation on storage activation
+- Fibre Channel (FC) SAN protocol support
+- New FC.pm module (WWPN discovery, LIP rescan)
+- Batch LUN query in `list_images` for performance
 - Configurable device discovery timeout (`ontap-device-timeout`)
-- Batch LUN query in `list_images` (reduces API calls)
 
-**Bug Fixes:**
-- Fixed `path()` and `snapshot_rollback` to support FC protocol
-- Fixed async job handling for DELETE and PATCH API calls
-- Volume deletion now properly waits for ONTAP job completion
-
-## [0.1.3-1] - 2026-01-03
+## [0.1.3] - 2026-01-03
 
 ### FlexClone Support Release
 
-**New Features:**
 - Linked Clone via NetApp FlexClone (instant, space-efficient)
-- Automatic LUN identity for cloned volumes
-- FlexClone license check with helpful error message
+- Prevention of template deletion with clone children
+- Fixed `path()` causing system hangs when device not accessible
+- Volume autogrow enabled, reduced overhead to 64MB
 
-**Bug Fixes:**
-- Fixed `path()` method causing system hangs when device not accessible
-- Fixed prerm script hanging during upgrade (added 5s timeout)
-- Fixed postinst script potential hang (added timeout for systemctl calls)
-
-## [0.1.2-1] - 2026-01-02
+## [0.1.2] - 2026-01-02
 
 ### Bug Fix & Dependency Release
 
-- Enabled volume autogrow (auto-expands when needed)
-- Reduced initial overhead to 64MB (was 5GB)
-- Added missing dependency: psmisc (provides `fuser` for device-in-use detection)
+- Enabled volume autogrow
+- Added psmisc dependency (fuser command)
 
-## [0.1.1-1] - 2026-01-02
+## [0.1.1] - 2026-01-02
 
 ### Safety Improvements Release
 
-- Added shrink protection, in-use device check, collision detection
-- Added API cache TTL (5 minutes)
-- Fixed taint mode compatibility for PVE's qemu-img operations
+- Shrink protection, in-use device check, collision detection
+- API cache TTL (5 minutes)
+- Fixed taint mode compatibility for PVE
 
-## [0.1.0-1] - 2026-01-02
+## [0.1.0] - 2026-01-02
 
 ### Initial Release
 
@@ -173,4 +174,4 @@ All notable changes to this project will be documented in this file.
 - iSCSI discovery and login
 - Multipath device handling
 - Snapshot operations (create, delete, rollback)
-- Real-time storage capacity reporting from ONTAP
+- Real-time storage status from ONTAP

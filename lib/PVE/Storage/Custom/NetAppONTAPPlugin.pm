@@ -9,6 +9,7 @@ use JSON;
 use PVE::Tools qw(run_command);
 use PVE::JSONSchema qw(get_standard_option);
 use Fcntl qw(:flock);
+use POSIX qw();
 use PVE::Cluster qw(cfs_read_file);
 use PVE::ProcFSTools;
 
@@ -30,6 +31,7 @@ use PVE::Storage::Custom::NetAppONTAP::ISCSI qw(
     login_target
     logout_target
     rescan_sessions
+    is_portal_logged_in
     wait_for_device
 );
 use PVE::Storage::Custom::NetAppONTAP::Multipath qw(
@@ -37,9 +39,13 @@ use PVE::Storage::Custom::NetAppONTAP::Multipath qw(
     multipath_reload
     get_multipath_device
     get_device_by_wwid
+    get_scsi_devices_by_serial
+    get_multipath_slaves
+    remove_scsi_device
     wait_for_multipath_device
     cleanup_lun_devices
     is_device_in_use
+    sysfs_read_with_timeout
 );
 use PVE::Storage::Custom::NetAppONTAP::FC qw(
     get_fc_wwpns
@@ -253,12 +259,19 @@ sub _ensure_igroup {
     my @initiators = _get_initiators($scfg);
     my $ontap_protocol = _get_ontap_protocol($scfg);
 
-    my $igroup = $api->igroup_get_or_create(
-        name       => $igroup_name,
-        protocol   => $ontap_protocol,
-        os_type    => 'linux',
-        initiators => \@initiators,
-    );
+    my $igroup = eval {
+        $api->igroup_get_or_create(
+            name       => $igroup_name,
+            protocol   => $ontap_protocol,
+            os_type    => 'linux',
+            initiators => \@initiators,
+        );
+    };
+    if ($@ && !$igroup) {
+        # Handle race condition when multiple nodes create igroup simultaneously
+        $igroup = $api->igroup_get($igroup_name);
+        die "Failed to create or get igroup '$igroup_name': $@" unless $igroup;
+    }
 
     # Verify all initiators are in igroup
     my %existing_initiators;
@@ -268,11 +281,12 @@ sub _ensure_igroup {
         }
     }
 
-    # Add missing initiators
+    # Add missing initiators (ignore "already exists" errors from concurrent adds)
     for my $initiator (@initiators) {
         unless ($existing_initiators{lc($initiator)}) {
             eval { $api->igroup_add_initiator($igroup_name, $initiator); };
-            # Ignore error if already exists
+            warn "Failed to add initiator $initiator to igroup: $@\n"
+                if $@ && $@ !~ /already exists|duplicate|entry.*exists/i;
         }
     }
 
@@ -393,6 +407,12 @@ sub activate_storage {
         # Discover and login to targets
         my $portal_success = 0;
         for my $portal (@$portals) {
+            my $portal_addr = "$portal->{address}:$portal->{port}";
+            # Skip discovery if already logged in to this portal
+            if (is_portal_logged_in($portal_addr, $portal->{target})) {
+                $portal_success++;
+                next;
+            }
             eval {
                 discover_targets($portal->{address}, port => $portal->{port});
                 login_target($portal->{address}, $portal->{target}, port => $portal->{port});
@@ -462,10 +482,12 @@ sub deactivate_storage {
                 next;
             }
 
-            # Flush and cleanup
+            # Flush and cleanup (with timeout to prevent hang on unresponsive storage)
             eval {
-                system('sync');
-                system('blockdev', '--flushbufs', $device);
+                eval { run_command(['/bin/sync'], timeout => 10); };
+                warn "sync timed out: $@" if $@;
+                eval { run_command(['/sbin/blockdev', '--flushbufs', $device], timeout => 10); };
+                warn "blockdev --flushbufs timed out: $@" if $@;
                 cleanup_lun_devices($wwid);
                 warn "  [OK] $vol->{name}: device cleaned up\n";
                 $cleanup_count++;
@@ -502,11 +524,22 @@ sub _with_temp_clone_lock {
         warn "Cannot open lock file $TEMP_CLONE_LOCK_FILE: $!\n";
         return $code->();
     };
-    flock($lock_fh, LOCK_EX) or do {
-        warn "Cannot acquire lock on $TEMP_CLONE_LOCK_FILE: $!\n";
+    # Use non-blocking lock with retry to prevent indefinite hang
+    my $lock_timeout = 10;
+    my $lock_start = time();
+    my $locked = 0;
+    while (time() - $lock_start < $lock_timeout) {
+        if (flock($lock_fh, LOCK_EX | LOCK_NB)) {
+            $locked = 1;
+            last;
+        }
+        select(undef, undef, undef, 0.1);
+    }
+    unless ($locked) {
+        warn "Cannot acquire lock on $TEMP_CLONE_LOCK_FILE within ${lock_timeout}s, proceeding without lock\n";
         close($lock_fh);
         return $code->();
-    };
+    }
     my $result = eval { $code->() };
     my $err = $@;
     flock($lock_fh, LOCK_UN);
@@ -549,10 +582,20 @@ sub _cleanup_temp_clones_for_storage {
 sub status {
     my ($class, $storeid, $scfg, $cache) = @_;
 
-    my $api = _get_api($scfg);
+    my $api = eval { _get_api($scfg); };
+    if (!$api) {
+        warn "Failed to connect to ONTAP API for status check: $@";
+        return (0, 0, 0, 0);
+    }
 
-    # Cleanup old temporary FlexClones (non-blocking, errors ignored)
-    eval { _cleanup_temp_clones($api, $storeid); };
+    # Cleanup old temporary FlexClones in background (don't block status check)
+    my $cleanup_pid = fork();
+    if (defined $cleanup_pid && $cleanup_pid == 0) {
+        eval { _cleanup_temp_clones($api, $storeid); };
+        POSIX::_exit(0);
+    }
+    # Reap immediately if child already finished
+    waitpid($cleanup_pid, POSIX::WNOHANG()) if defined $cleanup_pid;
 
     eval {
         my $capacity = $api->get_managed_capacity();
@@ -665,9 +708,11 @@ sub alloc_image {
             }
 
             # All retries exhausted
-            die "Volume '$ontap_volname' already exists on ONTAP. " .
-                "This may indicate a naming conflict or orphaned volume. " .
-                "Please check ONTAP and remove the existing volume if it's not in use.";
+            die "Cannot find free disk ID for VM $vmid after $max_retries retries. " .
+                "Volume '$ontap_volname' already exists on ONTAP. " .
+                "This may be caused by a manually created volume with a conflicting name, " .
+                "orphaned volumes from a previous failed operation, or concurrent allocation. " .
+                "Please check ONTAP volumes with prefix 'pve_' and remove unused ones.";
         }
         $pve_volname = "vm-${vmid}-disk-${diskid}";
     }
@@ -687,13 +732,48 @@ sub alloc_image {
         }
     }
 
-    # Create FlexVol
-    $api->volume_create(
-        name      => $ontap_volname,
-        aggregate => $scfg->{'ontap-aggregate'},
-        size      => $vol_size,
-        thin      => $scfg->{'ontap-thin'} // 1,
-    );
+    # Create FlexVol (with race condition handling for concurrent allocation)
+    eval {
+        $api->volume_create(
+            name      => $ontap_volname,
+            aggregate => $scfg->{'ontap-aggregate'},
+            size      => $vol_size,
+            thin      => $scfg->{'ontap-thin'} // 1,
+        );
+    };
+    if ($@ && $@ =~ /already exists|duplicate|entry.*exists|unique/i && $voltype eq 'disk') {
+        # TOCTOU race: another process created this volume between our check and create
+        # Retry with next disk ID
+        warn "Volume '$ontap_volname' race detected, retrying with next disk ID\n";
+        $diskid++;
+        $ontap_volname = encode_volume_name($storeid, $vmid, $diskid);
+        $lun_path = encode_lun_path($ontap_volname);
+        $pve_volname = "vm-${vmid}-disk-${diskid}";
+        $api->volume_create(
+            name      => $ontap_volname,
+            aggregate => $scfg->{'ontap-aggregate'},
+            size      => $vol_size,
+            thin      => $scfg->{'ontap-thin'} // 1,
+        );
+    } elsif ($@) {
+        die "Failed to create volume '$ontap_volname': $@";
+    }
+
+    # Warn if aggregate is running low on space (thin provisioning overcommit risk)
+    if ($thin) {
+        my $aggr = eval { $api->aggregate_get($scfg->{'ontap-aggregate'}); };
+        if ($aggr && $aggr->{space} && $aggr->{space}{block_storage}) {
+            my $total = $aggr->{space}{block_storage}{size} // 0;
+            my $used = $aggr->{space}{block_storage}{used} // 0;
+            if ($total > 0) {
+                my $used_pct = int($used * 100 / $total);
+                if ($used_pct > 85) {
+                    warn "WARNING: Aggregate '$scfg->{'ontap-aggregate'}' is at ${used_pct}% capacity. " .
+                        "Thin provisioned volumes may fail if aggregate fills up.\n";
+                }
+            }
+        }
+    }
 
     # Create LUN
     eval {
@@ -712,14 +792,36 @@ sub alloc_image {
         die "Failed to create LUN: $err";
     }
 
-    # Map LUN to igroup
+    # Map LUN to igroups
+    # In per-node mode, map to ALL node igroups for migration/HA support
+    # (consistent with clone_image behavior)
     eval {
-        my $igroup = _get_igroup_name($scfg);
-        $api->lun_map($lun_path, $igroup);
+        my $igroup_mode = $scfg->{'ontap-igroup-mode'} // 'per-node';
+        if ($igroup_mode eq 'shared') {
+            my $igroup = _get_igroup_name($scfg);
+            $api->lun_map($lun_path, $igroup);
+        } else {
+            my $cluster_name = $scfg->{'ontap-cluster-name'} // 'pve';
+            my $igroups = $api->igroup_list();
+            my $ontap_proto = _get_ontap_protocol($scfg);
+            my $mapped = 0;
+            for my $ig (@$igroups) {
+                next unless ($ig->{protocol} // '') eq $ontap_proto;
+                if ($ig->{name} =~ /^pve_${cluster_name}_/) {
+                    eval {
+                        $api->lun_map($lun_path, $ig->{name});
+                        $mapped++;
+                    };
+                    warn "Failed to map LUN to igroup '$ig->{name}': $@" if $@;
+                }
+            }
+            die "No matching igroups found for cluster '$cluster_name'" unless $mapped > 0;
+        }
     };
     if ($@) {
         my $err = $@;
-        # Cleanup on failure
+        # Cleanup on failure (unmap first, then delete)
+        eval { $api->lun_unmap_all($lun_path); };
         eval { $api->lun_delete($lun_path); };
         eval { $api->volume_delete($ontap_volname); };
         die "Failed to map LUN: $err";
@@ -760,13 +862,19 @@ sub free_image {
             "Please delete or split the clones first.";
     }
 
-    # IMPORTANT: Cleanup local devices BEFORE deleting on ONTAP
-    # This ensures no pending I/O when the storage-side resources are removed
+    # Step 1: Capture multipath device and slave list BEFORE unmap
+    # (after unmap, multipath may lose the device and we can't find slaves)
+    my @scsi_slaves;
     if ($wwid) {
-        eval { cleanup_lun_devices($wwid); };
+        my $mpath = get_multipath_device($wwid);
+        if ($mpath && -b $mpath) {
+            my $slaves = get_multipath_slaves($mpath);
+            @scsi_slaves = @$slaves if $slaves;
+        }
     }
 
-    # Unmap LUN from all igroups
+    # Step 2: Unmap LUN from all igroups
+    # This prevents iSCSI session rescans from re-discovering the LUN
     my $lun = $api->lun_get($lun_path);
     if ($lun && $lun->{lun_maps}) {
         for my $map (@{$lun->{lun_maps}}) {
@@ -774,7 +882,23 @@ sub free_image {
         }
     }
 
-    # Delete LUN
+    # Step 3: Cleanup local multipath + SCSI devices
+    if ($wwid) {
+        eval { cleanup_lun_devices($wwid); };
+
+        # Step 4: Remove any SCSI slave devices that cleanup_lun_devices missed
+        # (use the slave list captured before unmap)
+        for my $slave (@scsi_slaves) {
+            if (-b $slave) {
+                eval { remove_scsi_device($slave); };
+            }
+        }
+
+        # Step 5: Final multipath reload to flush any residual stale maps
+        eval { multipath_reload(); };
+    }
+
+    # Step 5: Delete LUN on ONTAP
     eval { $api->lun_delete($lun_path); };
     warn "Failed to delete LUN '$lun_path': $@\n" if $@;
 
@@ -852,10 +976,21 @@ sub list_images {
     # Build a set of volumes that are templates
     # A template has __pve_base__ snapshot AND is NOT a FlexClone
     # (FlexClones inherit parent's snapshots, so we must exclude them)
+    # Use a deadline to prevent cascading API timeouts with many volumes
     my %is_template;
+    my $template_deadline = time() + 10;
     for my $vol (@$volumes) {
+        if (time() > $template_deadline) {
+            warn "Template detection timed out after 10s, skipping remaining volumes\n";
+            last;
+        }
+
         # Skip if this volume is a FlexClone (clone of a template)
         next if $vol->{clone} && $vol->{clone}{is_flexclone};
+
+        # Skip non-disk volumes (state, cloudinit) - they can't be templates
+        my $decoded = decode_volume_name($vol->{name});
+        next if $decoded && $decoded->{type} && $decoded->{type} ne 'disk';
 
         my $snap = eval { $api->snapshot_get($vol->{name}, '__pve_base__'); };
         if ($@) {
@@ -999,10 +1134,26 @@ sub activate_volume {
     my $ontap_volname = pve_volname_to_ontap($storeid, $volname);
     my $lun_path = encode_lun_path($ontap_volname);
 
-    # Ensure LUN is mapped to this node's igroup
-    my $igroup = _get_igroup_name($scfg);
-    unless ($api->lun_is_mapped($lun_path, $igroup)) {
-        $api->lun_map($lun_path, $igroup);
+    # Ensure LUN is mapped to this node's igroup (and all node igroups for migration)
+    my $igroup_mode = $scfg->{'ontap-igroup-mode'} // 'per-node';
+    if ($igroup_mode eq 'shared') {
+        my $igroup = _get_igroup_name($scfg);
+        unless ($api->lun_is_mapped($lun_path, $igroup)) {
+            $api->lun_map($lun_path, $igroup);
+        }
+    } else {
+        my $cluster_name = $scfg->{'ontap-cluster-name'} // 'pve';
+        my $igroups = $api->igroup_list();
+        my $ontap_proto = _get_ontap_protocol($scfg);
+        for my $ig (@$igroups) {
+            next unless ($ig->{protocol} // '') eq $ontap_proto;
+            if ($ig->{name} =~ /^pve_${cluster_name}_/) {
+                unless ($api->lun_is_mapped($lun_path, $ig->{name})) {
+                    eval { $api->lun_map($lun_path, $ig->{name}); };
+                    warn "Failed to map LUN to igroup '$ig->{name}': $@" if $@;
+                }
+            }
+        }
     }
 
     # Rescan for the device based on protocol
@@ -1036,11 +1187,13 @@ sub activate_volume {
 sub deactivate_volume {
     my ($class, $storeid, $scfg, $volname, $snapname, $cache) = @_;
 
-    # In per-node mode, we could unmap from this node
-    # But keeping mapped is safer for migrations
-    # Just flush caches
+    # In per-node mode, we keep LUN mapped for migration safety.
+    # Only flush caches if device is not actively used by another process
+    # (prevents sync/flush from blocking during live migration).
 
-    my $api = _get_api($scfg);
+    my $api = eval { _get_api($scfg); };
+    return 1 unless $api;
+
     my $ontap_volname = pve_volname_to_ontap($storeid, $volname);
     my $lun_path = encode_lun_path($ontap_volname);
 
@@ -1048,11 +1201,11 @@ sub deactivate_volume {
 
     if ($wwid) {
         my $device = get_device_by_wwid($wwid);
-        if ($device && -b $device) {
-            my $sync_rc = system('sync');
-            warn "sync failed with exit code " . ($sync_rc >> 8) . "\n" if $sync_rc != 0;
-            my $flush_rc = system('blockdev', '--flushbufs', $device);
-            warn "blockdev --flushbufs failed for $device with exit code " . ($flush_rc >> 8) . "\n" if $flush_rc != 0;
+        if ($device && -b $device && !is_device_in_use($device)) {
+            eval { run_command(['/bin/sync'], timeout => 10); };
+            warn "sync timed out: $@" if $@;
+            eval { run_command(['/sbin/blockdev', '--flushbufs', $device], timeout => 10); };
+            warn "blockdev --flushbufs timed out for $device: $@" if $@;
         }
     }
 
@@ -1226,29 +1379,34 @@ sub path {
     my $device = get_multipath_device($wwid);
     $device //= get_device_by_wwid($wwid);
 
-    # If device not found, try a quick rescan (non-blocking)
+    # If device not found, rescan and wait with retry loop
     if (!$device || ! -b $device) {
         my $protocol = $scfg->{'ontap-protocol'} // 'iscsi';
-        if ($protocol eq 'fc') {
-            rescan_fc_hosts(delay => 1);
-        } else {
-            rescan_sessions();
-            rescan_scsi_hosts();
-        }
-        multipath_reload();
-        sleep(2);
+        my $max_wait = $scfg->{'ontap-device-timeout'} // 30;
+        my $start = time();
 
-        $device = get_multipath_device($wwid);
-        $device //= get_device_by_wwid($wwid);
+        while ((time() - $start) < $max_wait) {
+            if ($protocol eq 'fc') {
+                rescan_fc_hosts(delay => 1);
+            } else {
+                rescan_sessions();
+                rescan_scsi_hosts();
+            }
+            multipath_reload();
+
+            $device = get_multipath_device($wwid);
+            $device //= get_device_by_wwid($wwid);
+            last if $device && -b $device;
+
+            sleep(2);
+        }
     }
 
-    # If device still not found, return a synthetic path based on WWID
-    # This allows operations like delete to proceed (they work directly with ONTAP API)
-    # Actual I/O operations will fail appropriately when they try to access the device
+    # If device still not found, return synthetic path for non-I/O operations
+    # (e.g., delete can proceed via ONTAP API without a local device)
     if (!$device || ! -b $device) {
-        # Return expected multipath device path - it may appear later
         $device = "/dev/mapper/$wwid";
-        warn "Device for LUN $lun_path not found locally, returning synthetic path: $device\n";
+        warn "Device for LUN $lun_path not found locally after waiting, returning synthetic path: $device\n";
     }
 
     return ($device, $parsed->{vmid}, 'raw');
@@ -1313,8 +1471,10 @@ sub volume_snapshot_rollback {
                 die "Cannot rollback snapshot: device $device is still in use. " .
                     "Please stop the VM first.";
             }
-            system('sync');
-            system('blockdev', '--flushbufs', $device);
+            eval { run_command(['/bin/sync'], timeout => 10); };
+            warn "sync timed out: $@" if $@;
+            eval { run_command(['/sbin/blockdev', '--flushbufs', $device], timeout => 10); };
+            warn "blockdev --flushbufs timed out for $device: $@" if $@;
         }
     }
 

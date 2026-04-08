@@ -6,6 +6,8 @@ use warnings;
 use Carp qw(croak);
 use File::Basename qw(basename);
 
+use PVE::Storage::Custom::NetAppONTAP::Multipath qw(sysfs_write_with_timeout sysfs_read_with_timeout);
+
 use Exporter qw(import);
 
 our @EXPORT_OK = qw(
@@ -23,13 +25,11 @@ use constant {
     FC_REMOTE_PATH => '/sys/class/fc_remote_ports',
 };
 
-# Read file content
+# Read file content (with timeout for sysfs files that could block)
 sub _read_file {
     my ($path) = @_;
     return undef unless -r $path;
-    open(my $fh, '<', $path) or return undef;
-    my $content = <$fh>;
-    close($fh);
+    my $content = sysfs_read_with_timeout($path, 5);
     chomp($content) if defined $content;
     return $content;
 }
@@ -207,13 +207,11 @@ sub rescan_fc_hosts {
         # Method 1: Issue LIP (Loop Initialization Primitive)
         my $issue_lip_file = FC_HOST_PATH . "/$host/issue_lip";
         if (-w $issue_lip_file) {
-            eval {
-                open(my $fh, '>', $issue_lip_file) or die "Cannot open $issue_lip_file: $!";
-                print $fh "1\n";
-                close($fh);
+            if (sysfs_write_with_timeout($issue_lip_file, "1\n", 10)) {
                 $rescanned++;
-            };
-            warn "FC rescan failed for $host (issue_lip): $@" if $@;
+            } else {
+                warn "FC rescan failed for $host (issue_lip): timed out\n";
+            }
         }
     }
 
@@ -232,12 +230,8 @@ sub rescan_fc_hosts {
 
             my $scan_file = "$scsi_host_path/$host/scan";
             if (-w $scan_file) {
-                eval {
-                    open(my $fh, '>', $scan_file) or die "Cannot open $scan_file: $!";
-                    print $fh "- - -\n";
-                    close($fh);
-                };
-                warn "SCSI rescan failed for $host: $@" if $@;
+                sysfs_write_with_timeout($scan_file, "- - -\n", 10)
+                    or warn "SCSI rescan failed for $host: timed out\n";
             }
         }
         closedir($dh);

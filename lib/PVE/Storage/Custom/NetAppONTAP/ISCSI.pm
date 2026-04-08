@@ -19,6 +19,7 @@ our @EXPORT_OK = qw(
     get_sessions
     rescan_sessions
     is_target_logged_in
+    is_portal_logged_in
     wait_for_device
 );
 
@@ -132,8 +133,13 @@ sub set_initiator_name {
 
     _write_file(INITIATOR_NAME_FILE, "InitiatorName=$iqn\n");
 
-    # Restart iscsid to pick up new name
-    system('systemctl', 'restart', 'iscsid');
+    # Restart iscsid to pick up new name (with timeout to prevent hang)
+    my ($stdout, $stderr, $exit) = _run_cmd(
+        ['systemctl', 'restart', 'iscsid'],
+        timeout => 30,
+        allow_nonzero => 1,
+    );
+    warn "Failed to restart iscsid (exit $exit): $stderr\n" if $exit != 0;
 
     return 1;
 }
@@ -177,8 +183,11 @@ sub login_target {
     my $port = $opts{port} // 3260;
     my $portal_addr = "$portal:$port";
 
-    # Check if already logged in
-    if (is_target_logged_in($target)) {
+    # Check if already logged in to this specific portal
+    # Note: must check portal+target pair, not just target name,
+    # because all ONTAP LIFs share the same target IQN.
+    # Logging in to each portal separately is required for multipath.
+    if (is_portal_logged_in($portal_addr, $target)) {
         return 1;
     }
 
@@ -195,6 +204,11 @@ sub login_target {
     # Enable automatic login on boot
     _run_cmd([ISCSIADM, '-m', 'node', '-T', $target, '-p', $portal_addr,
               '-o', 'update', '-n', 'node.startup', '-v', 'automatic'],
+             allow_nonzero => 1);
+
+    # Enable session auto-recovery after path failure (ONTAP failover/takeover)
+    _run_cmd([ISCSIADM, '-m', 'node', '-T', $target, '-p', $portal_addr,
+              '-o', 'update', '-n', 'node.session.timeo.replacement_timeout', '-v', '120'],
              allow_nonzero => 1);
 
     # Login
@@ -263,13 +277,31 @@ sub get_sessions {
     return \@sessions;
 }
 
-# Check if a target is logged in
+# Check if a target is logged in (any portal)
 sub is_target_logged_in {
     my ($target) = @_;
 
     my $sessions = get_sessions();
     for my $session (@$sessions) {
         return 1 if $session->{target} eq $target;
+    }
+
+    return 0;
+}
+
+# Check if a specific portal+target combination is logged in
+# This is needed for multipath: each portal (LIF) requires its own session,
+# even though all portals share the same target IQN.
+sub is_portal_logged_in {
+    my ($portal_addr, $target) = @_;
+
+    my $sessions = get_sessions();
+    for my $session (@$sessions) {
+        next unless $session->{target} eq $target;
+        # Session portal format may include port, normalize for comparison
+        my $sess_portal = $session->{portal};
+        $sess_portal =~ s/,\d+$//;  # Remove trailing portal group tag if present
+        return 1 if $sess_portal eq $portal_addr;
     }
 
     return 0;
@@ -329,9 +361,16 @@ sub wait_for_device {
     my $start_time = time();
 
     while ((time() - $start_time) < $timeout) {
-        # Check /dev/disk/by-id for the device
+        # Check /dev/disk/by-id for the device (with timeout)
         (my $safe_serial = $serial) =~ s/([\[\]{}*?\\])/\\$1/g;
-        my @devices = glob("/dev/disk/by-id/scsi-*$safe_serial*");
+        my @devices;
+        eval {
+            local $SIG{ALRM} = sub { die "timeout\n" };
+            alarm(5);
+            @devices = glob("/dev/disk/by-id/scsi-*$safe_serial*");
+            alarm(0);
+        };
+        alarm(0);
 
         if (@devices) {
             # Return the first matching device (untainted for taint mode)

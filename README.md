@@ -108,7 +108,7 @@ systemctl enable --now multipathd
 
 # Step 4: Install the plugin package
 # (Automatically configures multipath and restarts PVE services)
-dpkg -i jt-pve-storage-netapp_0.1.9-1_all.deb
+dpkg -i jt-pve-storage-netapp_0.2.1-1_all.deb
 ```
 
 > **Note:** The plugin automatically:
@@ -153,7 +153,7 @@ apt install -y open-iscsi multipath-tools sg3-utils psmisc \
 systemctl enable --now iscsid multipathd
 
 # Install plugin (auto-configures multipath and restarts PVE services)
-dpkg -i jt-pve-storage-netapp_0.1.9-1_all.deb
+dpkg -i jt-pve-storage-netapp_0.2.1-1_all.deb
 ```
 
 **Installation Order for Clusters:**
@@ -174,9 +174,11 @@ pvesm add netappontap netapp1 \
     --ontap-aggregate aggr1 \
     --ontap-username pveadmin \
     --ontap-password 'YourSecurePassword' \
-    --content images \
+    --content images,rootdir \
     --shared 1
 ```
+
+> **Note:** Use `--content images` for VM-only storage, or `--content images,rootdir` to also support LXC containers.
 
 **FC (Fibre Channel) Example:**
 ```bash
@@ -223,8 +225,10 @@ All plugin-specific options use the `ontap-` prefix to avoid conflicts with othe
 | `ontap-ssl-verify` | `1` | Verify SSL certificates (0=disable for self-signed) |
 | `ontap-thin` | `1` | Use thin provisioning (0=thick provisioning) |
 | `ontap-igroup-mode` | `per-node` | igroup mode: `per-node` or `shared` |
-| `ontap-cluster-name` | `pve` | Cluster name for igroup naming |
+| `ontap-cluster-name` | `pve` | Cluster name for igroup naming (see note below) |
 | `ontap-device-timeout` | `60` | Device discovery timeout in seconds |
+
+> **Multi-storage on same SVM:** If you configure multiple storage entries pointing to the same SVM, use different `ontap-cluster-name` values for each to prevent igroup conflicts. For example, `--ontap-cluster-name pve-prod` and `--ontap-cluster-name pve-dev`.
 
 ### Example storage.cfg (iSCSI)
 
@@ -561,6 +565,10 @@ PVE::Storage::Plugin (Proxmox VE base class)
 | Full Clone from Snapshot | Supported | Via temporary FlexClone + qemu-img copy |
 | Backup (vzdump) | Supported | Via snapshot |
 | RAM Snapshot (vmstate) | Supported | VM state saved to dedicated LUN (v0.1.7+) |
+| LXC Container (rootdir) | Supported | Container rootfs on NetApp LUN (v0.2.0+) |
+| EFI Disk | Supported | OVMF UEFI variables on NetApp LUN (v0.2.0+) |
+| Cloud-init Disk | Supported | Cloud-init ISO on NetApp LUN (v0.2.0+) |
+| TPM State | Supported | TPM 2.0 state on NetApp LUN (v0.2.0+) |
 
 ## Testing Status
 
@@ -792,7 +800,7 @@ storage: No such storage
 **Solution:**
 ```bash
 # Install on the affected node
-dpkg -i jt-pve-storage-netapp_0.1.9-1_all.deb
+dpkg -i jt-pve-storage-netapp_0.2.1-1_all.deb
 apt install -f
 systemctl restart pvedaemon pveproxy
 ```

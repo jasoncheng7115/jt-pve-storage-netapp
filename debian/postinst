@@ -24,6 +24,44 @@ add_netapp_multipath_config() {
     if [ -f "$MULTIPATH_CONF" ] && grep -q 'vendor.*"NETAPP"' "$MULTIPATH_CONF" 2>/dev/null; then
         echo "Existing NetApp configuration found in $MULTIPATH_CONF, skipping auto-configuration."
         echo "Note: Manual configuration will be preserved."
+        echo ""
+        # Check for dangerous infinite-queue settings
+        local needs_update=0
+        if grep -q 'no_path_retry.*queue' "$MULTIPATH_CONF" 2>/dev/null; then
+            needs_update=1
+        fi
+        if grep -q 'queue_if_no_path' "$MULTIPATH_CONF" 2>/dev/null; then
+            needs_update=1
+        fi
+        if grep -q 'dev_loss_tmo.*infinity' "$MULTIPATH_CONF" 2>/dev/null; then
+            needs_update=1
+        fi
+        if [ "$needs_update" -eq 1 ]; then
+            echo ""
+            echo -e "\033[1;33m!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!\033[0m"
+            echo -e "\033[1;31m  WARNING: DANGEROUS MULTIPATH SETTINGS DETECTED\033[0m"
+            echo -e "\033[1;33m!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!\033[0m"
+            echo ""
+            echo -e "  Your \033[1m$MULTIPATH_CONF\033[0m contains settings that may cause"
+            echo -e "  the \033[1;31mENTIRE PVE NODE TO HANG\033[0m if a NetApp LUN becomes unavailable."
+            echo ""
+            echo -e "  \033[1mRequired changes:\033[0m"
+            echo ""
+            echo -e "    \033[1;31mno_path_retry queue\033[0m    -->  \033[1;32mno_path_retry 30\033[0m"
+            echo -e "    \033[1;31mqueue_if_no_path\033[0m       -->  \033[1;32m(remove, use no_path_retry instead)\033[0m"
+            echo -e "    \033[1;31mdev_loss_tmo infinity\033[0m  -->  \033[1;32mdev_loss_tmo 60\033[0m"
+            echo ""
+            echo -e "  \033[1mAlso add if not present:\033[0m"
+            echo -e "    \033[1;32mfast_io_fail_tmo 5\033[0m"
+            echo ""
+            echo -e "  After editing, run: \033[1msystemctl reload multipathd\033[0m"
+            echo ""
+            echo -e "  For details, see: \033[1;36mhttps://github.com/jasoncheng7115/jt-pve-storage-netapp\033[0m"
+            echo -e "  Refer to \033[1mdocs/CONFIGURATION.md\033[0m -> Multipath Configuration section."
+            echo ""
+            echo -e "\033[1;33m!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!\033[0m"
+            echo ""
+        fi
         return 0
     fi
 
@@ -64,13 +102,15 @@ devices {
         path_grouping_policy group_by_prio
         path_selector "queue-length 0"
         path_checker tur
-        features "3 queue_if_no_path pg_init_retries 50"
+        features "2 pg_init_retries 50"
+        no_path_retry 30
         hardware_handler "1 alua"
         prio alua
         failback immediate
         rr_weight uniform
         rr_min_io_rq 1
-        dev_loss_tmo infinity
+        fast_io_fail_tmo 5
+        dev_loss_tmo 60
     }
 }
 # END jt-pve-storage-netapp

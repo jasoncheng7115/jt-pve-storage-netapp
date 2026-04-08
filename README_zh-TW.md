@@ -4,6 +4,33 @@
 
 此儲存外掛程式讓 Proxmox VE 能夠透過 iSCSI 或 FC 協定使用 NetApp ONTAP 儲存系統作為虛擬機磁碟儲存。
 
+## 目錄
+
+- [免責聲明](#免責聲明)
+- [重要：Multipath 安全規則](#重要multipath-安全規則)
+- [功能特色](#功能特色)
+- [Web UI 支援](#web-ui-支援)
+- [系統需求](#系統需求)
+- [安裝](#安裝)
+- [升級 SOP](#升級-sop)
+- [快速開始](#快速開始)
+- [配置選項](#配置選項)
+- [架構](#架構)
+- [支援功能](#支援功能)
+- [測試狀態](#測試狀態)
+- [已知限制](#已知限制)
+
+### 文件
+
+| 文件 | 說明 |
+|------|------|
+| [docs/QUICKSTART_zh-TW.md](docs/QUICKSTART_zh-TW.md) | 逐步設定指南 |
+| [docs/CONFIGURATION_zh-TW.md](docs/CONFIGURATION_zh-TW.md) | 完整配置參考（包含 multipath 安全性說明）|
+| [docs/TROUBLESHOOTING_zh-TW.md](docs/TROUBLESHOOTING_zh-TW.md) | 常見問題與復原程序 |
+| [docs/NAMING_CONVENTIONS_zh-TW.md](docs/NAMING_CONVENTIONS_zh-TW.md) | ONTAP 物件命名規則 |
+| [docs/TESTING_zh-TW.md](docs/TESTING_zh-TW.md) | 測試計畫與發版測試結果 |
+| [CHANGELOG_zh-TW.md](CHANGELOG_zh-TW.md) | 版本歷史 |
+
 ## 免責聲明
 
 > **警告：本外掛程式為新開發軟體，使用風險自負。**
@@ -18,6 +45,49 @@
 > **建議使用方式：**
 > - 從非關鍵性虛擬機開始進行評估
 > - 密切監控儲存操作
+
+## 重要：Multipath 安全規則
+
+> **安裝前務必閱讀。** 這些規則可避免 PVE 節點掛起以及誤斷其他儲存的連線。
+
+### 規則 1：絕對不要使用 `multipath -F`（大寫 F）
+
+`multipath -F` 會清除全系統**所有未使用**的 multipath maps。如果你有其他儲存（手動 iSCSI LVM、其他廠牌等），剛好當下沒有 I/O 在跑，**就會被斷線**。需要手動 `systemctl reload multipathd` 或 `iscsiadm -m session --rescan` 才能恢復。
+
+**請改用針對性清除：**
+```bash
+# 1. 找出 stale 的 WWID（所有 path 都顯示 "failed faulty"）
+multipath -ll
+
+# 2. 只清除一個特定的 stale WWID（小寫 f）
+multipath -f 3600a09807770457a795d5a7653705853
+```
+
+### 規則 2：編輯 `/etc/multipath.conf` 後，使用 `restart` 而非 `reload`
+
+```bash
+# 正確 - 套用新設定並清除 stale 狀態
+systemctl restart multipathd
+
+# 錯誤 - 只重新讀取設定，stale maps 不會清除
+systemctl reload multipathd
+```
+
+### 規則 3：檢查你的 `/etc/multipath.conf` 設定
+
+如果你的設定有以下任何一項，當 LUN 被刪除或變得無法存取時，整個 PVE 節點可能會掛起：
+
+| 設定 | 風險 | 修復方式 |
+|------|------|----------|
+| `no_path_retry queue` | I/O 永久排隊 | 改為 `no_path_retry 30` |
+| `queue_if_no_path`（在 features 中）| 同上 | 從 `features` 行移除 |
+| `dev_loss_tmo infinity` | Stale 裝置永遠不會被移除 | 改為 `dev_loss_tmo 60` |
+
+Plugin 安裝時會偵測這些設定並顯示醒目警告。詳見 [docs/CONFIGURATION.md](docs/CONFIGURATION.md#multipath-configuration)。
+
+### 規則 4：v0.2.2 之後會自動清理
+
+升級到 v0.2.2 之後，**不需要**再手動清理 stale 裝置。Plugin 會在背景的儲存狀態輪詢時自動偵測並清除它自己建立的孤兒裝置。它只會處理自己建立過的 WWID，**永遠不會影響其他儲存**。
 
 ## 功能特色
 
@@ -108,7 +178,7 @@ systemctl enable --now multipathd
 
 # 步驟 4：安裝外掛程式套件
 # （自動配置 multipath 並重新啟動 PVE 服務）
-dpkg -i jt-pve-storage-netapp_0.2.1-1_all.deb
+dpkg -i jt-pve-storage-netapp_0.2.2-1_all.deb
 ```
 
 > **注意：** 外掛程式會自動：
@@ -153,12 +223,111 @@ apt install -y open-iscsi multipath-tools sg3-utils psmisc \
 systemctl enable --now iscsid multipathd
 
 # 安裝外掛程式（自動配置 multipath 並重新啟動 PVE 服務）
-dpkg -i jt-pve-storage-netapp_0.2.1-1_all.deb
+dpkg -i jt-pve-storage-netapp_0.2.2-1_all.deb
 ```
 
 **叢集安裝順序：**
 1. 先在所有節點上安裝外掛程式
 2. 然後新增儲存配置（只需在任一節點執行一次）
+
+## 升級 SOP
+
+從舊版本升級時，請在**每個叢集節點**依序執行下列步驟（一次升級一台節點）：
+
+### 步驟 1：升級前備份
+
+```bash
+# 備份 multipath.conf（升級可能會顯示需要修改的警告）
+cp /etc/multipath.conf /etc/multipath.conf.bak.$(date +%Y%m%d-%H%M%S)
+
+# 記錄目前版本
+dpkg -l jt-pve-storage-netapp | tail -1
+```
+
+### 步驟 2：停止或遷移 VM（建議）
+
+為了最安全的升級，建議遷移或停止使用此儲存的 VM。執行中的 VM 在升級期間會繼續運作（plugin 只影響新操作），但乾淨的狀態能讓出問題時更容易復原。
+
+```bash
+# 列出使用 netapp 儲存的 VM
+qm list | while read vmid name rest; do
+    [ "$vmid" = "VMID" ] && continue
+    qm config $vmid 2>/dev/null | grep -q netapp && echo "VM $vmid 使用 netapp 儲存"
+done
+```
+
+### 步驟 3：安裝新套件
+
+```bash
+# 升級 plugin 套件
+dpkg -i jt-pve-storage-netapp_0.2.2-1_all.deb
+```
+
+postinst 會自動：
+- 偵測到既有 NetApp 設定時跳過 multipath.conf 修改
+- 重啟 `pvedaemon` 和 `pveproxy`
+- 偵測到危險的 multipath 設定時顯示**醒目警告**
+
+### 步驟 4：檢查 postinst 警告
+
+如果看到關於 `no_path_retry queue`、`queue_if_no_path` 或 `dev_loss_tmo infinity` 的警告，**必須**手動修改 `/etc/multipath.conf`：
+
+```bash
+# 編輯 multipath.conf
+nano /etc/multipath.conf
+
+# 套用變更：
+#   no_path_retry queue    -->  no_path_retry 30
+#   queue_if_no_path       -->  (從 features 行移除)
+#   dev_loss_tmo infinity  -->  dev_loss_tmo 60
+# 若沒有則新增：
+#   fast_io_fail_tmo 5
+
+# 套用（使用 restart，不是 reload -- reload 不會清除 stale maps）
+systemctl restart multipathd
+
+# 驗證
+multipathd show config local | grep -E 'no_path_retry|dev_loss_tmo|fast_io_fail'
+```
+
+### 步驟 5：驗證升級
+
+```bash
+# 確認套件版本
+dpkg -l jt-pve-storage-netapp | grep ii
+
+# 確認儲存狀態
+pvesm status | grep netapp
+
+# 確認 multipath 裝置健康（沒有 "failed faulty" 路徑）
+multipath -ll
+
+# 確認孤兒清理有在執行（幾分鐘後查 journal）
+journalctl -u pvedaemon --since "5 minutes ago" | grep -i "orphan" || echo "沒有孤兒（正常）"
+```
+
+### 步驟 6：在下一個節點重複
+
+移到下一個叢集節點，從步驟 1 重複。**不要同時升級多個節點**。
+
+### 復原（Rollback）
+
+若有問題需要降版：
+
+```bash
+# 從 GitHub releases 下載前一版
+dpkg -i jt-pve-storage-netapp_0.2.1-1_all.deb
+
+# 若有修改 multipath.conf，請還原備份
+cp /etc/multipath.conf.bak.<timestamp> /etc/multipath.conf
+systemctl restart multipathd
+```
+
+### 重要提醒
+
+- **絕對不要**在升級前、升級中、升級後執行 `multipath -F`（大寫 F）-- 會清除所有未使用的 maps，包括手動管理的儲存。請參閱上方[Multipath 安全規則](#重要multipath-安全規則)。
+- 使用 `systemctl restart multipathd`，**不要用 reload**。reload 不會清除 stale maps。
+- v0.2.2+ 的 plugin 會**自動處理孤兒清理** -- 升級後**不需要**手動清除 stale 裝置。
 
 ## 快速開始
 
@@ -376,20 +545,22 @@ pvesm set netapp1 --disable 0
 
 ### 1:1:1 架構模型
 
+> 註：以下圖示使用英文標籤以確保 ASCII art 對齊正確。
+
 ```
-Proxmox VE 叢集                      NetApp ONTAP
+Proxmox VE Cluster                    NetApp ONTAP
 +------------------+                  +-------------------+
-|   PVE 節點 1     |                  |   SVM: svm0       |
+|     PVE Node 1   |                  |   SVM: svm0       |
 |   +----------+   |    iSCSI         |   +-------------+ |
 |   | VM 100   |<--+----------------->|   | FlexVol     | |
 |   | scsi0    |   |   multipath      |   | pve_..._100 | |
 |   +----------+   |                  |   | +-------+   | |
 +------------------+                  |   | | LUN   |   | |
         |                             |   | | lun0  |   | |
-        | 線上遷移                     |   | +-------+   | |
+        | live-migration              |   | +-------+   | |
         v                             |   +-------------+ |
 +------------------+                  |                   |
-|   PVE 節點 2     |                  |   igroups:        |
+|     PVE Node 2   |                  |   igroups:        |
 |   +----------+   |    iSCSI         |   - pve_pve_pve1  |
 |   | VM 100   |<--+----------------->|   - pve_pve_pve2  |
 |   | scsi0    |   |   multipath      |                   |
@@ -572,8 +743,10 @@ PVE::Storage::Plugin (Proxmox VE 基礎類別)
 
 | 協定 | 狀態 | 備註 |
 |------|------|------|
-| **iSCSI** | 已測試 | 功能測試完成，尚未在正式環境大量測試 |
+| **iSCSI** | 已測試 | 22 項完整測試套件通過（v0.2.1）|
 | **FC (Fibre Channel)** | 尚未完整驗證 | 基本實作已完成，需要實際 FC 環境測試 |
+
+完整測試計畫及發版測試結果：[docs/TESTING.md](docs/TESTING.md)
 
 ## 已知限制
 
@@ -788,7 +961,7 @@ storage: No such storage
 **解決方案：**
 ```bash
 # 在受影響的節點上安裝
-dpkg -i jt-pve-storage-netapp_0.2.1-1_all.deb
+dpkg -i jt-pve-storage-netapp_0.2.2-1_all.deb
 apt install -f
 systemctl restart pvedaemon pveproxy
 ```

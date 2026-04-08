@@ -783,12 +783,23 @@ With `no_path_retry 30`, the I/O is retried for ~150 seconds and then **fails wi
 After editing `/etc/multipath.conf`:
 
 ```bash
-# Reload multipathd to apply new settings
-systemctl reload multipathd
+# Restart multipathd to apply new settings AND flush stale maps
+# IMPORTANT: Use 'restart', NOT 'reload'.
+# 'reload' only re-reads the config file but does NOT remove existing stale
+# multipath maps. Stale maps from deleted LUNs will persist until restart.
+systemctl restart multipathd
+
+# Alternatively, flush only unused/stale maps without restarting the daemon:
+multipath -F
 
 # Verify the new settings are active
 multipathd show config local
+
+# Verify no stale maps remain
+multipath -ll
 ```
+
+> **Why not `reload`?** `systemctl reload multipathd` only tells the daemon to re-parse `/etc/multipath.conf`. It applies new settings to *future* devices but does **not** clean up existing multipath maps. If you have stale maps from deleted LUNs (e.g., dm-X devices showing all paths in "failed faulty" state), `reload` will not remove them. Use `restart` or `multipath -F`.
 
 ### Coexistence with Existing Storage
 
@@ -804,6 +815,33 @@ If you configure multiple plugin storage entries on the **same SVM**, use differ
 pvesm add netappontap storage-prod --ontap-cluster-name pve-prod ...
 pvesm add netappontap storage-dev  --ontap-cluster-name pve-dev ...
 ```
+
+### Mixed Environment: Manual iSCSI LVM + This Plugin
+
+A common scenario: a PVE node already uses manually-configured iSCSI (e.g., as PVE's "iSCSI" or "LVM on iSCSI" storage type) AND has this plugin installed for additional NetApp storage. **This plugin is fully compatible with such setups, but there are critical rules to follow:**
+
+**DO:**
+- Upgrade to **v0.2.2 or later** -- automatic orphan cleanup handles this plugin's stale devices safely without affecting your manual storage.
+- Let the plugin manage its own LUNs entirely.
+- Only use targeted WWID flushing if manual cleanup is ever needed: `multipath -f <wwid>`.
+
+**DO NOT:**
+- **NEVER use `multipath -F` (capital F).** This flushes ALL unused multipath maps system-wide, including your manually-configured iSCSI LVM if it has no active I/O at the moment. Recovery requires `systemctl reload multipathd` or `iscsiadm -m session --rescan`.
+- Do not flush WWIDs you do not recognize -- they may belong to manual storage.
+
+**Why v0.2.2 is safe in mixed environments:**
+
+The plugin maintains a per-storage WWID tracking file at `/var/lib/pve-storage-netapp/<storeid>-wwids.json`. It records ONLY WWIDs that came from this plugin's own `path()` calls (i.e., LUNs created by `pvesm alloc` or `qm` operations on this plugin's storage). When the orphan cleanup runs (during `status()` polling), it checks ONLY tracked WWIDs against the ONTAP LUN list. WWIDs from your manual iSCSI setup are NEVER in the tracking file, so they are NEVER touched by automatic cleanup.
+
+**Symptoms of mixing `multipath -F` with manual LVM iSCSI:**
+
+| Symptom | Cause | Fix |
+|---------|-------|-----|
+| Manual iSCSI LVM disappears from PVE after `multipath -F` on a node with no VMs using it | `multipath -F` flushed the unused map | `systemctl reload multipathd` or `iscsiadm -m session --rescan` |
+| VM migration to that node fails or LVM still missing | PVE LVM plugin doesn't auto-rescan multipath | Same as above |
+| This plugin's storage works fine, but manual storage is broken | `multipath -F` only affects unused maps; this plugin's active maps were preserved | Same as above |
+
+The lesson: **after upgrading to v0.2.2, never run `multipath -F` again.** The plugin handles its own cleanup automatically and safely.
 
 ## Acknowledgments
 

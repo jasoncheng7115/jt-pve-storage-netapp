@@ -1,0 +1,455 @@
+# NetApp ONTAP 儲存外掛 - 測試計畫
+
+本文件定義 jt-pve-storage-netapp 外掛的完整測試程序。
+每次發佈之前，所有測試均須通過。
+
+## 前置需求
+
+- 已安裝外掛的 Proxmox VE 節點
+- 可透過管理 IP 存取的 ONTAP 系統 (模擬器或實體設備)
+- 已於 ONTAP SVM 設定的 iSCSI LIF (多重路徑測試至少需要 2 個)
+- 具 2 張與 ONTAP LIF 位於同一網段的 NIC 主機 (供 4-path 多重路徑測試)
+- 已設定 storage：`pvesm add netappontap <id> ...`
+- 於 `local:vztmpl/` 中備有 LXC 範本
+
+## 1. 基本連線
+
+```bash
+# 驗證 storage 為 active 狀態
+pvesm status | grep <storage-id>
+# 預期：active 並顯示容量
+
+# 驗證 iSCSI sessions (每個 LIF 對每個 NIC 有 1 個)
+iscsiadm -m session
+# 預期：N 個 sessions (NIC 數 x LIF 數)
+
+# 驗證多重路徑
+multipath -ll
+# 預期：NetApp LUN 裝置，所有路徑均為 active
+```
+
+## 2. VM 磁碟生命週期
+
+```bash
+STORAGE=netapp1
+VMID=9900
+
+# 2.1 配置 (Allocate)
+pvesm alloc $STORAGE $VMID vm-${VMID}-disk-0 1G
+# 預期：成功
+
+# 2.2 路徑解析
+pvesm path $STORAGE:vm-${VMID}-disk-0
+# 預期：/dev/mapper/<wwid>
+
+# 2.3 多重路徑驗證
+multipath -ll | grep -A8 NETAPP
+# 預期：所有路徑 active ready running
+
+# 2.4 讀寫
+DEVPATH=$(pvesm path $STORAGE:vm-${VMID}-disk-0)
+dd if=/dev/zero of="$DEVPATH" bs=1M count=10 oflag=direct
+dd if="$DEVPATH" of=/dev/null bs=1M count=10 iflag=direct
+# 預期：兩者均成功
+
+# 2.5 釋放 (Free)
+pvesm free $STORAGE:vm-${VMID}-disk-0
+# 預期：成功，不留下多重路徑殘留裝置
+multipath -ll | grep -c NETAPP
+# 預期：0 (或僅剩其他測試 LUN)
+```
+
+## 3. VM 操作
+
+```bash
+STORAGE=netapp1
+VMID=9901
+
+# 3.1 於 NetApp 上建立含磁碟的 VM
+qm create $VMID --name test-netapp --memory 512 --cores 1 \
+  --scsi0 $STORAGE:1 --ostype l26 --scsihw virtio-scsi-single
+
+# 3.2 快照
+qm snapshot $VMID snap1
+qm listsnapshot $VMID
+# 預期：列出 snap1
+
+# 3.3 第二個快照
+qm snapshot $VMID snap2
+
+# 3.4 刪除第一個快照
+qm delsnapshot $VMID snap1
+# 預期：snap1 已移除，snap2 仍保留
+
+# 3.5 還原
+qm rollback $VMID snap2
+# 預期：成功
+
+# 3.6 調整大小
+qm resize $VMID scsi0 +512M
+qm config $VMID | grep scsi0
+# 預期：容量增加
+
+# 3.7 清除快照以進行移動測試
+qm delsnapshot $VMID snap2
+```
+
+## 4. 磁碟遷移
+
+```bash
+# 4.1 NetApp -> local-lvm
+qm move-disk $VMID scsi0 local-lvm --delete 1
+qm config $VMID | grep scsi0
+# 預期：scsi0 位於 local-lvm，無 hang 住
+
+# 4.2 local-lvm -> NetApp
+qm move-disk $VMID scsi0 $STORAGE --delete 1
+qm config $VMID | grep scsi0
+# 預期：scsi0 位於 NetApp，無 hang 住
+```
+
+## 5. 複製 (Clone) 操作
+
+```bash
+# 5.1 Full Clone
+qm clone $VMID 9902 --name test-full-clone --full 1
+qm config 9902 | grep scsi0
+# 預期：於 NetApp 上的新磁碟
+
+# 5.2 範本 + Linked Clone
+qm delsnapshot $VMID snap2 2>/dev/null  # 確保無快照
+qm template $VMID
+qm clone $VMID 9903 --name test-linked-clone
+qm config 9903 | grep scsi0
+# 預期：於 NetApp 上的 linked clone 磁碟
+
+# 清除複製
+qm destroy 9902 --purge
+qm destroy 9903 --purge
+```
+
+## 6. 特殊磁碟類型
+
+```bash
+VMID=9903
+qm create $VMID --name test-disks --memory 512 --cores 1 \
+  --scsi0 $STORAGE:1 --ostype l26 --scsihw virtio-scsi-single
+
+# 6.1 EFI 磁碟
+qm set $VMID --bios ovmf \
+  --efidisk0 $STORAGE:1,efitype=4m,pre-enrolled-keys=1
+qm config $VMID | grep efidisk0
+# 預期：efidisk0 位於 NetApp
+
+# 6.2 Cloud-init
+qm set $VMID --ide2 $STORAGE:cloudinit
+qm config $VMID | grep ide2
+# 預期：cloudinit 磁碟位於 NetApp
+
+# 6.3 TPM
+qm set $VMID --tpmstate0 $STORAGE:1,version=v2.0
+qm config $VMID | grep tpmstate0
+# 預期：tpmstate0 位於 NetApp
+
+# 清除
+qm destroy $VMID --purge
+```
+
+## 7. LXC 容器
+
+```bash
+CTID=9910
+
+# 7.1 建立以 NetApp 為 rootfs 的 LXC
+pct create $CTID local:vztmpl/<template>.tar.zst \
+  --rootfs $STORAGE:2 \
+  --hostname test-lxc --memory 256 --cores 1 \
+  --net0 name=eth0,bridge=vmbr0,ip=dhcp --unprivileged 0
+# 預期：成功
+
+# 7.2 啟動
+pct start $CTID
+pct status $CTID
+# 預期：running
+
+# 7.3 快照
+pct snapshot $CTID snap1
+# 預期：成功
+
+# 7.4 停止 + 清除
+pct stop $CTID
+pct delsnapshot $CTID snap1
+pct destroy $CTID --purge
+# 預期：全部乾淨
+```
+
+## 8. igroup 對應驗證
+
+```bash
+# 執行 alloc_image 後，驗證 LUN 已對應至所有節點的 igroup
+pvesm alloc $STORAGE 9999 vm-9999-disk-0 128M
+
+# 於 ONTAP 檢查 (透過 API 或 CLI)：
+# - LUN 應對應至 pve_<cluster>_<node1> 及 pve_<cluster>_<node2>
+# - 而不僅是目前節點的 igroup
+
+pvesm free $STORAGE:vm-9999-disk-0
+```
+
+## 9. 逾時保護 (防止 Hang)
+
+```bash
+# 9.1 驗證 sysfs 寫入逾時機制
+# 檢查 dmesg/journal 於正常操作期間是否出現 "timed out after 10s" 訊息
+# 這類訊息對於無回應的 SCSI host 是預期行為，且不應阻塞操作
+
+# 9.2 儲存狀態查詢不應 hang 住
+time pvesm status
+# 預期：即使 ONTAP 回應緩慢，仍應於 30 秒內完成
+
+# 9.3 若條件允許，中斷一個 iSCSI LIF 並驗證：
+#   - 透過剩餘路徑仍可正常操作
+#   - 沒有 PVE worker hang 住
+#   - multipath 顯示路徑降級
+```
+
+## 10. 失效情境 (選用，需受控環境)
+
+```bash
+# 10.1 中斷一個 iSCSI LIF
+# 驗證：multipath 降級，剩餘路徑上 I/O 持續進行
+# 驗證：重新連線後所有路徑恢復
+
+# 10.2 中斷所有 iSCSI LIF
+# 驗證：PVE 狀態回傳 (0,0,0,0) 而非 hang 住
+# 驗證：pvesm status 可完成 (不 hang)
+# 驗證：無 PVE worker 行程卡在 D state
+
+# 10.3 ONTAP API 無法連線 (封鎖 port 443)
+# 驗證：pvesm status 約於 35 秒內完成
+# 驗證：alloc/free 操作以清楚錯誤訊息失敗，而非 hang 住
+```
+
+## 11. 與現有 multipath 共存
+
+若主機已存在手動設定的 multipath：
+
+```bash
+# 11.1 驗證現有 multipath 裝置未受影響
+multipath -ll
+# 預期：客戶既有的裝置仍存在且可正常運作
+
+# 11.2 驗證 iSCSI sessions
+iscsiadm -m session
+# 預期：客戶原有 sessions 完整，並新增外掛的 sessions
+
+# 11.3 驗證 multipath.conf 未被修改
+grep "BEGIN jt-pve-storage-netapp" /etc/multipath.conf
+# 預期：找不到 (客戶設定被保留)
+```
+
+## 清除
+
+```bash
+# 移除所有測試 VM 與容器
+qm destroy 9900 --purge 2>/dev/null
+qm destroy 9901 --purge 2>/dev/null
+qm destroy 9902 --purge 2>/dev/null
+qm destroy 9903 --purge 2>/dev/null
+pct destroy 9910 --purge 2>/dev/null
+
+# 驗證 ONTAP 上無孤立 volume
+pvesm list $STORAGE
+```
+
+---
+
+## 發佈測試結果
+
+每個版本發佈前都必須通過上述所有測試。結果記錄於下方。
+
+### v0.2.2-1 擴展測試套件 (2026-04-08)
+
+**測試環境：** 與 v0.2.1 相同，配合混合 multipath.conf（保留既有的手動 NetApp 設定，含 `queue_if_no_path` 和 `dev_loss_tmo infinity` -- 故意保留以驗證 postinst 警告）。
+
+#### 第 1-2 區：基本連線與磁碟生命週期
+
+| # | 測試項目 | 結果 |
+|---|---------|------|
+| T1 | Storage 啟用 | PASS |
+| T2 | iSCSI sessions >= 2 | PASS |
+| T3 | Alloc image | PASS |
+| T4 | Path 解析 | PASS |
+| T5 | Multipath active | PASS |
+| T6 | 寫入測試 (dd) | PASS |
+| T7 | 讀取測試 (dd) | PASS |
+| T8 | WWID 已記錄到追蹤檔 | PASS |
+| T9 | Free image (無殘留) | PASS |
+| T10 | Free 後 WWID 解除追蹤 | PASS |
+
+#### 第 3 區：VM 操作與遷移
+
+| # | 測試項目 | 結果 |
+|---|---------|------|
+| T11 | 建立 VM 並把磁碟放到 NetApp | PASS |
+| T12 | 快照 1 | PASS |
+| T13 | 快照 2 | PASS |
+| T14 | 刪除快照 | PASS |
+| T15 | 回滾 (rollback) | PASS |
+| T16 | Resize +256M | PASS |
+| T17 | 遷移磁碟 NetApp -> local-lvm | PASS |
+| T18 | 遷移磁碟 local-lvm -> NetApp | PASS |
+| T19 | Full Clone | PASS |
+| T20 | 轉換為 Template | PASS |
+| T21 | Linked Clone | PASS |
+| T22 | EFI 磁碟 | PASS |
+| T23 | Cloud-init 磁碟 | PASS |
+| T24 | TPM 狀態 | PASS |
+| T25 | LXC 建立 (rootfs 在 NetApp) | PASS |
+| T26 | LXC 啟動 | PASS |
+| T27 | LXC 快照 | PASS |
+
+#### 第 4 區：對既有 VM 新增/移除磁碟
+
+| # | 測試項目 | 結果 |
+|---|---------|------|
+| T28 | 對既有 VM 新增 2GB 磁碟 (qm set --scsi1) | PASS |
+| T29 | 磁碟出現在配置中 | PASS |
+| T30 | 再新增 1GB 磁碟 (scsi2) | PASS |
+| T31 | Resize 新增的磁碟 | PASS |
+| T32 | 透過 qm set --delete 卸載磁碟 | PASS |
+| T33 | 磁碟顯示為 unused | PASS |
+| T34 | 刪除 unused 磁碟 | PASS |
+| T35 | 透過 qm unlink 強制刪除 | PASS |
+| T36 | 額外磁碟全部清除 | PASS |
+| T37 | 磁碟移除後無殘留 multipath | PASS |
+
+#### 第 5 區：孤兒清理 (叢集情境)
+
+端到端測試：模擬 Node A 刪除 VM，Node B 的 stale 裝置由 status() 輪詢自動清除。
+
+| # | 測試項目 | 結果 |
+|---|---------|------|
+| T38 | path() 後 WWID 已追蹤 | PASS |
+| T39 | 模擬叢集刪除 (僅透過 API) | PASS |
+| T40 | 清理前 stale multipath 仍存在 | PASS |
+| T41 | (略過：由 T42 涵蓋) | - |
+| T42 | status() 輪詢觸發孤兒清理 | PASS |
+| T43 | WWID 從追蹤檔中移除 | PASS |
+
+#### 第 6 區：混合環境、igroup、韌性測試
+
+| # | 測試項目 | 結果 |
+|---|---------|------|
+| T44 | 追蹤檔結構正確 | PASS |
+| T45 | alloc_image map 到所有節點 igroup | PASS |
+| T46 | status() < 35 秒完成 | PASS (1 秒) |
+| T47 | 無 PVE worker 處於 D state | PASS |
+| T48 | postinst 警告邏輯偵測到危險設定 | PASS |
+
+#### 第 7 區：PVE 實際工作流程（真實 VM 生命週期）
+
+| # | 測試項目 | 結果 | 備註 |
+|---|---------|------|------|
+| T49 | VM 建立 | PASS | |
+| T50 | VM 啟動（觸發 storage activate）| PASS | 巢狀測試使用 TCG 模式 |
+| T51 | 熱插拔磁碟到執行中的 VM | PASS | qm set --scsi1 |
+| T52 | 熱插拔的磁碟可見 | PASS | |
+| T53 | 從執行中的 VM 熱拔除磁碟 | PASS | |
+| T54 | VM 停止 | PASS | |
+| T55 | vzdump 備份 | PASS | mode=stop |
+| T56 | qmrestore 還原至 NetApp | PASS | 跨儲存還原 |
+| T57 | 多磁碟 VM 執行中 | PASS | 2 磁碟 |
+| T58 | 帶 RAM 狀態的 VM 快照 (vmstate) | PASS | QEMU 狀態存到專用 LUN |
+| T59 | 刪除 RAM 快照 | PASS | |
+
+#### 第 8 區：故障情境
+
+| # | 測試項目 | 結果 | 備註 |
+|---|---------|------|------|
+| T65 | 多重路徑降級時 I/O 持續 | PASS | 2/4 路徑時 35 MB/s |
+| T66 | Multipath 正確降級 | PASS | 部分 failed，部分 active |
+| T67 | LIF 恢復後路徑恢復 | PASS | |
+| T69 | iSCSI 全斷時 status() 仍可完成 | PASS | 1 秒（使用 API 非 iSCSI）|
+| T70 | ONTAP API 封鎖時 status() | PASS | 33 秒 timeout，回 inactive |
+| T71 | 封鎖期間無 PVE worker 進入 D state | PASS | 所有 timeout 保護生效 |
+
+#### 第 9 區：ONTAP 端協同故障測試
+
+這些測試需要 ONTAP 端配合操作（由獨立的 ONTAP 管理 agent 執行）。
+
+| # | 測試項目 | 結果 | 備註 |
+|---|---------|------|------|
+| T72 | iSCSI service stop/start (~36 秒中斷) | PASS | dd 在 counter=92 被 queue，重啟後自動恢復，零資料遺失 |
+| T73 | 4 條 multipath 路徑在 iSCSI 重啟後恢復 | PASS | iscsi start 後 6 秒內 |
+| T74 | dd 在 iSCSI 恢復後自動繼續 | PASS | counter 92 → 95 → 101（無需人工介入）|
+| T75 | dd 在中斷期間進入 D state 但會恢復 | PASS | 非永久卡死 |
+| T76 | PVE worker 全程無 D state 卡死 | PASS | 整個中斷期間 |
+| T77 | 手動建立 ONTAP volume 衝突 (TOCTOU) | PASS | `pvesm alloc` 自動 retry 下一個 disk ID |
+| T78 | 連續衝突 retry | PASS | disk-0 衝突 → disk-1，再 disk-0 → disk-2 |
+| T79 | API 401 偵測 | PASS | 警告紀錄：「ONTAP API returned 401, reinitializing auth」|
+| T80 | API 401 reinit auth 嘗試 | PASS | Fix #10 (v0.2.1) 端到端驗證 |
+| T81 | 認證失敗時優雅失敗 | PASS | status() 9 秒內回 inactive，無卡死 |
+| T82 | 密碼恢復後 storage 自動恢復 | PASS | 1 秒回 active，完整功能恢復 |
+| T83 | 401 處理過程無 PVE worker 在 D state | PASS | |
+
+**總計：75/75 PASS**
+
+**v0.2.2 已驗證的改進：**
+- 叢集孤兒清理機制端到端正常運作
+- WWID 追蹤在 path() / free_image() 生命週期中正確維護
+- alloc_image 對應到所有 per-node igroups（不只當前節點）
+- 混合環境（手動 NetApp + plugin）安全 -- 只碰追蹤過的 WWID
+- API 401 重試邏輯已驗證有效（測試中 Perl shell 引號觸發 401，plugin 自動恢復）
+- status() 輪詢快速且永不掛起
+
+### v0.2.2-1 初版測試 (2026-04-08)
+
+**測試環境：** 與 v0.2.1 相同
+
+| # | 測試項目 | 結果 | 備註 |
+|---|---------|------|------|
+| T1-T22 | 所有 v0.2.1 測試 | PASS | |
+| T23 | **孤兒清理 (叢集情境)** | **PASS** | 初步驗證 |
+
+**總計：23/23 PASS**
+
+### v0.2.1-1 (2026-04-08)
+
+**測試環境：**
+- Proxmox VE 9.1 (kernel 6.17.4-2-pve)
+- ONTAP Simulator 9.16.1 (單節點)
+- 2 個 iSCSI LIF (192.168.1.197、192.168.1.198)
+- 主機 2 張 NIC (每個 LUN 4 條多重路徑)
+- 主機已有手動 multipath 設定
+
+| # | 測試項目 | 結果 | 備註 |
+|---|------|--------|-------|
+| T1 | Storage status | PASS | Active，容量正確回報 |
+| T2 | iSCSI sessions | PASS | 4 sessions (2 NIC x 2 LIF) |
+| T3 | Alloc + Path + Multipath | PASS | 每個 LUN 4 條 active 路徑 |
+| T4 | 讀/寫 (dd) | PASS | 寫入 40 MB/s，讀取 29 MB/s |
+| T5 | Free + 清除 | PASS | Volume 已移除，multipath 已清理 |
+| T6 | 於 NetApp 建立 VM | PASS | |
+| T7 | 快照 (建立 x2) | PASS | |
+| T8 | 快照刪除 | PASS | |
+| T9 | 快照還原 | PASS | |
+| T10 | 磁碟調整大小 (+512M) | PASS | 線上調整 |
+| T11 | 磁碟移動 NetApp -> local-lvm | PASS | 無 hang，完整複製完成 |
+| T12 | 磁碟移動 local-lvm -> NetApp | PASS | 無 hang，完整複製完成 |
+| T13 | Full Clone | PASS | |
+| T14 | 範本 + Linked Clone | PASS | FlexClone 立即建立 |
+| T15a | EFI Disk | PASS | OVMF vars 位於 NetApp LUN |
+| T15b | Cloud-init Disk | PASS | ISO 位於 NetApp LUN |
+| T15c | TPM State | PASS | TPM 2.0 位於 NetApp LUN |
+| T16 | LXC 建立 (rootfs 於 NetApp) | PASS | 格式化為 ext4，範本已解開 |
+| T17 | LXC 啟動 | PASS | 容器 running |
+| T18 | LXC 快照 | PASS | |
+| T19 | igroup 對應 (多節點) | PASS | LUN 對應至兩個節點的 igroup |
+| T20 | 逾時保護 | PASS | sysfs 寫入逾時觸發，無 hang |
+| T21 | activate_storage 略過探索 | PASS | 重用既有 sessions，無 30 秒延遲 |
+| T22 | postinst 警告顯示 | PASS | 對危險 multipath 設定顯示彩色警告 |
+
+**已知限制 (僅限測試環境)：**
+- SCSI host6 掃描因測試 VM 的 NIC 設定而持續逾時 (10 秒) — 不影響操作，逾時保護機制運作正常
+- ONTAP 模擬器的過期 FlexClone 中繼資料導致部分範本 volume 無法刪除 — 屬 ONTAP 端問題，非外掛 bug

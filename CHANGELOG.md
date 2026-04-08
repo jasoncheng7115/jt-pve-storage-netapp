@@ -2,6 +2,35 @@
 
 All notable changes to the NetApp ONTAP Storage Plugin for Proxmox VE are documented here.
 
+## [0.2.2] - 2026-04-08
+
+### Cluster Orphan Device Cleanup Release
+
+**Critical Cluster Fix:**
+- Fixed stale multipath devices remaining on cluster nodes after a VM disk is deleted on a different node. Previously, when Node A removed a VM, Node B's local SCSI/multipath devices for that LUN became orphaned and could persist indefinitely (showing all paths in failed state). Combined with `no_path_retry queue` multipath settings, this could cause the entire node to hang when any process touched the orphaned device.
+
+**New Feature: Automatic Orphan Device Cleanup**
+- Added per-storage WWID tracking state file at `/var/lib/pve-storage-netapp/<storeid>-wwids.json`. Each node records WWIDs it has seen for this storage.
+- `path()` now tracks WWIDs after successfully resolving a real device.
+- `free_image()` untracks WWIDs after successful LUN deletion.
+- `status()` runs orphan cleanup in a background fork on every poll. It compares tracked WWIDs against the current ONTAP LUN list and cleans up local devices for any tracked WWIDs that no longer exist on ONTAP.
+- **Safety:** only WWIDs in the tracking file are eligible for cleanup, so manually-managed NetApp devices and devices from other plugins are never affected.
+- If the ONTAP API is unreachable during cleanup, the operation aborts to avoid false positives that could remove valid devices.
+
+**Concurrency Fixes (post-review):**
+- Added file locking (`flock`) to WWID tracking state file to prevent race conditions when multiple PVE workers concurrently call `path()` for different volumes (e.g., parallel VM allocation).
+- Atomic write via temp file + rename for WWID state persistence.
+- Changed `status()` background cleanup to double-fork pattern to prevent zombie process accumulation in long-running `pvedaemon` (grandchild is reparented to init and reaped automatically).
+
+**Documentation:**
+- Updated postinst warning to recommend `systemctl restart multipathd` instead of `reload` (reload does not flush stale maps).
+- Updated `docs/CONFIGURATION.md` to explain reload vs restart behavior.
+
+**Test Coverage Expanded to 63 tests:**
+- Added Section 7: PVE workflow tests (VM start, hot-plug/unplug, vzdump backup, qmrestore, multi-disk VM, vmstate RAM snapshot)
+- Added Section 8: Failure scenarios (single LIF failure, total iSCSI blackout, ONTAP API blackout, D-state verification)
+- All 63 tests PASS
+
 ## [0.2.1] - 2026-04-08
 
 ### Production Hardening Release - Edge Case & Race Condition Fixes

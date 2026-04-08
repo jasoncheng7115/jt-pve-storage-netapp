@@ -7,7 +7,7 @@ All notable changes to the NetApp ONTAP Storage Plugin for Proxmox VE are docume
 ### Cluster Orphan Device Cleanup Release
 
 **Critical Cluster Fix:**
-- Fixed stale multipath devices remaining on cluster nodes after a VM disk is deleted on a different node. Previously, when Node A removed a VM, Node B's local SCSI/multipath devices for that LUN became orphaned and could persist indefinitely (showing all paths in failed state). Combined with `no_path_retry queue` multipath settings, this could cause the entire node to hang when any process touched the orphaned device.
+- Fixed stale multipath devices remaining on cluster nodes after a VM disk is deleted on a different node. Previously, when Node A removed a VM, Node B's local SCSI/multipath devices for that LUN became orphaned and could persist indefinitely (showing all paths in failed state). If multipath.conf used the **dangerous** `no_path_retry queue` setting (which should be changed to `no_path_retry 30`, see [README.md](README.md#critical-multipath-safety-rules)), any process touching the orphaned device could hang the entire node. v0.2.2 automatically cleans orphans, making the system safer regardless of `no_path_retry` setting.
 
 **New Feature: Automatic Orphan Device Cleanup**
 - Added per-storage WWID tracking state file at `/var/lib/pve-storage-netapp/<storeid>-wwids.json`. Each node records WWIDs it has seen for this storage.

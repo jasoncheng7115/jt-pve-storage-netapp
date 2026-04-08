@@ -686,6 +686,125 @@ iptables -A OUTPUT -d <ontap-mgmt-ip> -p tcp --dport 443 -j ACCEPT
 
 ---
 
+## Multipath Configuration
+
+### Automatic Configuration (New Installations)
+
+When this plugin is installed on a system **without** existing NetApp multipath configuration, it automatically adds a safe default configuration to `/etc/multipath.conf`. No manual action is needed.
+
+### Existing Multipath Configuration (Manual Setup)
+
+If you already have NetApp multipath configuration in `/etc/multipath.conf` (e.g., from a previous manual iSCSI setup), the plugin will **not** modify it. You will see a warning during installation if your settings need updating.
+
+### Critical Settings
+
+The following multipath settings directly affect system stability. Incorrect values can cause the **entire PVE node to become unresponsive** when a NetApp LUN is deleted or becomes unavailable.
+
+#### no_path_retry (CRITICAL)
+
+Controls what happens when **all** paths to a LUN fail (e.g., LUN deleted, network down, ONTAP failover).
+
+| Value | Behavior | Risk |
+|-------|----------|------|
+| `queue` | I/O queued **indefinitely** | **DANGEROUS** - Any process accessing the device hangs forever. PVE node becomes unresponsive. Cannot be killed with `kill -9`. Only reboot recovers. |
+| `30` | I/O queued for ~150 seconds, then fails | **Recommended** - Allows time for ONTAP failover recovery while preventing permanent hangs. |
+| `fail` | I/O fails immediately | Too aggressive - normal failovers will cause unnecessary errors. |
+
+**Recommended:** `no_path_retry 30`
+
+If your current config uses `no_path_retry queue` or has `features "... queue_if_no_path ..."`, change it:
+
+```
+# BEFORE (dangerous):
+no_path_retry           queue
+features "3 queue_if_no_path pg_init_retries 50"
+
+# AFTER (safe):
+no_path_retry           30
+features "2 pg_init_retries 50"
+```
+
+#### dev_loss_tmo
+
+Controls how long the kernel keeps a SCSI device after the transport (iSCSI session) reports it lost.
+
+| Value | Behavior | Risk |
+|-------|----------|------|
+| `infinity` | Device kept **forever** | **DANGEROUS** - Stale SCSI devices for deleted LUNs are never removed. Generates I/O errors indefinitely. |
+| `60` | Device removed after 60 seconds | **Recommended** - Gives enough time for transient failures while cleaning up dead devices. |
+
+**Recommended:** `dev_loss_tmo 60`
+
+#### fast_io_fail_tmo
+
+Controls how quickly a path is marked as failed when the transport reports an error.
+
+**Recommended:** `fast_io_fail_tmo 5`
+
+### Recommended multipath.conf for NetApp
+
+```
+devices {
+    device {
+        vendor "NETAPP"
+        product "LUN C-Mode"
+        path_grouping_policy group_by_prio
+        path_selector "queue-length 0"
+        path_checker tur
+        features "2 pg_init_retries 50"
+        no_path_retry 30
+        hardware_handler "1 alua"
+        prio alua
+        failback immediate
+        rr_weight uniform
+        rr_min_io_rq 1
+        fast_io_fail_tmo 5
+        dev_loss_tmo 60
+    }
+}
+```
+
+### Why queue_if_no_path is Dangerous
+
+When a LUN is deleted from ONTAP while PVE still has active iSCSI sessions:
+
+1. ONTAP removes the LUN, but the host still has SCSI device entries
+2. Any process that touches the stale device triggers an I/O request
+3. With `queue_if_no_path`, the kernel queues the I/O **forever**
+4. The process enters uninterruptible sleep (D state) -- cannot be killed
+5. PVE periodically polls storage status, hitting the stale device
+6. PVE daemon enters D state -- the entire node becomes unresponsive
+7. Only a reboot can recover the node
+
+With `no_path_retry 30`, the I/O is retried for ~150 seconds and then **fails with an error**. The process gets an I/O error (which it can handle) instead of hanging forever. This gives ONTAP failover enough time to complete while preventing permanent hangs.
+
+### Applying Changes
+
+After editing `/etc/multipath.conf`:
+
+```bash
+# Reload multipathd to apply new settings
+systemctl reload multipathd
+
+# Verify the new settings are active
+multipathd show config local
+```
+
+### Coexistence with Existing Storage
+
+If you have multiple storage systems using multipath (e.g., existing NetApp iSCSI + this plugin), the plugin will:
+
+- **Not modify** your existing multipath.conf
+- Share the same multipath daemon and iSCSI infrastructure
+- Use device-level filtering (vendor "NETAPP") for its multipath settings
+
+If you configure multiple plugin storage entries on the **same SVM**, use different `ontap-cluster-name` values to prevent igroup conflicts:
+
+```bash
+pvesm add netappontap storage-prod --ontap-cluster-name pve-prod ...
+pvesm add netappontap storage-dev  --ontap-cluster-name pve-dev ...
+```
+
 ## Acknowledgments
 
 Special thanks to **NetApp** for generously providing the development and testing environment that made this project possible.

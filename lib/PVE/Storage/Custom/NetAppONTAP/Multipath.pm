@@ -8,6 +8,7 @@ use IPC::Open3;
 use IO::Select;
 use Symbol qw(gensym);
 use File::Basename qw(basename);
+use POSIX qw(_exit);
 
 use Exporter qw(import);
 
@@ -27,6 +28,8 @@ our @EXPORT_OK = qw(
     get_multipath_slaves
     cleanup_lun_devices
     is_device_in_use
+    sysfs_write_with_timeout
+    sysfs_read_with_timeout
 );
 
 # Constants
@@ -73,6 +76,120 @@ sub _untaint_path {
         return $1;
     }
     return undef;
+}
+
+# Write to a sysfs file in a forked child process with timeout.
+# Prevents the parent from entering uninterruptible sleep (D state)
+# if the kernel operation blocks due to unresponsive storage.
+# Returns: 1 on success, 0 on timeout/failure (with warning)
+sub sysfs_write_with_timeout {
+    my ($path, $data, $timeout) = @_;
+    $timeout //= 10;
+
+    my $pid = fork();
+    if (!defined $pid) {
+        warn "fork failed for sysfs write to $path: $!\n";
+        return 0;
+    }
+
+    if ($pid == 0) {
+        # Child: do the sysfs write, then exit immediately
+        eval {
+            open(my $fh, '>', $path) or die "open: $!";
+            print $fh $data;
+            close($fh);
+        };
+        POSIX::_exit($@ ? 1 : 0);
+    }
+
+    # Parent: wait for child with timeout
+    my $deadline = time() + $timeout;
+    while (time() < $deadline) {
+        my $res = waitpid($pid, POSIX::WNOHANG());
+        if ($res > 0) {
+            return ($? >> 8) == 0 ? 1 : 0;
+        }
+        return 1 if $res < 0;
+        select(undef, undef, undef, 0.1);
+    }
+
+    # Timeout: kill the child
+    warn "sysfs write to $path timed out after ${timeout}s, killing child pid $pid\n";
+    kill('KILL', $pid);
+    my $reaped = waitpid($pid, POSIX::WNOHANG());
+    if ($reaped == 0) {
+        warn "child pid $pid in uninterruptible sleep, cannot reap\n";
+    }
+    return 0;
+}
+
+# Read from a sysfs/proc file in a forked child process with timeout.
+# Prevents the parent from entering uninterruptible sleep (D state)
+# when reading device attributes from unresponsive storage.
+# Returns: file content on success, undef on timeout/failure
+sub sysfs_read_with_timeout {
+    my ($path, $timeout) = @_;
+    $timeout //= 5;
+
+    pipe(my $read_fh, my $write_fh) or do {
+        warn "pipe failed for sysfs read of $path: $!\n";
+        return undef;
+    };
+
+    my $pid = fork();
+    if (!defined $pid) {
+        warn "fork failed for sysfs read of $path: $!\n";
+        close($read_fh);
+        close($write_fh);
+        return undef;
+    }
+
+    if ($pid == 0) {
+        # Child: read the file, send content through pipe
+        close($read_fh);
+        eval {
+            open(my $fh, '<', $path) or die "open: $!";
+            local $/;
+            my $data = <$fh>;
+            close($fh);
+            print $write_fh ($data // '');
+        };
+        close($write_fh);
+        POSIX::_exit($@ ? 1 : 0);
+    }
+
+    # Parent: read from pipe with alarm-based timeout
+    close($write_fh);
+    my $content = '';
+
+    eval {
+        local $SIG{ALRM} = sub { die "timeout\n" };
+        alarm($timeout);
+
+        # Read all data from pipe until EOF
+        while (1) {
+            my $buf;
+            my $bytes = sysread($read_fh, $buf, 65536);
+            last if !defined($bytes) || $bytes == 0;
+            $content .= $buf;
+        }
+
+        alarm(0);
+    };
+    my $timed_out = $@;
+    alarm(0);
+    close($read_fh);
+
+    if ($timed_out) {
+        warn "sysfs read of $path timed out after ${timeout}s, killing child pid $pid\n";
+        kill('KILL', $pid);
+        waitpid($pid, POSIX::WNOHANG());
+        return undef;
+    }
+
+    # Reap child
+    waitpid($pid, 0);
+    return length($content) ? $content : undef;
 }
 
 # Run a command and return output
@@ -152,9 +269,7 @@ sub rescan_scsi_hosts {
 
         my $scan_file = SCSI_HOST_PATH . "/$host/scan";
         if (-w $scan_file) {
-            open(my $fh, '>', $scan_file) or next;
-            print $fh "- - -\n";
-            close($fh);
+            sysfs_write_with_timeout($scan_file, "- - -\n", 10);
         }
     }
 
@@ -275,16 +390,16 @@ sub get_multipath_wwid {
         }
     }
 
-    # Try /sys/block/*/device/wwid
+    # Try /sys/block/*/device/wwid (with timeout to prevent hang on unresponsive device)
     my $dev_name = _untaint_device_name(basename($device));
     return undef unless $dev_name;
     my $wwid_file = BLOCK_DEVICE_PATH . "/$dev_name/device/wwid";
     if (-r $wwid_file) {
-        open(my $fh, '<', $wwid_file) or return undef;
-        my $wwid = <$fh>;
-        close($fh);
-        chomp($wwid) if $wwid;
-        return $wwid;
+        my $wwid = sysfs_read_with_timeout($wwid_file, 5);
+        if ($wwid) {
+            chomp($wwid);
+            return $wwid;
+        }
     }
 
     return undef;
@@ -300,10 +415,17 @@ sub get_device_by_wwid {
     my $mpath = get_multipath_device($wwid);
     return $mpath if $mpath && -b $mpath;
 
-    # Check /dev/disk/by-id
+    # Check /dev/disk/by-id (with timeout to prevent hang on unresponsive device)
     (my $safe_wwid = $wwid) =~ s/([\[\]{}*?\\])/\\$1/g;
-    my @devices = glob("/dev/disk/by-id/wwn-*$safe_wwid*");
-    push @devices, glob("/dev/disk/by-id/scsi-*$safe_wwid*");
+    my @devices;
+    eval {
+        local $SIG{ALRM} = sub { die "timeout\n" };
+        alarm(5);
+        @devices = glob("/dev/disk/by-id/wwn-*$safe_wwid*");
+        push @devices, glob("/dev/disk/by-id/scsi-*$safe_wwid*");
+        alarm(0);
+    };
+    alarm(0);
 
     if (@devices && -b $devices[0]) {
         # Untaint the device path for taint mode compatibility
@@ -348,8 +470,15 @@ sub get_scsi_devices_by_serial {
 
     my @devices;
 
-    # Search in /dev/disk/by-id
-    my @by_id = glob("/dev/disk/by-id/scsi-*");
+    # Search in /dev/disk/by-id (with timeout to prevent hang)
+    my @by_id;
+    eval {
+        local $SIG{ALRM} = sub { die "timeout\n" };
+        alarm(5);
+        @by_id = glob("/dev/disk/by-id/scsi-*");
+        alarm(0);
+    };
+    alarm(0);
 
     for my $link (@by_id) {
         # Check if the symlink name contains the serial
@@ -375,11 +504,7 @@ sub get_scsi_devices_by_serial {
 
         my $vpd_file = "/sys/block/$block/device/vpd_pg80";
         if (-r $vpd_file) {
-            open(my $fh, '<', $vpd_file) or next;
-            local $/;
-            my $vpd_data = <$fh>;
-            close($fh);
-
+            my $vpd_data = sysfs_read_with_timeout($vpd_file, 5);
             if ($vpd_data && $vpd_data =~ /\Q$serial\E/i) {
                 push @devices, "/dev/$block" unless grep { $_ eq "/dev/$block" } @devices;
             }
@@ -405,13 +530,14 @@ sub remove_scsi_device {
     my $delete_file = BLOCK_DEVICE_PATH . "/$dev_name/device/delete";
 
     if (-w $delete_file) {
-        # Sync and flush first
-        system('sync');
-        system('blockdev', '--flushbufs', $safe_device) if $safe_device && -b $safe_device;
+        # Sync and flush first (with timeout to prevent hang on unresponsive storage)
+        eval { _run_cmd(['/bin/sync'], timeout => 10, allow_nonzero => 1, ignore_errors => 1); };
+        if ($safe_device && -b $safe_device) {
+            eval { _run_cmd(['/sbin/blockdev', '--flushbufs', $safe_device], timeout => 10, allow_nonzero => 1, ignore_errors => 1); };
+        }
 
-        open(my $fh, '>', $delete_file) or croak "Cannot write to $delete_file: $!";
-        print $fh "1\n";
-        close($fh);
+        sysfs_write_with_timeout($delete_file, "1\n", 10)
+            or croak "Failed to write to $delete_file (timed out or error)";
 
         return 1;
     }
@@ -431,9 +557,8 @@ sub rescan_scsi_device {
     my $rescan_file = BLOCK_DEVICE_PATH . "/$dev_name/device/rescan";
 
     if (-w $rescan_file) {
-        open(my $fh, '>', $rescan_file) or croak "Cannot write to $rescan_file: $!";
-        print $fh "1\n";
-        close($fh);
+        sysfs_write_with_timeout($rescan_file, "1\n", 10)
+            or croak "Failed to write to $rescan_file (timed out or error)";
         return 1;
     }
 
@@ -480,13 +605,13 @@ sub cleanup_lun_devices {
         # Get slave devices first (before we remove the multipath)
         my $slaves = get_multipath_slaves($mpath);
 
-        # Step 1: Sync all pending writes to this device
-        system('sync');
+        # Step 1: Sync all pending writes to this device (with timeout)
+        eval { _run_cmd(['/bin/sync'], timeout => 10, allow_nonzero => 1, ignore_errors => 1); };
 
-        # Step 2: Flush device buffers
+        # Step 2: Flush device buffers (with timeout)
         my $safe_mpath = _untaint_device_path($mpath);
         if ($safe_mpath) {
-            system('blockdev', '--flushbufs', $safe_mpath);
+            eval { _run_cmd(['/sbin/blockdev', '--flushbufs', $safe_mpath], timeout => 10, allow_nonzero => 1, ignore_errors => 1); };
         }
 
         # Step 3: Remove the multipath device using multipathd
@@ -524,15 +649,15 @@ sub is_device_in_use {
     my $dev_name = _untaint_device_name(basename($device));
     return 0 unless $dev_name;
 
-    # Check 1: Is device mounted?
-    if (open(my $fh, '<', '/proc/mounts')) {
-        while (<$fh>) {
-            if (/^\Q$device\E\s/ || /^\/dev\/\Q$dev_name\E\s/) {
-                close($fh);
+    # Check 1: Is device mounted? (use sysfs_read_with_timeout to prevent hang
+    # if a mounted filesystem on another device is unresponsive)
+    my $mounts = sysfs_read_with_timeout('/proc/mounts', 5);
+    if ($mounts) {
+        for my $line (split /\n/, $mounts) {
+            if ($line =~ /^\Q$device\E\s/ || $line =~ /^\/dev\/\Q$dev_name\E\s/) {
                 return 1;  # Device is mounted
             }
         }
-        close($fh);
     }
 
     # Check 2: Does device have holders (e.g., LVM, dm-crypt)?
@@ -546,11 +671,14 @@ sub is_device_in_use {
         }
     }
 
-    # Check 3: Is device open by any process? (using fuser)
+    # Check 3: Is device open by any process? (using fuser with timeout)
     my $safe_device = _untaint_device_path($device);
     return 0 unless $safe_device;
-    my $fuser_check = system('fuser', '-s', $safe_device);
-    if ($fuser_check == 0) {
+    my (undef, undef, $fuser_exit) = eval {
+        _run_cmd(['/bin/fuser', '-s', $safe_device],
+            timeout => 10, allow_nonzero => 1, ignore_errors => 1);
+    };
+    if (!$@ && defined $fuser_exit && $fuser_exit == 0) {
         return 1;  # Device is open by a process
     }
 

@@ -108,7 +108,7 @@ systemctl enable --now multipathd
 
 # 步驟 4：安裝外掛程式套件
 # （自動配置 multipath 並重新啟動 PVE 服務）
-dpkg -i jt-pve-storage-netapp_0.1.9-1_all.deb
+dpkg -i jt-pve-storage-netapp_0.2.1-1_all.deb
 ```
 
 > **注意：** 外掛程式會自動：
@@ -153,7 +153,7 @@ apt install -y open-iscsi multipath-tools sg3-utils psmisc \
 systemctl enable --now iscsid multipathd
 
 # 安裝外掛程式（自動配置 multipath 並重新啟動 PVE 服務）
-dpkg -i jt-pve-storage-netapp_0.1.9-1_all.deb
+dpkg -i jt-pve-storage-netapp_0.2.1-1_all.deb
 ```
 
 **叢集安裝順序：**
@@ -174,9 +174,11 @@ pvesm add netappontap netapp1 \
     --ontap-aggregate aggr1 \
     --ontap-username pveadmin \
     --ontap-password 'YourSecurePassword' \
-    --content images \
+    --content images,rootdir \
     --shared 1
 ```
+
+> **注意：** 使用 `--content images` 僅支援 VM 磁碟，或使用 `--content images,rootdir` 同時支援 LXC 容器。
 
 **FC (Fibre Channel) 範例：**
 ```bash
@@ -223,8 +225,10 @@ pvesm status
 | `ontap-ssl-verify` | `1` | 驗證 SSL 憑證（0=停用，用於自簽憑證）|
 | `ontap-thin` | `1` | 使用精簡佈建（0=完整佈建）|
 | `ontap-igroup-mode` | `per-node` | igroup 模式：`per-node` 或 `shared` |
-| `ontap-cluster-name` | `pve` | 用於 igroup 命名的叢集名稱 |
+| `ontap-cluster-name` | `pve` | 用於 igroup 命名的叢集名稱（見下方說明）|
 | `ontap-device-timeout` | `60` | 裝置探索逾時秒數 |
+
+> **同一 SVM 多 storage 設定：** 若在同一個 SVM 上設定多個 storage，請為每個 storage 使用不同的 `ontap-cluster-name`，以避免 igroup 衝突。例如 `--ontap-cluster-name pve-prod` 和 `--ontap-cluster-name pve-dev`。
 
 ### storage.cfg 範例（iSCSI）
 
@@ -559,6 +563,10 @@ PVE::Storage::Plugin (Proxmox VE 基礎類別)
 | 從快照完整複製 | 支援 | 透過暫時 FlexClone + qemu-img 複製 |
 | 備份 (vzdump) | 支援 | 透過快照 |
 | RAM 快照 (vmstate) | 支援 | VM 狀態儲存至專用 LUN（v0.1.7+）|
+| LXC 容器 (rootdir) | 支援 | 容器 rootfs 儲存於 NetApp LUN（v0.2.0+）|
+| EFI 磁碟 | 支援 | OVMF UEFI 變數儲存於 NetApp LUN（v0.2.0+）|
+| Cloud-init 磁碟 | 支援 | Cloud-init ISO 儲存於 NetApp LUN（v0.2.0+）|
+| TPM 狀態 | 支援 | TPM 2.0 狀態儲存於 NetApp LUN（v0.2.0+）|
 
 ## 測試狀態
 
@@ -780,7 +788,7 @@ storage: No such storage
 **解決方案：**
 ```bash
 # 在受影響的節點上安裝
-dpkg -i jt-pve-storage-netapp_0.1.9-1_all.deb
+dpkg -i jt-pve-storage-netapp_0.2.1-1_all.deb
 apt install -f
 systemctl restart pvedaemon pveproxy
 ```

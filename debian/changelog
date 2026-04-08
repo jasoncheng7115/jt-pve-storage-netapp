@@ -1,3 +1,104 @@
+jt-pve-storage-netapp (0.2.1-1) stable; urgency=high
+
+  * Production Hardening Release - Edge Case & Race Condition Fixes
+  * Requirements: Proxmox VE 9.1 or later
+  * Race Condition Fixes:
+    - Fixed alloc_image() disk ID TOCTOU race: if volume_create fails due to
+      concurrent allocation, retries with next disk ID instead of dying.
+    - Fixed igroup creation race when multiple cluster nodes activate storage
+      simultaneously. igroup_get_or_create() now handles 409 Conflict gracefully.
+    - Fixed _ensure_igroup() to handle concurrent initiator add operations
+      from multiple nodes without failing.
+  * Cleanup & Reliability:
+    - alloc_image() cleanup now calls lun_unmap_all() before lun_delete() on
+      failure, preventing orphaned igroup mappings on ONTAP.
+    - Improved error message for disk ID exhaustion to suggest checking for
+      manually created volumes or orphaned volumes.
+  * Thin Provisioning Safety:
+    - Added aggregate space warning when usage exceeds 85% during alloc_image()
+      with thin provisioning enabled, alerting operators before overcommit.
+  * Performance:
+    - list_images() template detection now has 10-second deadline to prevent
+      cascading API timeouts when many volumes exist on ONTAP.
+    - Non-disk volumes (state, cloudinit) are skipped during template detection.
+  * Migration Safety:
+    - deactivate_volume() now skips sync/flush if device is still in use by
+      another process, preventing I/O deadlock during live migration.
+    - deactivate_volume() fails gracefully if API is unreachable.
+  * iSCSI Session Recovery:
+    - login_target() now sets node.session.timeo.replacement_timeout=120 for
+      automatic session recovery after ONTAP failover/takeover events.
+  * API Resilience:
+    - API client now retries on HTTP 401 with fresh authentication, handling
+      session expiry during long-running operations.
+  * Multipath Safety (prevents node hang on stale devices):
+    - Changed multipath.conf template: replaced queue_if_no_path (infinite queue)
+      with no_path_retry=30 (bounded 150-second retry). Prevents PVE node from
+      hanging indefinitely when LUN paths fail or stale devices remain.
+    - Changed dev_loss_tmo from infinity to 60 seconds. SCSI devices for failed
+      LUNs are now removed after 60s instead of kept forever.
+    - Added fast_io_fail_tmo=5 for faster path failure detection.
+    - NOTE: Existing installations with manual multipath.conf are not affected
+      (postinst skips if NetApp config already exists). Manual update recommended.
+  * Stale Device Prevention:
+    - Fixed free_image() operation order: now unmaps LUN from igroups BEFORE
+      cleaning local SCSI devices, preventing iSCSI session rescans from
+      re-discovering removed LUNs as ghost devices that generate I/O errors.
+    - Added iSCSI session rescan after device cleanup to clear stale entries.
+  * activate_storage() Optimization:
+    - Skip iSCSI discovery for portals that already have active sessions,
+      preventing 30-second discovery timeout during repeated storage activation
+      (e.g., linked clone, VM operations that re-activate storage).
+
+ -- Jason Cheng (Jason Tools) <jason@jason.tools>  Tue, 08 Apr 2026 01:00:00 +0800
+
+jt-pve-storage-netapp (0.2.0-1) stable; urgency=high
+
+  * Multipath & Migration Fix Release - Anti-Hang Protection
+  * Requirements: Proxmox VE 9.1 or later
+  * Critical Bug Fixes:
+    - Fixed iSCSI multipath only establishing 1 session instead of all portals.
+      login_target() checked is_target_logged_in() by IQN only; all ONTAP LIFs
+      share the same IQN, so after the first portal login all others were skipped.
+      Added is_portal_logged_in() to check portal+target pair individually.
+    - Fixed alloc_image() only mapping LUN to current node's igroup in per-node
+      mode. Disk migration (move_disk) would hang because the destination node
+      could not see the new LUN. Now maps to all node igroups, consistent with
+      clone_image() behavior.
+  * Anti-Hang Protection (prevents unkillable PVE task workers):
+    - Added sysfs_write_with_timeout(): all writes to /sys/ files (SCSI host
+      scan, device delete, device rescan, FC issue_lip) now execute in a forked
+      child process with 10-second timeout. If the child enters kernel D-state
+      due to unresponsive storage, the parent continues instead of hanging.
+    - Added sysfs_read_with_timeout(): all reads from /sys/ and /proc/ files
+      (device WWID, VPD pages, mount table, FC port attributes) now execute in
+      a forked child with 5-second timeout via alarm/pipe.
+    - Replaced all bare system() calls with timeout-protected alternatives:
+      system('sync') and system('blockdev --flushbufs') now use run_command()
+      or _run_cmd() with 10-second timeout in Multipath.pm and Plugin.
+    - system('systemctl restart iscsid') now uses _run_cmd() with 30s timeout.
+    - system('fuser') in is_device_in_use() now uses _run_cmd() with 10s timeout.
+    - glob() calls on /dev/disk/by-id/ now wrapped with alarm(5) timeout.
+    - flock(LOCK_EX) on temp clone state file changed to non-blocking LOCK_NB
+      with 10-second retry loop to prevent indefinite lock wait.
+    - FC.pm _read_file() now uses sysfs_read_with_timeout() for all sysfs reads.
+  * Migration Reliability Fixes:
+    - Fixed activate_volume() only mapping LUN to current node's igroup. Now
+      maps to all node igroups in per-node mode, consistent with alloc_image()
+      and clone_image(), preventing device visibility issues during migration.
+    - Fixed path() returning synthetic non-existent device path after a single
+      failed rescan. Now retries with a proper wait loop (up to ontap-device-timeout,
+      default 30s) before falling back to synthetic path, preventing qemu-img
+      from failing on newly allocated LUNs that haven't appeared yet.
+  * ONTAP Failure Resilience:
+    - Reduced API timeout from 30s to 15s and retries from 3 to 2, cutting
+      worst-case API call blocking from ~102s to ~34s per call.
+    - status() now fails fast if API is unreachable instead of blocking PVE.
+    - Temp FlexClone cleanup in status() moved to background fork to prevent
+      blocking PVE storage status polling.
+
+ -- Jason Cheng (Jason Tools) <jason@jason.tools>  Mon, 07 Apr 2026 20:00:00 +0800
+
 jt-pve-storage-netapp (0.1.9-1) stable; urgency=medium
 
   * Safety Audit Release - Security & Reliability Fixes

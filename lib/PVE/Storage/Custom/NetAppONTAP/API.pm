@@ -12,8 +12,8 @@ use Carp qw(croak);
 
 # Constants
 use constant {
-    DEFAULT_TIMEOUT     => 30,
-    DEFAULT_RETRY_COUNT => 3,
+    DEFAULT_TIMEOUT     => 15,
+    DEFAULT_RETRY_COUNT => 2,
     DEFAULT_RETRY_DELAY => 2,
     API_VERSION         => '9.8',  # Minimum ONTAP REST API version
 };
@@ -111,6 +111,13 @@ sub _request {
                 $last_error = "ONTAP API Error: $err->{error}{message} (code: $err->{error}{code})";
             }
         };
+
+        # On 401, reinitialize auth and retry (session/token may have expired)
+        if ($code == 401 && $attempt < $retry_count) {
+            warn "ONTAP API returned 401, reinitializing auth (attempt $attempt/$retry_count)\n";
+            $self->_init_ua();
+            next;
+        }
 
         # Don't retry on client errors (4xx) except 429 (rate limit)
         last if $code >= 400 && $code < 500 && $code != 429;
@@ -715,14 +722,20 @@ sub igroup_get {
     return undef;
 }
 
-# Get or create igroup
+# Get or create igroup (handles concurrent creation race from multiple nodes)
 sub igroup_get_or_create {
     my ($self, %opts) = @_;
 
     my $igroup = $self->igroup_get($opts{name});
     return $igroup if $igroup;
 
-    $self->igroup_create(%opts);
+    eval { $self->igroup_create(%opts); };
+    if ($@) {
+        # Another node may have created it simultaneously (409 Conflict)
+        my $retry = $self->igroup_get($opts{name});
+        return $retry if $retry;
+        die "Failed to create igroup '$opts{name}': $@";
+    }
     return $self->igroup_get($opts{name});
 }
 

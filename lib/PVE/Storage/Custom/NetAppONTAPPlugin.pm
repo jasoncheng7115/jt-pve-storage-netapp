@@ -46,6 +46,7 @@ use PVE::Storage::Custom::NetAppONTAP::Multipath qw(
     cleanup_lun_devices
     is_device_in_use
     sysfs_read_with_timeout
+    list_netapp_multipath_devices
 );
 use PVE::Storage::Custom::NetAppONTAP::FC qw(
     get_fc_wwpns
@@ -610,13 +611,17 @@ sub _wwid_lock_file {
 }
 
 sub _ensure_wwid_state_dir {
+    # /var/lib persists across reboots
     if (! -d $WWID_STATE_DIR) {
-        eval { mkdir $WWID_STATE_DIR, 0700; };
-        warn "Cannot create $WWID_STATE_DIR: $@" if $@ && ! -d $WWID_STATE_DIR;
+        unless (mkdir $WWID_STATE_DIR, 0700) {
+            warn "Cannot create $WWID_STATE_DIR: $!\n" unless -d $WWID_STATE_DIR;
+        }
     }
+    # /var/run is tmpfs, gets wiped on reboot, so always check/recreate
     if (! -d $WWID_LOCK_DIR) {
-        eval { mkdir $WWID_LOCK_DIR, 0700; };
-        warn "Cannot create $WWID_LOCK_DIR: $@" if $@ && ! -d $WWID_LOCK_DIR;
+        unless (mkdir $WWID_LOCK_DIR, 0700) {
+            warn "Cannot create $WWID_LOCK_DIR: $!\n" unless -d $WWID_LOCK_DIR;
+        }
     }
 }
 
@@ -701,22 +706,28 @@ sub _untrack_wwid {
 }
 
 # Find and clean up orphaned multipath devices on this node.
-# An orphan is a multipath device whose WWID:
-#   1. Is in our tracking state (we created it from this storage)
-#   2. Is no longer present on ONTAP (LUN was deleted, possibly from another node)
-# This handles the cluster-wide case: when Node A deletes a VM, Node B's stale
-# devices for the same LUN are eventually cleaned up by Node B's status() poll.
 #
-# Safety: only cleans WWIDs in our tracking file, never touches manually-managed
-# NetApp devices or devices belonging to other plugins.
+# Two-phase strategy (v0.2.3):
+#
+# Phase 1 (auto-import): Query ONTAP for current pve_* LUN WWIDs and add them
+# to the tracking file. This ensures all cluster nodes converge to the same
+# "alive set" over time, even if path() was never called on this node.
+#
+# Phase 2 (cleanup): Scan local NETAPP multipath devices. For each one:
+#   - WWID is in alive set (currently on ONTAP) → leave alone (it's valid)
+#   - WWID NOT in alive set + IS in tracking file → orphan we own, clean it
+#   - WWID NOT in alive set + NOT in tracking file → unknown (could be manual
+#     storage, customer's other NetApp, etc.) → leave alone for safety
+#
+# Safety guarantees:
+#   - Never touches devices from other SVMs / other ONTAP clusters
+#   - Never touches manually-managed devices with custom aliases
+#   - If ONTAP API is unreachable, abort entirely (no false positives)
+#   - All operations bounded by timeout (won't hang)
 sub _cleanup_orphaned_devices {
     my ($api, $storeid) = @_;
 
-    # Read tracked WWIDs (WWIDs we know about)
-    my $tracked = _read_wwid_state($storeid);
-    return unless %$tracked;
-
-    # Query ONTAP for currently existing LUNs in this storage
+    # Phase 1: Query ONTAP for currently alive pve_* LUNs in this storage
     my $san_storage = $storeid;
     $san_storage =~ s/-/_/g;
     my $luns = eval { $api->lun_list("/vol/pve_${san_storage}_*/lun0"); };
@@ -726,15 +737,21 @@ sub _cleanup_orphaned_devices {
         return;
     }
 
-    # Build set of currently-alive WWIDs
+    # Build set of currently-alive WWIDs and auto-import them into tracking
     my %alive_wwids;
     for my $lun (@$luns) {
         my $wwid = eval { $api->lun_get_wwid($lun->{name}); };
         next unless $wwid;
         $alive_wwids{lc($wwid)} = 1;
+        # Auto-import: ensure this WWID is tracked even if path() was never
+        # called on this node. _track_wwid is idempotent (no-op if already tracked).
+        eval { _track_wwid($storeid, $wwid); };
     }
 
-    # Find orphans: tracked WWIDs that are no longer on ONTAP
+    # Read tracked WWIDs AFTER auto-import
+    my $tracked = _read_wwid_state($storeid);
+
+    # Phase 2: Find orphans = tracked WWIDs that are no longer on ONTAP
     my $cleaned = 0;
     for my $wwid (keys %$tracked) {
         next if $alive_wwids{$wwid};
@@ -755,6 +772,32 @@ sub _cleanup_orphaned_devices {
 
     warn "Orphan cleanup: processed $cleaned stale WWID(s) for storage '$storeid'\n"
         if $cleaned > 0;
+
+    # Second-pass: detect UNTRACKED stale NETAPP multipath devices and warn.
+    # These could be pre-upgrade leftovers OR customer's manual storage that
+    # happens to be in failed state. We do NOT auto-clean to avoid touching
+    # customer's manual storage. Instead we list them with cleanup commands.
+    eval {
+        my $netapp_devs = list_netapp_multipath_devices();
+        my @untracked;
+        for my $dev (@$netapp_devs) {
+            my $wwid = lc($dev->{wwid});
+            next if $alive_wwids{$wwid};       # alive on ONTAP, leave alone
+            next if $tracked->{$wwid};         # already handled in first pass
+            push @untracked, $dev;
+        }
+        if (@untracked) {
+            warn "Orphan cleanup: detected " . scalar(@untracked) .
+                 " untracked NETAPP multipath device(s) that may be stale.\n";
+            warn "Plugin will NOT auto-clean these (risk of touching manually-managed storage).\n";
+            warn "If you confirm they are NOT in use, clean manually:\n";
+            for my $o (@untracked) {
+                warn "  multipathd disablequeueing map $o->{wwid}\n";
+                warn "  dmsetup message $o->{wwid} 0 fail_if_no_path\n";
+                warn "  multipath -f $o->{wwid}\n";
+            }
+        }
+    };
 }
 
 sub status {
@@ -1130,8 +1173,21 @@ sub free_image {
     die "Failed to delete volume '$ontap_volname' after $max_retries attempts: ONTAP reports stale clone metadata"
         unless $deleted;
 
-    # Untrack WWID since LUN is now deleted
-    eval { _untrack_wwid($storeid, $wwid); } if $wwid;
+    # Untrack WWID ONLY if local cleanup actually succeeded.
+    # If multipath device still exists locally (cleanup_lun_devices failed
+    # earlier), KEEP the WWID tracked. The next status() poll will detect
+    # it as orphan (in tracking but not in ONTAP alive set) and retry cleanup.
+    # This prevents the case where: local cleanup fails -> LUN deleted on
+    # ONTAP -> WWID untracked -> stale device permanently orphaned.
+    if ($wwid) {
+        my $still_exists = get_multipath_device($wwid);
+        if ($still_exists) {
+            warn "free_image: local multipath device for WWID $wwid still exists after cleanup. " .
+                 "Keeping WWID tracked so orphan cleanup can retry.\n";
+        } else {
+            eval { _untrack_wwid($storeid, $wwid); };
+        }
+    }
 
     return undef;
 }

@@ -87,7 +87,7 @@ Plugin 安裝時會偵測這些設定並顯示醒目警告。詳見 [docs/CONFIG
 
 ### 規則 4：v0.2.2 之後會自動清理
 
-升級到 v0.2.2 之後，**不需要**再手動清理 stale 裝置。Plugin 會在背景的儲存狀態輪詢時自動偵測並清除它自己建立的孤兒裝置。它只會處理自己建立過的 WWID，**永遠不會影響其他儲存**。
+升級到 v0.2.2 之後，**不需要**再手動清理 stale 裝置。Plugin 會在背景的儲存狀態輪詢時自動偵測並清除它自己建立的殘留裝置。它只會處理自己建立過的 WWID，**永遠不會影響其他儲存**。
 
 ## 功能特色
 
@@ -178,7 +178,7 @@ systemctl enable --now multipathd
 
 # 步驟 4：安裝外掛程式套件
 # （自動配置 multipath 並重新啟動 PVE 服務）
-dpkg -i jt-pve-storage-netapp_0.2.2-1_all.deb
+dpkg -i jt-pve-storage-netapp_0.2.3-1_all.deb
 ```
 
 > **注意：** 外掛程式會自動：
@@ -223,7 +223,7 @@ apt install -y open-iscsi multipath-tools sg3-utils psmisc \
 systemctl enable --now iscsid multipathd
 
 # 安裝外掛程式（自動配置 multipath 並重新啟動 PVE 服務）
-dpkg -i jt-pve-storage-netapp_0.2.2-1_all.deb
+dpkg -i jt-pve-storage-netapp_0.2.3-1_all.deb
 ```
 
 **叢集安裝順序：**
@@ -260,7 +260,7 @@ done
 
 ```bash
 # 升級 plugin 套件
-dpkg -i jt-pve-storage-netapp_0.2.2-1_all.deb
+dpkg -i jt-pve-storage-netapp_0.2.3-1_all.deb
 ```
 
 postinst 會自動：
@@ -302,8 +302,8 @@ pvesm status | grep netapp
 # 確認 multipath 裝置健康（沒有 "failed faulty" 路徑）
 multipath -ll
 
-# 確認孤兒清理有在執行（幾分鐘後查 journal）
-journalctl -u pvedaemon --since "5 minutes ago" | grep -i "orphan" || echo "沒有孤兒（正常）"
+# 確認殘留清理有在執行（幾分鐘後查 journal）
+journalctl -u pvedaemon --since "5 minutes ago" | grep -i "orphan" || echo "沒有殘留（正常）"
 ```
 
 ### 步驟 6：在下一個節點重複
@@ -327,7 +327,7 @@ systemctl restart multipathd
 
 - **絕對不要**在升級前、升級中、升級後執行 `multipath -F`（大寫 F）-- 會清除所有未使用的 maps，包括手動管理的儲存。請參閱上方[Multipath 安全規則](#重要multipath-安全規則)。
 - 使用 `systemctl restart multipathd`，**不要用 reload**。reload 不會清除 stale maps。
-- v0.2.2+ 的 plugin 會**自動處理孤兒清理** -- 升級後**不需要**手動清除 stale 裝置。
+- v0.2.2+ 的 plugin 會**自動處理殘留清理** -- 升級後**不需要**手動清除 stale 裝置。
 
 ## 快速開始
 
@@ -961,7 +961,7 @@ storage: No such storage
 **解決方案：**
 ```bash
 # 在受影響的節點上安裝
-dpkg -i jt-pve-storage-netapp_0.2.2-1_all.deb
+dpkg -i jt-pve-storage-netapp_0.2.3-1_all.deb
 apt install -f
 systemctl restart pvedaemon pveproxy
 ```

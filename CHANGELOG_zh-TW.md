@@ -2,18 +2,44 @@
 
 NetApp ONTAP Storage Plugin for Proxmox VE 的所有重要變更都記錄在此。
 
+## [0.2.3] - 2026-04-09
+
+### 升級前殘留裝置處理 Release (重大修復)
+
+**生產環境升級情境的重大修復：**
+- 修復殘留清理機制無法處理升級前殘留的 stale multipath 裝置。v0.2.2 只清理升級後 path() 過的 WWID，從舊版本（v0.1.x）留下的 stale 裝置從來沒被追蹤過，因此無法自動清理。v0.2.3 在每次 status() 輪詢時自動將 ONTAP 上現有的 pve_* LUN WWID 匯入追蹤檔，確保所有叢集節點最終都會收斂到一致的視圖，無論本地節點上次呼叫 path() 是何時。
+
+**Multipath 卡住預防（重大）：**
+- 修復 cleanup_lun_devices() 在 multipath 裝置設定了 queue_if_no_path 時會卡住的問題。現在會在任何 sync/flush 操作前先透過 `multipathd disablequeueing map` 與 `dmsetup message ... fail_if_no_path` 停用排隊，讓 I/O 快速失敗而非永久排隊。
+- 為所有 multipath_flush() 與 multipath_reload() 操作加上 10 秒 timeout。
+- 若 `multipath -f` timeout，會 fallback 到 `dmsetup remove --force --retry`，繞過會在 dead device 上卡住的 multipath flush 邏輯。
+- 為 `multipathd remove map` 呼叫加上 10 秒 timeout。
+
+**postinst 殘留裝置偵測：**
+- postinst 現在會掃描所有路徑都失敗的 NETAPP multipath 裝置，並顯示醒目警告，列出 WWID 與精確的清理指令。為了不誤碰手動管理的儲存，**不會自動清理**。從 v0.1.x 或 v0.2.0/1 升級時特別重要，因為這些版本可能留下了沒追蹤的殘留裝置。
+
+**慢速操作支援：**
+- `volume_delete()` 現在使用延長的 60 秒 API timeout（之前是 15 秒）。FlexClone 刪除可能在 ONTAP 上需要 30 秒以上，特別是在清理 snapshot 相依性時。之前 15 秒的預設值會產生「command timed out」警告訊息，即使操作最終會透過 retry 迴圈成功完成。
+- `_request()` 現在支援 per-call timeout override。
+
+**背景：**
+客戶環境在磁碟遷移時遇到節點掛起，因為 `vgs` 掃描到一個設定了 `queue_if_no_path` 的 stale multipath 裝置。這個 stale 裝置是從舊版 plugin 留下的，從來沒被 v0.2.2 的殘留清理機制追蹤過。結果：vgs 進入 D state，pvedaemon 等它而卡住，連 `systemctl restart` 也卡住。最終只能重開機。v0.2.3 透過以下方式防止這個問題：
+1. 自動匯入存活的 WWID，讓叢集節點都知道所有 LUN
+2. 在任何清理操作前停用 queue_if_no_path
+3. 安裝時警告升級前已存在的 stale 裝置
+
 ## [0.2.2] - 2026-04-08
 
-### 叢集孤兒裝置清理 Release
+### 叢集殘留裝置清理 Release
 
 **重大叢集修復：**
-- 修復在另一個節點刪除 VM 後，叢集節點上殘留 stale multipath 裝置的問題。之前當 Node A 移除 VM 時，Node B 上對應該 LUN 的 SCSI/multipath 裝置會變成孤兒並無限期保留（顯示所有路徑為 failed 狀態）。如果 multipath.conf 設定為**有問題的** `no_path_retry queue`（請務必改為 `no_path_retry 30`，見 [README_zh-TW.md](README_zh-TW.md#規則-3檢查你的-etcmultipathconf-設定)），任何程序觸碰到孤兒裝置都可能讓整個節點掛起。v0.2.2 自動清理孤兒，無論 `no_path_retry` 設定為何都更安全。
+- 修復在另一個節點刪除 VM 後，叢集節點上殘留 stale multipath 裝置的問題。之前當 Node A 移除 VM 時，Node B 上對應該 LUN 的 SCSI/multipath 裝置會變成殘留並無限期保留（顯示所有路徑為 failed 狀態）。如果 multipath.conf 設定為**有問題的** `no_path_retry queue`（請務必改為 `no_path_retry 30`，見 [README_zh-TW.md](README_zh-TW.md#規則-3檢查你的-etcmultipathconf-設定)），任何程序觸碰到殘留裝置都可能讓整個節點掛起。v0.2.2 自動清理殘留，無論 `no_path_retry` 設定為何都更安全。
 
-**新功能：自動孤兒裝置清理**
+**新功能：自動殘留裝置清理**
 - 新增每儲存的 WWID 追蹤狀態檔，位於 `/var/lib/pve-storage-netapp/<storeid>-wwids.json`。每個節點記錄它看過的此儲存的 WWID。
 - `path()` 在成功解析到真實裝置後追蹤 WWID。
 - `free_image()` 在成功刪除 LUN 後取消追蹤 WWID。
-- `status()` 在每次輪詢時於背景 fork 執行孤兒清理。比對追蹤的 WWID 與 ONTAP 上目前的 LUN 列表，清理 ONTAP 上已不存在的追蹤 WWID 對應的本機裝置。
+- `status()` 在每次輪詢時於背景 fork 執行殘留清理。比對追蹤的 WWID 與 ONTAP 上目前的 LUN 列表，清理 ONTAP 上已不存在的追蹤 WWID 對應的本機裝置。
 - **安全性：** 只有追蹤檔中的 WWID 才會被清理，因此手動管理的 NetApp 裝置或其他 plugin 的裝置永遠不會被影響。
 - 若清理過程中 ONTAP API 無法連線，操作會中止以避免誤刪有效裝置。
 

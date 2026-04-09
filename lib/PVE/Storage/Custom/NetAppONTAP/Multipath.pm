@@ -30,6 +30,7 @@ our @EXPORT_OK = qw(
     is_device_in_use
     sysfs_write_with_timeout
     sysfs_read_with_timeout
+    list_netapp_multipath_devices
 );
 
 # Constants
@@ -283,18 +284,49 @@ sub rescan_scsi_hosts {
 sub multipath_reload {
     my (%opts) = @_;
 
-    _run_cmd([MULTIPATHD, 'reconfigure'], allow_nonzero => 1, timeout => $opts{timeout} // 30);
+    _run_cmd([MULTIPATHD, 'reconfigure'],
+        allow_nonzero => 1,
+        ignore_errors => 1,
+        timeout => $opts{timeout} // 15);
     return 1;
 }
 
-# Flush unused multipath maps
+# Flush a specific multipath map (or all unused if no device given).
+# CRITICAL: multipath -f can hang indefinitely on a device with queue_if_no_path
+# if all paths are failed and there's pending queued I/O. We use a tight timeout
+# and fall back to dmsetup remove --force which bypasses the multipath flush logic.
 sub multipath_flush {
     my ($device, %opts) = @_;
+    my $timeout = $opts{timeout} // 10;
 
     if ($device) {
-        _run_cmd([MULTIPATH, '-f', $device], allow_nonzero => 1);
+        # Try multipath -f with timeout
+        my (undef, undef, $exit) = eval {
+            _run_cmd([MULTIPATH, '-f', $device],
+                allow_nonzero => 1, ignore_errors => 1, timeout => $timeout);
+        };
+        my $err = $@;
+
+        # If multipath -f hung or failed, fall back to dmsetup remove --force
+        # which doesn't wait for queued I/O.
+        if ($err || (defined $exit && $exit != 0)) {
+            warn "multipath -f $device failed/timed out, trying dmsetup remove --force\n";
+            my $name = basename($device);
+            my $safe_name = _untaint_device_name($name);
+            if ($safe_name) {
+                eval {
+                    _run_cmd(['/sbin/dmsetup', 'remove', '--force', '--retry', $safe_name],
+                        allow_nonzero => 1, ignore_errors => 1, timeout => 10);
+                };
+                warn "dmsetup remove also failed for $safe_name: $@" if $@;
+            }
+        }
     } else {
-        _run_cmd([MULTIPATH, '-F'], allow_nonzero => 1);
+        # WARNING: multipath -F (capital) flushes ALL unused maps system-wide.
+        # This can affect other storage. Use with extreme caution.
+        # We DO NOT recommend calling this without a device argument.
+        _run_cmd([MULTIPATH, '-F'],
+            allow_nonzero => 1, ignore_errors => 1, timeout => $timeout);
     }
 
     return 1;
@@ -327,6 +359,30 @@ sub multipath_remove {
     }
 
     return 1;
+}
+
+# List all NETAPP-vendor multipath devices on this host.
+# Returns arrayref of { name, wwid, vps } hashrefs.
+# Used for orphan detection: caller compares against ONTAP LUN list.
+sub list_netapp_multipath_devices {
+    my ($stdout) = _run_cmd(
+        [MULTIPATHD, 'show', 'maps', 'raw', 'format', '%n %w %s'],
+        allow_nonzero => 1,
+        ignore_errors => 1,
+        timeout => 10,
+    );
+    return [] unless defined $stdout;
+
+    my @devices;
+    for my $line (split /\n/, $stdout) {
+        $line =~ s/^\s+|\s+$//g;
+        next unless $line;
+        my ($name, $wwid, $vps) = split /\s+/, $line, 3;
+        next unless $name && $wwid && $vps;
+        next unless $vps =~ /NETAPP/i;
+        push @devices, { name => $name, wwid => $wwid, vps => $vps };
+    }
+    return \@devices;
 }
 
 # Get multipath device name by WWID
@@ -604,22 +660,42 @@ sub cleanup_lun_devices {
     if ($mpath && -b $mpath) {
         # Get slave devices first (before we remove the multipath)
         my $slaves = get_multipath_slaves($mpath);
+        my $mpath_name = basename($mpath);
+        my $safe_name = _untaint_device_name($mpath_name);
+        my $safe_mpath = _untaint_device_path($mpath);
+
+        # CRITICAL: Before any flush operation, disable queue_if_no_path on this
+        # specific device. Otherwise sync/blockdev/multipath -f will hang forever
+        # if all paths are failed and the device has queue_if_no_path enabled.
+        if ($safe_name) {
+            eval {
+                _run_cmd([MULTIPATHD, 'disablequeueing', 'map', $safe_name],
+                    allow_nonzero => 1, ignore_errors => 1, timeout => 5);
+            };
+            # Also use dmsetup to fail any queued I/O immediately
+            eval {
+                _run_cmd(['/sbin/dmsetup', 'message', $safe_name, '0', 'fail_if_no_path'],
+                    allow_nonzero => 1, ignore_errors => 1, timeout => 5);
+            };
+        }
 
         # Step 1: Sync all pending writes to this device (with timeout)
+        # Now safe because queue_if_no_path is disabled - sync will fail fast
+        # if paths are dead instead of hanging.
         eval { _run_cmd(['/bin/sync'], timeout => 10, allow_nonzero => 1, ignore_errors => 1); };
 
         # Step 2: Flush device buffers (with timeout)
-        my $safe_mpath = _untaint_device_path($mpath);
         if ($safe_mpath) {
-            eval { _run_cmd(['/sbin/blockdev', '--flushbufs', $safe_mpath], timeout => 10, allow_nonzero => 1, ignore_errors => 1); };
+            eval { _run_cmd(['/sbin/blockdev', '--flushbufs', $safe_mpath],
+                timeout => 10, allow_nonzero => 1, ignore_errors => 1); };
         }
 
-        # Step 3: Remove the multipath device using multipathd
-        # Use multipathd's remove map command for cleaner removal
-        my $mpath_name = basename($mpath);
-        my $safe_name = _untaint_device_name($mpath_name);
+        # Step 3: Remove the multipath device using multipathd (with timeout)
         if ($safe_name) {
-            _run_cmd([MULTIPATHD, 'remove', 'map', $safe_name], allow_nonzero => 1, ignore_errors => 1);
+            eval {
+                _run_cmd([MULTIPATHD, 'remove', 'map', $safe_name],
+                    allow_nonzero => 1, ignore_errors => 1, timeout => 10);
+            };
         }
 
         # Step 4: Also try multipath -f as fallback

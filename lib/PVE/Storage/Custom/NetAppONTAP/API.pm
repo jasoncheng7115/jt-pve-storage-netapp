@@ -79,11 +79,19 @@ sub _build_url {
 
 # Execute API request with retry logic
 sub _request {
-    my ($self, $method, $endpoint, $data) = @_;
+    my ($self, $method, $endpoint, $data, %opts) = @_;
 
     my $url = $self->_build_url($endpoint);
     my $retry_count = $self->{retry_count};
     my $last_error;
+
+    # Allow per-request timeout override (e.g. for slow operations like
+    # FlexClone delete which can take 30+ seconds on ONTAP). The original
+    # UA timeout is restored at the end.
+    my $orig_timeout = $self->{_ua}->timeout();
+    if ($opts{timeout}) {
+        $self->{_ua}->timeout($opts{timeout});
+    }
 
     for my $attempt (1 .. $retry_count) {
         my $req = HTTP::Request->new($method => $url);
@@ -95,6 +103,8 @@ sub _request {
         my $resp = $self->{_ua}->request($req);
 
         if ($resp->is_success) {
+            # Restore original timeout before returning
+            $self->{_ua}->timeout($orig_timeout) if $opts{timeout};
             my $content = $resp->decoded_content;
             return {} if !$content || $content eq '';
             return decode_json($content);
@@ -116,6 +126,8 @@ sub _request {
         if ($code == 401 && $attempt < $retry_count) {
             warn "ONTAP API returned 401, reinitializing auth (attempt $attempt/$retry_count)\n";
             $self->_init_ua();
+            # Re-apply timeout override after _init_ua resets the UA
+            $self->{_ua}->timeout($opts{timeout}) if $opts{timeout};
             next;
         }
 
@@ -127,6 +139,9 @@ sub _request {
             sleep($self->{retry_delay} * $attempt);
         }
     }
+
+    # Restore original timeout
+    $self->{_ua}->timeout($orig_timeout);
 
     croak $last_error;
 }
@@ -200,7 +215,13 @@ sub patch {
 # DELETE request (with async job handling)
 sub delete {
     my ($self, $endpoint, %opts) = @_;
-    my $resp = $self->_request('DELETE', $endpoint);
+
+    # Pass through optional timeout override (for slow operations like
+    # FlexClone delete which can exceed default 15s API timeout).
+    my %req_opts;
+    $req_opts{timeout} = $opts{timeout} if $opts{timeout};
+
+    my $resp = $self->_request('DELETE', $endpoint, undef, %req_opts);
 
     # Handle async jobs
     if ($resp->{job} && $resp->{job}{uuid} && !$opts{no_wait}) {
@@ -299,7 +320,11 @@ sub volume_delete {
     my $uuid = $self->volume_get_uuid($name);
     croak "Volume '$name' not found" unless $uuid;
 
-    return $self->delete("/storage/volumes/$uuid");
+    # Volume delete can be slow, especially for FlexClones (ONTAP needs to
+    # do extra split/cleanup work). Use extended 60s timeout for the API
+    # call. The actual job completion is then waited via wait_for_job
+    # which has its own 120s default timeout.
+    return $self->delete("/storage/volumes/$uuid", timeout => 60);
 }
 
 # Resize a volume

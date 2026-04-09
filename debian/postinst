@@ -139,6 +139,111 @@ EOF
     return 0
 }
 
+# Scan for stale NETAPP multipath devices (all paths failed) that may have
+# been left over from previous plugin versions before automatic orphan
+# cleanup was added (v0.2.2+). These devices can cause node hangs if any
+# process touches them, especially with queue_if_no_path settings.
+#
+# We do NOT auto-clean these because we cannot reliably distinguish them
+# from manually-configured NetApp storage. Instead, we list them with the
+# exact commands the operator should run.
+detect_stale_netapp_devices() {
+    if ! command -v multipath >/dev/null 2>&1; then
+        return 0
+    fi
+
+    # Get multipath -ll output, capture WWIDs of NETAPP devices with all paths failed
+    local mpath_output
+    mpath_output=$(timeout 15 multipath -ll 2>/dev/null) || return 0
+
+    # Parse: find blocks for NETAPP vendor where all paths are "failed faulty"
+    local stale_wwids
+    stale_wwids=$(echo "$mpath_output" | awk '
+        /NETAPP/ {
+            in_netapp=1
+            # Try to extract WWID from current or previous line
+            for (i=1;i<=NF;i++) {
+                if ($i ~ /^[0-9a-f]{32,}$/) wwid=$i
+                if ($i ~ /^\([0-9a-f]{32,}\)$/) { wwid=$i; gsub(/[()]/,"",wwid) }
+            }
+            # Also check first field which is often the WWID itself
+            if ($1 ~ /^[0-9a-f]{32,}$/) wwid=$1
+            has_active=0
+            has_failed=0
+            next
+        }
+        /^[^ \t]/ && in_netapp {
+            # New top-level entry, finalize previous
+            if (has_failed && !has_active && wwid) print wwid
+            in_netapp=0
+            wwid=""
+            has_active=0
+            has_failed=0
+            # Re-check current line
+            if ($0 ~ /NETAPP/) {
+                in_netapp=1
+                for (i=1;i<=NF;i++) {
+                    if ($i ~ /^[0-9a-f]{32,}$/) wwid=$i
+                    if ($i ~ /^\([0-9a-f]{32,}\)$/) { wwid=$i; gsub(/[()]/,"",wwid) }
+                }
+                if ($1 ~ /^[0-9a-f]{32,}$/) wwid=$1
+            }
+            next
+        }
+        in_netapp && /active ready running/ { has_active=1 }
+        in_netapp && /failed faulty/ { has_failed=1 }
+        END {
+            if (has_failed && !has_active && wwid) print wwid
+        }
+    ')
+
+    if [ -z "$stale_wwids" ]; then
+        return 0
+    fi
+
+    local count
+    count=$(echo "$stale_wwids" | wc -l)
+
+    echo ""
+    echo -e "\033[1;33m!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!\033[0m"
+    echo -e "\033[1;31m  STALE NETAPP MULTIPATH DEVICES DETECTED ($count)\033[0m"
+    echo -e "\033[1;33m!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!\033[0m"
+    echo ""
+    echo "  These multipath devices have all paths in failed state. They may be"
+    echo "  leftover from a previous plugin version that did not fully clean up."
+    echo ""
+    echo "  These devices are DANGEROUS:"
+    echo "  - Any process touching them (e.g., 'vgs', 'lvs', 'lsblk') may hang"
+    echo "  - With 'queue_if_no_path' multipath setting, the entire node can hang"
+    echo "  - Migration tasks may fail with cascading errors"
+    echo ""
+    echo -e "  \033[1;31mPlease verify each WWID below is NOT in use by other storage,\033[0m"
+    echo -e "  \033[1;31mthen clean them manually with:\033[0m"
+    echo ""
+    for wwid in $stale_wwids; do
+        echo -e "    \033[1;32mmultipath -f $wwid\033[0m"
+    done
+    echo ""
+    echo "  After flushing, also remove stale SCSI device entries:"
+    echo -e "    \033[1;32mfor sd in \$(lsscsi | grep NETAPP | awk '{print \$NF}' | xargs -I{} basename {}); do\033[0m"
+    echo -e "    \033[1;32m  echo 1 > /sys/block/\$sd/device/delete\033[0m"
+    echo -e "    \033[1;32mdone\033[0m"
+    echo ""
+    echo -e "  \033[1;33mWARNING:\033[0m If 'multipath -f' hangs (queue_if_no_path), use:"
+    echo -e "    \033[1;32mmultipathd disablequeueing map <wwid>\033[0m"
+    echo -e "    \033[1;32mdmsetup message <wwid> 0 fail_if_no_path\033[0m"
+    echo -e "    \033[1;32mdmsetup remove --force --retry <wwid>\033[0m"
+    echo ""
+    echo -e "  \033[1;31mDO NOT use 'multipath -F' (capital F)\033[0m -- it will flush ALL"
+    echo "  unused maps including manually-configured storage on idle nodes."
+    echo ""
+    echo "  See: https://github.com/jasoncheng7115/jt-pve-storage-netapp"
+    echo "  Doc: docs/TROUBLESHOOTING.md -> Stale Multipath Devices"
+    echo ""
+    echo -e "\033[1;33m!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!\033[0m"
+    echo ""
+}
+
 case "$1" in
     configure)
         echo "=============================================="
@@ -149,6 +254,9 @@ case "$1" in
         # Add NetApp multipath configuration
         add_netapp_multipath_config
         echo ""
+
+        # Detect stale multipath devices left over from previous versions
+        detect_stale_netapp_devices
 
         echo "To add storage, use:"
         echo ""

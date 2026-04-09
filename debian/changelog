@@ -1,3 +1,56 @@
+jt-pve-storage-netapp (0.2.4-1) stable; urgency=high
+
+  * Cleanup Path Hardening + Concurrency + Operator UX Release
+  * Requirements: Proxmox VE 9.1 or later
+  * Concurrency Fixes:
+    - Fixed clone_image() disk-id TOCTOU race. The previous code did a
+      volume_get pre-check to find a free disk ID, then called
+      volume_clone() outside the loop. Two parallel clone_image() calls
+      on the same VM (e.g. concurrent template clones from different
+      cluster nodes, or any path that bypasses PVE's storage cfs lock)
+      would both pass the pre-check with the same disk ID, race on
+      volume_clone, and the loser would die with "already exists".
+      Now volume_clone is inside the retry loop, and "already exists"
+      errors trigger retry with the next disk ID. Same fix pattern as
+      alloc_image v0.2.1 TOCTOU fix, applied to clone_image.
+    - Fixed temporary FlexClone (snapshot read-access) TOCTOU race in
+      _ensure_temp_clone(). Temp clone names are deterministic from
+      volume+snap, so two parallel path() callers reading the same
+      snapshot would race on volume_clone. Now treats "already exists"
+      as success since the temp clone is shared and reusable.
+  * Operator UX:
+    - Added _translate_limit_error() helper that detects common ONTAP
+      resource-limit errors (FlexVol cap, LUN cap, igroup LUN-map cap,
+      aggregate full, SVM quota) and prepends operator-friendly
+      one-line summaries explaining the cause and recovery action.
+      Applied to all alloc_image and clone_image die sites. Operators
+      now see "ONTAP FlexVol limit reached on this SVM/node" instead
+      of raw "POST /api/storage/volumes failed: 917927: Maximum number
+      of volumes is reached on Vserver svm0".
+  * Bug Fixes (production audit):
+    - Fixed clone_image() cleanup path missing lun_unmap_all() before
+      volume_delete() on failure. Same bug pattern previously fixed in
+      alloc_image() in v0.2.1, but the equivalent fix was missed in
+      clone_image(). When lun_map() failed partway through (e.g. mapped
+      to some node igroups but failed on others in per-node mode),
+      cleanup attempted volume_delete on a still-mapped LUN. ONTAP
+      rejects this, leaving orphaned igroup mappings and ghost LUNs
+      visible to other cluster nodes -- which then become stale devices
+      that can hang processes touching them.
+    - Added pre-snapshot host-side buffer flush in volume_snapshot().
+      For running VMs qemu's freeze handles consistency, but for
+      offline volumes or external script callers, dirty page cache was
+      not flushed before snapshot_create, potentially producing
+      filesystem-inconsistent snapshots. Skips flush if device is in
+      use by another process (live migration safety).
+    - Removed dead code: get_multipath_wwid() in Multipath.pm. The
+      function was exported but had zero callers across the codebase
+      and used basename() without symlink resolution -- a latent
+      footgun for any future caller that passed /dev/mapper/<wwid>.
+      Safer to delete than to leave as a trap.
+
+ -- Jason Cheng <jason@jason.tools>  Thu, 09 Apr 2026 12:00:00 +0800
+
 jt-pve-storage-netapp (0.2.3-1) stable; urgency=critical
 
   * Pre-Upgrade Stale Device Handling Release
@@ -27,6 +80,40 @@ jt-pve-storage-netapp (0.2.3-1) stable; urgency=critical
       to clean them. Does NOT auto-clean to avoid touching manually-managed
       storage. Especially important when upgrading from v0.1.x or v0.2.0/1
       which left orphans without tracking them.
+  * Critical Symlink Resolution Fix (DATA LOSS PREVENTION):
+    - Added _resolve_block_device_name() helper that resolves /dev/mapper/<wwid>
+      symlinks to the underlying dm-N kernel name. Required for any /sys/block/
+      access on multipath device paths.
+    - Fixed is_device_in_use() to use the helper. Previously, calling
+      is_device_in_use('/dev/mapper/<wwid>') would do basename() to get the
+      WWID, then look in /sys/block/<wwid>/holders/ which doesn't exist.
+      Result: LVM and other holders on multipath devices were silently missed,
+      and free_image() would happily delete in-use volumes -- DATA LOSS RISK.
+      This affects any environment with LVM/dm-crypt/etc on top of NetApp
+      multipath devices (a common production setup).
+    - Fixed get_multipath_slaves() to use the helper. Previously the slave
+      list was empty for /dev/mapper/<wwid> paths, breaking volume_resize
+      and any other operation that needed to enumerate paths.
+  * Snapshot Rollback Fix:
+    - volume_snapshot_rollback() now uses per-device rescan instead of
+      host scan, and adds post-rollback kernel buffer cache invalidation.
+      Without cache invalidation, reads after rollback could return stale
+      cached data from before the rollback.
+  * Critical Resize Fix:
+    - Fixed volume_resize() using rescan_scsi_hosts() (host scan) instead of
+      per-device rescan. Host scan is for discovering NEW devices and does
+      NOT trigger re-reading the size of existing devices. Result: after
+      resizing the LUN on ONTAP, the kernel still saw the old size and
+      QEMU's block_resize would fail with "Cannot grow device files".
+      Additionally, host scan can hang on unresponsive iSCSI hosts (the
+      sysfs_write_with_timeout protected the parent but the rescan never
+      completed).
+    - volume_resize() now correctly:
+      1. Iterates over the multipath device's SCSI slaves
+      2. Calls `echo 1 > /sys/block/sdX/device/rescan` on each (with timeout)
+      3. Calls `multipathd resize map <name>` to refresh multipath size
+    - This is the correct sequence for kernel + multipath to see the new
+      LUN size after a backend resize.
   * Slow Operation Support:
     - volume_delete() now uses an extended 60s API timeout (was 15s).
       FlexClone deletion can take 30+ seconds on ONTAP, especially when

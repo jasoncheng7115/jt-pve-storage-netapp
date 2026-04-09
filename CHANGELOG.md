@@ -2,6 +2,31 @@
 
 All notable changes to the NetApp ONTAP Storage Plugin for Proxmox VE are documented here.
 
+## [0.2.4] - 2026-04-09
+
+### Cleanup Path Hardening + Concurrency + Operator UX Release
+
+**Concurrency Fixes:**
+
+- **Fixed `clone_image()` disk-id TOCTOU race (HIGH).** The previous code did a `volume_get` pre-check to find a free disk ID, then called `volume_clone()` outside the loop. Two parallel `clone_image()` calls on the same VM (e.g. concurrent template clones from different cluster nodes, or any path that bypasses PVE's storage cfs lock) would both pass the pre-check with the same disk ID, race on `volume_clone`, and the loser would die with "already exists". Now `volume_clone` is inside the retry loop, and "already exists" errors trigger retry with the next disk ID. Same fix pattern as the v0.2.1 `alloc_image` TOCTOU fix, just applied to the function it was missed in.
+
+- **Fixed temporary FlexClone (snapshot read-access) TOCTOU race in `_ensure_temp_clone()` (MEDIUM).** Temp clone names are deterministic from volume+snap, so two parallel `path()` callers reading the same snapshot (e.g. concurrent qmrestore + qm clone --full from a snapshot) would race on `volume_clone`. The loser used to die. Now treats "already exists" as success since the temp clone is shared and reusable.
+
+**Operator UX:**
+
+- **Added `_translate_limit_error()` helper that detects common ONTAP resource-limit errors and prepends operator-friendly summaries.** Patterns covered: FlexVol count cap (per-SVM and per-node), SVM/cluster LUN cap, igroup LUN-map cap (default 4096 per igroup, hit faster in per-node mode), aggregate full (covers thin overcommit case), SVM quota exceeded. Applied to all `alloc_image` and `clone_image` die sites. Operators now see `ONTAP FlexVol limit reached on this SVM/node. This plugin uses 1 FlexVol per VM disk; you may have hit the SVM volume cap (default ~12000) ...` instead of raw ONTAP REST API error codes.
+
+**Production Audit Fixes:**
+
+- **Fixed `clone_image()` cleanup missing `lun_unmap_all()` (HIGH).** Same bug pattern as the `alloc_image()` fix in v0.2.1, but the equivalent fix was missed in `clone_image()`. When `lun_map()` failed partway through (e.g. mapped to some node igroups but failed on others in per-node mode), cleanup attempted `volume_delete` on a still-mapped LUN. ONTAP rejects this, leaving orphaned igroup mappings AND ghost LUNs visible to other cluster nodes. Those ghost LUNs then become stale multipath devices that can hang any process touching them -- the same root cause as the v0.2.3 customer node hang. Both cleanup branches in `clone_image()` (the `unless ($lun)` branch and the `lun_map` failure branch) now call `lun_unmap_all` before `volume_delete`.
+
+- **Added pre-snapshot host-side buffer flush in `volume_snapshot()` (LOW).** For running VMs, qemu's freeze handles consistency at the filesystem layer. But for offline volumes or external script callers, dirty page cache was not flushed before `snapshot_create`, potentially producing filesystem-inconsistent snapshots. The new flush mirrors what `volume_snapshot_rollback()` already does: `is_device_in_use` check, then `sync` and `blockdev --flushbufs` with timeouts. Skips entirely if device is in use by another process (live migration safety).
+
+- **Removed dead code: `get_multipath_wwid()` in `Multipath.pm` (LOW).** The function was exported but had zero callers across the codebase. Worse, it used `basename()` without symlink resolution -- a latent footgun for any future caller that passed `/dev/mapper/<wwid>`. Same bug class as the v0.2.3 `is_device_in_use` data loss bug. Safer to delete than to leave as a trap.
+
+**Background:**
+After the v0.2.3 customer incident (qm resize hang + latent `is_device_in_use` data loss bug), a full audit was done across the plugin looking for similar bug patterns: (1) cleanup paths that call `volume_delete` without first unmapping the LUN, and (2) functions that use `basename()` on a device path before accessing `/sys/block/`. Three more issues were found and fixed in this release.
+
 ## [0.2.3] - 2026-04-09
 
 ### Pre-Upgrade Stale Device Handling Release (CRITICAL)
@@ -17,6 +42,21 @@ All notable changes to the NetApp ONTAP Storage Plugin for Proxmox VE are docume
 
 **Postinst Stale Device Detection:**
 - Postinst now scans for NETAPP multipath devices with all paths failed and displays a prominent warning listing the WWIDs and exact commands to clean them. Does NOT auto-clean to avoid touching manually-managed storage. Especially important when upgrading from v0.1.x or v0.2.0/1 which left orphans without tracking them.
+
+**CRITICAL Symlink Resolution Fix (DATA LOSS PREVENTION):**
+- Added `_resolve_block_device_name()` helper that resolves `/dev/mapper/<wwid>` symlinks to the underlying `dm-N` kernel name. Required for any `/sys/block/` access on multipath device paths.
+- Fixed `is_device_in_use()` to use the helper. Previously, calling `is_device_in_use('/dev/mapper/<wwid>')` would do `basename()` to get the WWID, then look in `/sys/block/<wwid>/holders/` which doesn't exist. Result: LVM and other holders on multipath devices were silently missed, and `free_image()` would happily delete in-use volumes -- **DATA LOSS RISK**. This affects any environment with LVM / dm-crypt / etc on top of NetApp multipath devices.
+- Fixed `get_multipath_slaves()` to use the helper. Previously the slave list was empty for `/dev/mapper/<wwid>` paths, breaking `volume_resize` and any other operation that needed to enumerate paths.
+
+**Snapshot Rollback Fix:**
+- `volume_snapshot_rollback()` now uses per-device rescan instead of host scan, and adds post-rollback kernel buffer cache invalidation. Without cache invalidation, reads after rollback could return stale cached data from before the rollback.
+
+**Critical Resize Fix:**
+- Fixed `volume_resize()` using `rescan_scsi_hosts()` (host scan) instead of per-device rescan. Host scan is for discovering NEW devices and does NOT trigger re-reading the size of existing devices. Result: after resizing the LUN on ONTAP, the kernel still saw the old size and QEMU's `block_resize` would fail with "Cannot grow device files". Additionally, host scan can hang on unresponsive iSCSI hosts.
+- `volume_resize()` now correctly:
+  1. Iterates over the multipath device's SCSI slaves
+  2. Calls `echo 1 > /sys/block/sdX/device/rescan` on each (with timeout)
+  3. Calls `multipathd resize map <name>` to refresh multipath size
 
 **Slow Operation Support:**
 - `volume_delete()` now uses an extended 60s API timeout (was 15s). FlexClone deletion can take 30+ seconds on ONTAP, especially when cleaning up snapshot dependencies. The 15s default caused spurious "command timed out" warnings even though the operation eventually succeeded via the retry loop.

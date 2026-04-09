@@ -42,12 +42,14 @@ use PVE::Storage::Custom::NetAppONTAP::Multipath qw(
     get_scsi_devices_by_serial
     get_multipath_slaves
     remove_scsi_device
+    rescan_scsi_device
     wait_for_multipath_device
     cleanup_lun_devices
     is_device_in_use
     sysfs_read_with_timeout
     list_netapp_multipath_devices
 );
+use File::Basename qw(basename);
 use PVE::Storage::Custom::NetAppONTAP::FC qw(
     get_fc_wwpns
     is_fc_available
@@ -183,6 +185,78 @@ my $TEMP_CLONE_MAX_AGE = 3600;  # 1 hour - cleanup clones older than this
 # Persisted across reboots so we can clean up orphans even after node restart.
 my $WWID_STATE_DIR = '/var/lib/pve-storage-netapp';
 my $WWID_LOCK_DIR  = '/var/run/pve-storage-netapp';
+
+# Translate ONTAP API errors about resource limits into actionable messages.
+# ONTAP raw errors often look like:
+#   "POST /api/storage/volumes failed: 917927: Cannot create volume 'pve_xxx'.
+#    Reason: Maximum number of volumes is reached on Vserver 'svm0'."
+# These messages are technically correct but cluttered. The translation here
+# matches common limit-reached patterns and prepends a one-line operator-
+# friendly summary so the cause is obvious in the PVE task log.
+#
+# Returns the friendly message (with the original error appended) if a known
+# limit pattern matches, or the original error unchanged otherwise.
+sub _translate_limit_error {
+    my ($err, $context) = @_;
+    return $err unless defined $err;
+    $context //= 'operation';
+
+    # FlexVol count limit (per-SVM or per-node FlexVol cap)
+    if ($err =~ /maximum number of volumes/i ||
+        $err =~ /volume.*limit.*reached/i ||
+        $err =~ /too many volumes/i) {
+        return "ONTAP FlexVol limit reached on this SVM/node. " .
+               "This plugin uses 1 FlexVol per VM disk; you may have hit " .
+               "the SVM volume cap (default ~12000) or the per-node cap " .
+               "(default 1000 on entry-level systems). " .
+               "Ask your ONTAP admin to check 'volume show -vserver <svm>' " .
+               "count and either delete unused volumes or move to a node " .
+               "with capacity. Original error: $err";
+    }
+
+    # SVM/cluster LUN count limit
+    if ($err =~ /maximum number of LUNs/i ||
+        $err =~ /LUN.*limit.*reached/i ||
+        $err =~ /too many LUNs/i) {
+        return "ONTAP LUN limit reached on this SVM/cluster. " .
+               "Each VM disk creates one LUN; you may have hit the SVM LUN " .
+               "cap. Ask your ONTAP admin to check 'lun show -vserver <svm>' " .
+               "count and clean up unused LUNs, or contact NetApp support " .
+               "about raising the limit. Original error: $err";
+    }
+
+    # igroup LUN-map count limit (per-igroup LUN map cap, default 4096)
+    if ($err =~ /maximum number of LUN map/i ||
+        $err =~ /LUN map.*limit/i ||
+        $err =~ /too many LUN maps/i) {
+        return "ONTAP LUN-map limit reached on the target igroup. " .
+               "Default cap is 4096 LUN maps per igroup. In per-node mode " .
+               "this plugin maps each LUN to every node igroup, so you may " .
+               "have ~4000 VM disks already. Consider switching to shared " .
+               "igroup mode (ontap-igroup-mode shared) or contact NetApp " .
+               "support to raise the limit. Original error: $err";
+    }
+
+    # Aggregate full (mostly caught by alloc_image pre-check, but thin
+    # overcommit can still hit this on volume_create or lun_create)
+    if ($err =~ /no space|insufficient space|aggregate.*full/i ||
+        $err =~ /not enough space.*aggregate/i) {
+        return "ONTAP aggregate is out of space. " .
+               "If using thin provisioning, the aggregate has overcommitted " .
+               "and there is no physical space left. Either delete unused " .
+               "volumes/snapshots, expand the aggregate, or switch new " .
+               "allocations to a different aggregate. Original error: $err";
+    }
+
+    # SVM-level quota / hard limit
+    if ($err =~ /quota.*exceed/i || $err =~ /vserver.*limit/i) {
+        return "ONTAP SVM quota or limit exceeded for this $context. " .
+               "Ask your ONTAP admin to check the SVM resource limits " .
+               "('vserver show -vserver <svm>'). Original error: $err";
+    }
+
+    return $err;
+}
 
 sub _get_api {
     my ($scfg) = @_;
@@ -991,7 +1065,8 @@ sub alloc_image {
             thin      => $scfg->{'ontap-thin'} // 1,
         );
     } elsif ($@) {
-        die "Failed to create volume '$ontap_volname': $@";
+        die "Failed to create volume '$ontap_volname': " .
+            _translate_limit_error($@, 'volume creation');
     }
 
     # Warn if aggregate is running low on space (thin provisioning overcommit risk)
@@ -1024,7 +1099,7 @@ sub alloc_image {
         my $err = $@;
         # Cleanup volume on failure
         eval { $api->volume_delete($ontap_volname); };
-        die "Failed to create LUN: $err";
+        die "Failed to create LUN: " . _translate_limit_error($err, 'LUN creation');
     }
 
     # Map LUN to igroups
@@ -1059,7 +1134,7 @@ sub alloc_image {
         eval { $api->lun_unmap_all($lun_path); };
         eval { $api->lun_delete($lun_path); };
         eval { $api->volume_delete($ontap_volname); };
-        die "Failed to map LUN: $err";
+        die "Failed to map LUN: " . _translate_limit_error($err, 'LUN map');
     }
 
     # Return PVE volume name
@@ -1353,20 +1428,39 @@ sub volume_resize {
     # Resize LUN
     $api->lun_resize($lun_path, $size);
 
-    # Rescan device if VM is running to pick up new size
-    if ($running) {
-        my $wwid = eval { $api->lun_get_wwid($lun_path); };
-        if ($wwid) {
-            my $device = get_device_by_wwid($wwid);
-            if ($device && -b $device) {
-                my $protocol = $scfg->{'ontap-protocol'} // 'iscsi';
-                if ($protocol eq 'fc') {
-                    rescan_fc_hosts(delay => 1);
-                } else {
-                    eval { rescan_sessions(); };
-                    rescan_scsi_hosts();
-                }
-                multipath_reload();
+    # Make kernel + multipath see the new size.
+    #
+    # IMPORTANT: For RESIZE (not new device discovery), we must use
+    # `echo 1 > /sys/block/sdX/device/rescan` on EACH path slave, then
+    # `multipathd resize map <wwid>` to refresh the multipath device size.
+    #
+    # Do NOT use rescan_scsi_hosts() (host scan) -- that's for discovering
+    # NEW devices, not re-reading the size of existing ones. Host scan is
+    # also slow and can hang on unresponsive iSCSI hosts.
+    my $wwid = eval { $api->lun_get_wwid($lun_path); };
+    if ($wwid) {
+        my $device = get_device_by_wwid($wwid);
+        if ($device && -b $device) {
+            # Get all underlying SCSI slave devices and rescan each one.
+            # This makes the kernel re-read the SCSI device capacity.
+            my $slaves = get_multipath_slaves($device) || [];
+            for my $slave (@$slaves) {
+                eval { rescan_scsi_device($slave); };
+                warn "Failed to rescan $slave: $@" if $@;
+            }
+
+            # Tell multipathd to resize the map to match the new underlying size.
+            # Inline untaint check (basename of /dev/mapper/<wwid>).
+            my $mpath_name = basename($device);
+            if ($mpath_name =~ /^([a-zA-Z0-9_\-]+)$/) {
+                my $safe_name = $1;
+                eval {
+                    PVE::Tools::run_command(
+                        ['/sbin/multipathd', 'resize', 'map', $safe_name],
+                        timeout => 15,
+                    );
+                };
+                warn "multipathd resize map $safe_name failed: $@" if $@;
             }
         }
     }
@@ -1534,12 +1628,21 @@ sub _get_snapshot_path {
         # Create FlexClone from snapshot
         warn "Creating temporary FlexClone '$temp_clone_name' for snapshot '$snapname' access\n";
 
-        # Create FlexClone from the snapshot
-        $api->volume_clone(
-            clone_name      => $temp_clone_name,
-            parent_name     => $ontap_volname,
-            parent_snapshot => $ontap_snapname,
-        );
+        # Create FlexClone from the snapshot. Temp clone names are
+        # deterministic (volname + snap), so two parallel path() callers
+        # for the same volume+snap will race on this create. Treat
+        # "already exists" as success -- whichever process won, the temp
+        # clone is now there and we can use it.
+        eval {
+            $api->volume_clone(
+                clone_name      => $temp_clone_name,
+                parent_name     => $ontap_volname,
+                parent_snapshot => $ontap_snapname,
+            );
+        };
+        if ($@ && $@ !~ /already exists|duplicate|entry.*exists/i) {
+            die "Failed to create temporary FlexClone '$temp_clone_name': $@";
+        }
 
         # Track for cleanup
         _track_temp_clone($storeid, $temp_clone_name);
@@ -1683,12 +1786,30 @@ sub volume_snapshot {
     my $api = _get_api($scfg);
     my $ontap_volname = pve_volname_to_ontap($storeid, $volname);
     my $ontap_snapname = encode_snapshot_name($snap);
+    my $lun_path = encode_lun_path($ontap_volname);
 
     # Safety check: Verify snapshot doesn't already exist
     my $existing_snap = $api->snapshot_get($ontap_volname, $ontap_snapname);
     if ($existing_snap) {
         die "Snapshot '$snap' already exists on volume '$volname'. " .
             "Please use a different snapshot name or delete the existing snapshot first.";
+    }
+
+    # Best-effort flush of host-side buffers before taking the storage-level
+    # snapshot. For running VMs, qemu's own freeze handles consistency at the
+    # filesystem layer; this flush only catches the case where the device has
+    # dirty page cache from non-qemu access (e.g. external scripts, offline
+    # snapshot of a stopped VM after a host write). Skip if device is in use
+    # by another process to avoid blocking on a busy live migration.
+    my $wwid = eval { $api->lun_get_wwid($lun_path); };
+    if ($wwid) {
+        my $device = get_device_by_wwid($wwid);
+        if ($device && -b $device && !is_device_in_use($device)) {
+            eval { run_command(['/bin/sync'], timeout => 10); };
+            warn "pre-snapshot sync timed out: $@" if $@;
+            eval { run_command(['/sbin/blockdev', '--flushbufs', $device], timeout => 10); };
+            warn "pre-snapshot blockdev --flushbufs failed for $device: $@" if $@;
+        }
     }
 
     $api->snapshot_create($ontap_volname, $ontap_snapname);
@@ -1718,8 +1839,9 @@ sub volume_snapshot_rollback {
 
     # Quiesce device before rollback to prevent data corruption
     my $wwid = eval { $api->lun_get_wwid($lun_path); };
+    my $device;
     if ($wwid) {
-        my $device = get_device_by_wwid($wwid);
+        $device = get_device_by_wwid($wwid);
         if ($device && -b $device) {
             if (is_device_in_use($device)) {
                 die "Cannot rollback snapshot: device $device is still in use. " .
@@ -1735,15 +1857,36 @@ sub volume_snapshot_rollback {
     # Rollback the volume to snapshot
     $api->snapshot_rollback($ontap_volname, $ontap_snapname);
 
-    # Rescan to pick up any size changes based on protocol
-    my $protocol = $scfg->{'ontap-protocol'} // 'iscsi';
-    if ($protocol eq 'fc') {
-        rescan_fc_hosts(delay => 1);
-    } else {
-        eval { rescan_sessions(); };  # May fail if no active sessions
-        rescan_scsi_hosts();
+    # After rollback, the data on the LUN has changed but the device identity
+    # is the same. We need to:
+    #   1. Per-device SCSI rescan to re-read capacity (in case snapshot had
+    #      a different size)
+    #   2. Invalidate kernel buffer cache so next reads see new content
+    #
+    # Do NOT use rescan_scsi_hosts() (host scan) -- that's for discovering
+    # NEW devices, not refreshing existing ones, and can hang on unresponsive hosts.
+    if ($device && -b $device) {
+        # Per-device rescan on each path slave
+        my $slaves = get_multipath_slaves($device) || [];
+        for my $slave (@$slaves) {
+            eval { rescan_scsi_device($slave); };
+            warn "Failed to rescan $slave: $@" if $@;
+        }
+
+        # Refresh multipath map size in case capacity changed
+        my $mpath_name = basename($device);
+        if ($mpath_name =~ /^([a-zA-Z0-9_\-]+)$/) {
+            my $safe_name = $1;
+            eval {
+                run_command(['/sbin/multipathd', 'resize', 'map', $safe_name],
+                    timeout => 15);
+            };
+        }
+
+        # Invalidate kernel buffer cache so subsequent reads see new content
+        eval { run_command(['/sbin/blockdev', '--flushbufs', $device], timeout => 10); };
+        warn "post-rollback blockdev --flushbufs failed: $@" if $@;
     }
-    multipath_reload();
 
     return 1;
 }
@@ -1958,45 +2101,68 @@ sub clone_image {
         }
     }
 
-    # Generate new disk ID for clone (with retry for concurrent allocation)
+    # Generate new disk ID for clone and create the FlexClone in one loop.
+    # Pre-check (volume_get) handles the cheap case; the volume_clone error
+    # handler catches the TOCTOU race window where two parallel clone_image
+    # calls on the same VM both pass the pre-check with the same disk ID.
+    # The first volume_clone wins; the second gets "already exists" from
+    # ONTAP and we retry with the next disk ID.
     my $new_diskid;
     my $new_volname;
     my $clone_ontap_vol;
     my $clone_lun_path;
     my $max_clone_retries = 5;
+    my $clone_created = 0;
+
+    my $disk_list = $class->list_images($storeid, $scfg, $vmid);
+    my $max_disk = -1;
+    for my $disk (@$disk_list) {
+        if ($disk->{volid} =~ /vm-$vmid-disk-(\d+)/) {
+            $max_disk = $1 if $1 > $max_disk;
+        }
+    }
+    my $base_diskid = $max_disk + 1;
 
     for my $retry (0 .. $max_clone_retries) {
-        my $disk_list = $class->list_images($storeid, $scfg, $vmid);
-        my $max_disk = -1;
-        for my $disk (@$disk_list) {
-            if ($disk->{volid} =~ /vm-$vmid-disk-(\d+)/) {
-                $max_disk = $1 if $1 > $max_disk;
-            }
-        }
-        $new_diskid = $max_disk + 1 + $retry;
+        $new_diskid = $base_diskid + $retry;
         $new_volname = "vm-${vmid}-disk-${new_diskid}";
         $clone_ontap_vol = encode_volume_name($storeid, $vmid, $new_diskid);
         $clone_lun_path = encode_lun_path($clone_ontap_vol);
 
-        # Check if volume already exists on ONTAP
+        # Cheap pre-check: skip IDs we already know are taken to avoid a
+        # round-trip to ONTAP for the create.
         my $existing = $api->volume_get($clone_ontap_vol);
-        last unless $existing;
+        if ($existing) {
+            next if $retry < $max_clone_retries;
+            die "Cannot find free disk ID for clone after $max_clone_retries retries";
+        }
 
-        die "Cannot find free disk ID for clone after $max_clone_retries retries"
-            if $retry == $max_clone_retries;
+        # Try to create the FlexClone. This is the actual race-window
+        # protection: even if the pre-check said the ID was free, another
+        # parallel clone_image may have grabbed it between the check and now.
+        eval {
+            $api->volume_clone(
+                clone_name      => $clone_ontap_vol,
+                parent_name     => $parent_ontap_vol,
+                parent_snapshot => $base_snapshot,
+            );
+        };
+        if (!$@) {
+            $clone_created = 1;
+            last;
+        }
+        if ($@ =~ /already exists|duplicate|entry.*exists|unique/i) {
+            warn "Clone '$clone_ontap_vol' race detected, retrying with next disk ID\n";
+            next if $retry < $max_clone_retries;
+            die "Cannot find free disk ID for clone after $max_clone_retries retries: $@";
+        }
+        # Any other error: not a race, fail immediately
+        die "Failed to create FlexClone: " .
+            _translate_limit_error($@, 'FlexClone creation');
     }
 
-    # Create FlexClone
-    eval {
-        $api->volume_clone(
-            clone_name      => $clone_ontap_vol,
-            parent_name     => $parent_ontap_vol,
-            parent_snapshot => $base_snapshot,
-        );
-    };
-    if ($@) {
-        die "Failed to create FlexClone: $@";
-    }
+    die "Failed to create FlexClone after $max_clone_retries retries"
+        unless $clone_created;
 
     # The LUN inside the FlexClone volume is automatically cloned with new identity
     # Wait a moment for the LUN to be ready
@@ -2005,7 +2171,8 @@ sub clone_image {
     # Check if LUN exists in the cloned volume
     my $lun = $api->lun_get($clone_lun_path);
     unless ($lun) {
-        # Cleanup and fail
+        # Cleanup and fail (unmap first in case FlexClone inherited mappings)
+        eval { $api->lun_unmap_all($clone_lun_path); };
         eval { $api->volume_delete($clone_ontap_vol); };
         die "LUN not found in cloned volume: $clone_lun_path. " .
             "FlexClone may not have copied the LUN correctly.";
@@ -2041,9 +2208,15 @@ sub clone_image {
     };
     if ($@ || $map_error) {
         my $err = $@ || $map_error || "Unknown error";
-        # Cleanup on failure
+        # Cleanup on failure (unmap first, then delete)
+        # lun_map may have partially succeeded (mapped to some node igroups
+        # before failing on others). volume_delete on a still-mapped LUN
+        # will fail on ONTAP, leaving orphaned igroup mappings and ghost
+        # LUNs visible to other cluster nodes.
+        eval { $api->lun_unmap_all($clone_lun_path); };
         eval { $api->volume_delete($clone_ontap_vol); };
-        die "Failed to map cloned LUN to igroup: $err";
+        die "Failed to map cloned LUN to igroup: " .
+            _translate_limit_error($err, 'cloned LUN map');
     }
 
     # Note: clone_image is only called for Linked Clone from template

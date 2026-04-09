@@ -7,7 +7,7 @@ use Carp qw(croak);
 use IPC::Open3;
 use IO::Select;
 use Symbol qw(gensym);
-use File::Basename qw(basename);
+use File::Basename qw(basename dirname);
 use POSIX qw(_exit);
 
 use Exporter qw(import);
@@ -19,7 +19,6 @@ our @EXPORT_OK = qw(
     multipath_add
     multipath_remove
     get_multipath_device
-    get_multipath_wwid
     get_device_by_wwid
     wait_for_multipath_device
     get_scsi_devices_by_serial
@@ -44,6 +43,34 @@ use constant {
     DEVICE_WAIT_TIMEOUT   => 60,
     DEVICE_WAIT_INTERVAL  => 2,
 };
+
+# Resolve a device path to the kernel name used in /sys/block/.
+# Handles all three forms:
+#   /dev/sdX                 → sdX (no change)
+#   /dev/dm-N                → dm-N (no change)
+#   /dev/mapper/<name>       → dm-N (resolves symlink)
+# Returns the kernel name, or undef if it can't be resolved.
+sub _resolve_block_device_name {
+    my ($device) = @_;
+    return undef unless defined $device;
+
+    # If it's a symlink (typical for /dev/mapper/*), resolve to target
+    if (-l $device) {
+        my $target = readlink($device);
+        if (defined $target) {
+            # readlink may return relative path like "../dm-9"
+            if ($target !~ m|^/|) {
+                my $dir = dirname($device);
+                $target = "$dir/$target";
+            }
+            # Normalize: remove "/foo/../" sequences
+            while ($target =~ s|/[^/]+/\.\./|/|g) {}
+            $device = $target;
+        }
+    }
+
+    return _untaint_device_name(basename($device));
+}
 
 # Untaint a device name (e.g., sda, dm-0)
 sub _untaint_device_name {
@@ -415,52 +442,6 @@ sub get_multipath_device {
     return undef;
 }
 
-# Get WWID for a device
-sub get_multipath_wwid {
-    my ($device, %opts) = @_;
-
-    croak "device is required" unless $device;
-
-    # Try using multipathd
-    my ($stdout) = _run_cmd(
-        [MULTIPATHD, 'show', 'paths', 'raw', 'format', '%d %w'],
-        allow_nonzero => 1,
-        ignore_errors => 1,
-    );
-
-    if (defined $stdout) {
-        my $dev_name = basename($device);
-        for my $line (split /\n/, $stdout) {
-            my ($path_dev, $wwid) = split /\s+/, $line, 2;
-            if ($path_dev && $path_dev eq $dev_name) {
-                return $wwid;
-            }
-        }
-    }
-
-    # Fall back to sg_inq
-    if (-x SG_INQ) {
-        my ($inq_out) = _run_cmd([SG_INQ, '-p', '0x83', $device], allow_nonzero => 1, ignore_errors => 1);
-        if ($inq_out && $inq_out =~ /\[0x(\w+)\]/) {
-            return $1;
-        }
-    }
-
-    # Try /sys/block/*/device/wwid (with timeout to prevent hang on unresponsive device)
-    my $dev_name = _untaint_device_name(basename($device));
-    return undef unless $dev_name;
-    my $wwid_file = BLOCK_DEVICE_PATH . "/$dev_name/device/wwid";
-    if (-r $wwid_file) {
-        my $wwid = sysfs_read_with_timeout($wwid_file, 5);
-        if ($wwid) {
-            chomp($wwid);
-            return $wwid;
-        }
-    }
-
-    return undef;
-}
-
 # Get device path by WWID
 sub get_device_by_wwid {
     my ($wwid, %opts) = @_;
@@ -621,17 +602,18 @@ sub rescan_scsi_device {
     croak "Cannot find rescan file for device $device";
 }
 
-# Get all slave devices for a multipath device
+# Get all slave devices for a multipath device.
+# Handles both /dev/mapper/<wwid> (symlink to /dev/dm-N) and /dev/dm-N forms.
 sub get_multipath_slaves {
     my ($mpath_device, %opts) = @_;
 
     croak "mpath_device is required" unless $mpath_device;
 
-    my $dev_name = _untaint_device_name(basename($mpath_device));
+    # Resolve symlink: /dev/mapper/<wwid> -> dm-N kernel name
+    my $dev_name = _resolve_block_device_name($mpath_device);
     return [] unless $dev_name;
 
-    my $slaves_dir = BLOCK_DEVICE_PATH . "/$dev_name/slaves";
-
+    my $slaves_dir = "/sys/block/$dev_name/slaves";
     return [] unless -d $slaves_dir;
 
     opendir(my $dh, $slaves_dir) or return [];
@@ -722,7 +704,8 @@ sub is_device_in_use {
 
     return 0 unless $device && -b $device;
 
-    my $dev_name = _untaint_device_name(basename($device));
+    # Resolve to kernel name (handles /dev/mapper/<wwid> -> dm-N)
+    my $dev_name = _resolve_block_device_name($device);
     return 0 unless $dev_name;
 
     # Check 1: Is device mounted? (use sysfs_read_with_timeout to prevent hang
@@ -730,6 +713,7 @@ sub is_device_in_use {
     my $mounts = sysfs_read_with_timeout('/proc/mounts', 5);
     if ($mounts) {
         for my $line (split /\n/, $mounts) {
+            # Check both the original device path and the resolved /dev/<dev_name>
             if ($line =~ /^\Q$device\E\s/ || $line =~ /^\/dev\/\Q$dev_name\E\s/) {
                 return 1;  # Device is mounted
             }
@@ -737,6 +721,9 @@ sub is_device_in_use {
     }
 
     # Check 2: Does device have holders (e.g., LVM, dm-crypt)?
+    # CRITICAL: must use resolved kernel name (dm-N), not basename of /dev/mapper/<wwid>.
+    # Otherwise LVM holders on multipath devices are missed and free_image would
+    # happily delete a mounted/in-use volume.
     my $holders_dir = "/sys/block/$dev_name/holders";
     if (-d $holders_dir) {
         opendir(my $dh, $holders_dir);

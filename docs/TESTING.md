@@ -553,6 +553,28 @@ These tests require coordination with ONTAP-side operations (executed by separat
 | T82 | Storage auto-recovers after password restored | PASS | 1 second to active, full functionality restored |
 | T83 | No PVE workers in D state during 401 | PASS | |
 
+#### Section 10: ONTAP-Coordinated Failure Tests (v0.2.3 re-validation)
+
+These tests were re-run with v0.2.3 in coordination with the ONTAP admin agent.
+
+| # | Test | Result | Notes |
+|---|------|--------|-------|
+| T72 | iSCSI service stop/start (~65s downtime) | PASS | dd counter froze at 79, resumed to 121 after restart |
+| T73 | All 4 multipath paths recover | PASS | Within 3 seconds of `iscsi start` |
+| T74 | dd auto-resumes after iSCSI recovery | PASS | counter 79 → 83 → 158 (no manual intervention) |
+| T75 | dd in D state during outage but recovers | PASS | Not permanently stuck |
+| T76 | No PVE workers stuck in D state | PASS | Throughout entire outage |
+| **T76b** | **v0.2.3: free LUN with queue_if_no_path multipath.conf** | **PASS** | **dmsetup fallback triggered, free completed in 8s instead of hanging** |
+| T77 | Manual ONTAP volume conflict (TOCTOU) | PASS | `pvesm alloc` auto-retries with disk-1 |
+| T78 | Consecutive collision retries | PASS | disk-0 conflict → disk-1, then disk-0 again → disk-2 |
+| T79 | API 401 detection | PASS | Warning logged: "ONTAP API returned 401, reinitializing auth (attempt 1/2)" |
+| T80 | API 401 reinit auth attempt | PASS | Fix #10 verified end-to-end |
+| T81 | Graceful failure on auth failure | PASS | status() returns inactive within 10s, no hang |
+| T82 | Storage auto-recovers after password restored | PASS | **2 seconds** to active, full functionality restored |
+| T83 | No PVE workers in D state during 401 | PASS | Throughout multiple status() calls |
+
+**v0.2.3 Total: 92/92 PASS** (71 prior + 9 post-fix + 12 ONTAP-coordinated re-run)
+
 **Total: 75/75 PASS**
 
 **Validated Improvements in v0.2.2:**

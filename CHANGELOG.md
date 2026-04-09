@@ -2,6 +2,32 @@
 
 All notable changes to the NetApp ONTAP Storage Plugin for Proxmox VE are documented here.
 
+## [0.2.3] - 2026-04-09
+
+### Pre-Upgrade Stale Device Handling Release (CRITICAL)
+
+**Critical Fixes for Production Upgrade Scenarios:**
+- Fixed orphan cleanup not handling pre-upgrade stale multipath devices. v0.2.2 only cleaned WWIDs that `path()` was called on AFTER upgrade. Stale devices left over from earlier plugin versions (v0.1.x) were never tracked and could not be cleaned automatically. v0.2.3 now auto-imports current ONTAP `pve_*` LUN WWIDs into the tracking file on every `status()` poll, ensuring all cluster nodes converge to a consistent view regardless of when `path()` was last called locally.
+
+**Multipath Hang Prevention (CRITICAL):**
+- Fixed `cleanup_lun_devices()` hanging on multipath devices with `queue_if_no_path` enabled. Now disables queueing via `multipathd disablequeueing map` and `dmsetup message ... fail_if_no_path` BEFORE attempting any sync/flush, so I/O fails fast instead of queueing forever.
+- Added timeout (10s) to all `multipath_flush()` and `multipath_reload()` operations.
+- Fallback to `dmsetup remove --force --retry` if `multipath -f` times out, bypassing the multipath flush logic that hangs on dead devices.
+- Added timeout (10s) to `multipathd remove map` calls.
+
+**Postinst Stale Device Detection:**
+- Postinst now scans for NETAPP multipath devices with all paths failed and displays a prominent warning listing the WWIDs and exact commands to clean them. Does NOT auto-clean to avoid touching manually-managed storage. Especially important when upgrading from v0.1.x or v0.2.0/1 which left orphans without tracking them.
+
+**Slow Operation Support:**
+- `volume_delete()` now uses an extended 60s API timeout (was 15s). FlexClone deletion can take 30+ seconds on ONTAP, especially when cleaning up snapshot dependencies. The 15s default caused spurious "command timed out" warnings even though the operation eventually succeeded via the retry loop.
+- `_request()` now supports per-call timeout override.
+
+**Background:**
+Customer environment hit a node hang during disk migration when `vgs` scanned a stale multipath device that had `queue_if_no_path` enabled. The stale device was left over from earlier plugin versions and was never tracked by v0.2.2's orphan cleanup mechanism. Result: `vgs` entered D state, `pvedaemon` hung waiting for it, and `systemctl restart` also hung. Recovery required reboot. v0.2.3 prevents this by:
+1. Auto-importing alive WWIDs so cluster nodes know about ALL LUNs
+2. Disabling `queue_if_no_path` before any cleanup operation
+3. Warning at install time about pre-existing stale devices
+
 ## [0.2.2] - 2026-04-08
 
 ### Cluster Orphan Device Cleanup Release

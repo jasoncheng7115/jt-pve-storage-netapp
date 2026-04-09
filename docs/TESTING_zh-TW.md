@@ -324,7 +324,7 @@ pvesm list $STORAGE
 | T36 | 額外磁碟全部清除 | PASS |
 | T37 | 磁碟移除後無殘留 multipath | PASS |
 
-#### 第 5 區：孤兒清理 (叢集情境)
+#### 第 5 區：殘留清理 (叢集情境)
 
 端到端測試：模擬 Node A 刪除 VM，Node B 的 stale 裝置由 status() 輪詢自動清除。
 
@@ -334,7 +334,7 @@ pvesm list $STORAGE
 | T39 | 模擬叢集刪除 (僅透過 API) | PASS |
 | T40 | 清理前 stale multipath 仍存在 | PASS |
 | T41 | (略過：由 T42 涵蓋) | - |
-| T42 | status() 輪詢觸發孤兒清理 | PASS |
+| T42 | status() 輪詢觸發殘留清理 | PASS |
 | T43 | WWID 從追蹤檔中移除 | PASS |
 
 #### 第 6 區：混合環境、igroup、韌性測試
@@ -393,10 +393,32 @@ pvesm list $STORAGE
 | T82 | 密碼恢復後 storage 自動恢復 | PASS | 1 秒回 active，完整功能恢復 |
 | T83 | 401 處理過程無 PVE worker 在 D state | PASS | |
 
+#### 第 10 區：ONTAP 端協同故障測試（v0.2.3 重新驗證）
+
+這些測試在 v0.2.3 跟 ONTAP 管理 agent 協同重新執行。
+
+| # | 測試項目 | 結果 | 備註 |
+|---|---------|------|------|
+| T72 | iSCSI service stop/start（~65 秒中斷）| PASS | dd counter 凍結於 79，重啟後繼續寫到 121 |
+| T73 | 4 條 multipath 路徑全部恢復 | PASS | iscsi start 後 3 秒內 |
+| T74 | dd 在 iSCSI 恢復後自動繼續 | PASS | counter 79 → 83 → 158（無需人工介入）|
+| T75 | dd 在中斷期間進入 D state 但會恢復 | PASS | 非永久卡死 |
+| T76 | PVE worker 全程無 D state 卡死 | PASS | 整個中斷期間 |
+| **T76b** | **v0.2.3: 在 queue_if_no_path 設定下 free LUN** | **PASS** | **dmsetup fallback 觸發，free 8 秒完成（非永久卡住）** |
+| T77 | 手動 ONTAP volume 衝突 (TOCTOU) | PASS | `pvesm alloc` 自動 retry 用 disk-1 |
+| T78 | 連續衝突 retry | PASS | disk-0 衝突 → disk-1，再 disk-0 → disk-2 |
+| T79 | API 401 偵測 | PASS | 警告紀錄：「ONTAP API returned 401, reinitializing auth (attempt 1/2)」|
+| T80 | API 401 reinit auth 嘗試 | PASS | Fix #10 端到端驗證 |
+| T81 | 認證失敗時優雅失敗 | PASS | status() 10 秒內回 inactive，無卡死 |
+| T82 | 密碼恢復後 storage 自動恢復 | PASS | **2 秒**回 active，完整功能恢復 |
+| T83 | 401 處理過程無 PVE worker 在 D state | PASS | 連續多次 status() 都正常 |
+
+**v0.2.3 總計：92/92 PASS**（71 先前測試 + 9 修復後驗證 + 12 ONTAP 協同重跑）
+
 **總計：75/75 PASS**
 
 **v0.2.2 已驗證的改進：**
-- 叢集孤兒清理機制端到端正常運作
+- 叢集殘留清理機制端到端正常運作
 - WWID 追蹤在 path() / free_image() 生命週期中正確維護
 - alloc_image 對應到所有 per-node igroups（不只當前節點）
 - 混合環境（手動 NetApp + plugin）安全 -- 只碰追蹤過的 WWID
@@ -410,7 +432,7 @@ pvesm list $STORAGE
 | # | 測試項目 | 結果 | 備註 |
 |---|---------|------|------|
 | T1-T22 | 所有 v0.2.1 測試 | PASS | |
-| T23 | **孤兒清理 (叢集情境)** | **PASS** | 初步驗證 |
+| T23 | **殘留清理 (叢集情境)** | **PASS** | 初步驗證 |
 
 **總計：23/23 PASS**
 

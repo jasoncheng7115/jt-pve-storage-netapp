@@ -23,7 +23,7 @@ All notable changes to the NetApp ONTAP Storage Plugin for Proxmox VE are docume
 - **Fix:** `rescan_fc_hosts()` in `FC.pm` had the same bug in its post-LIP SCSI scan loop. Now only iterates FC hosts from `/sys/class/fc_host/` (already enumerated via `get_fc_hosts()`).
 
 **Architectural lesson:**
-This bug existed since v0.1.0. Previous releases protected the parent process from hanging but did not prevent the write from reaching the kernel. The correct fix is not to write to non-iSCSI hosts at all -- they are categorically irrelevant to plugin-managed iSCSI LUNs. See `PVE_STORAGE_PLUGIN_DEV_GUIDE.md` Incident 8 for the full analysis.
+This bug existed since v0.1.0. Previous releases protected the parent process from hanging but did not prevent the write from reaching the kernel. The correct fix is not to write to non-iSCSI hosts at all -- they are categorically irrelevant to plugin-managed iSCSI LUNs.
 
 ## [0.2.4] - 2026-04-09
 

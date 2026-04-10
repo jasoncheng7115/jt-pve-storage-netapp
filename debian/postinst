@@ -258,6 +258,45 @@ case "$1" in
         # Detect stale multipath devices left over from previous versions
         detect_stale_netapp_devices
 
+        # Check if lvm.conf global_filter excludes plugin multipath devices.
+        # Without this filter, the host's LVM scanner reads VG metadata from
+        # inside VM disks on plugin-managed LUNs and auto-activates them as
+        # host-level VGs. This creates holders on the multipath device that
+        # block free_image() from deleting volumes. Common on PVE nodes
+        # upgraded from 7->8->9 that inherited old lvm.conf without filter.
+        LVM_CONF="/etc/lvm/lvm.conf"
+        if [ -f "$LVM_CONF" ]; then
+            if ! grep -qE '^\s*global_filter\s*=' "$LVM_CONF" 2>/dev/null; then
+                echo ""
+                echo -e "\033[1;33m!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!\033[0m"
+                echo -e "\033[1;33m  WARNING: /etc/lvm/lvm.conf has no global_filter\033[0m"
+                echo -e "\033[1;33m!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!\033[0m"
+                echo ""
+                echo "  Without a global_filter, the host's LVM scanner will read VG metadata"
+                echo "  from inside VM disks on plugin-managed multipath LUNs and auto-activate"
+                echo "  them as host-level VGs. This causes:"
+                echo "    - 'Cannot delete volume: device is still in use' errors"
+                echo "    - move-disk unable to clean up source disk after migration"
+                echo "    - Duplicate VG name warnings from vgs/pvs"
+                echo ""
+                echo "  This is common on PVE nodes upgraded from 7 -> 8 -> 9."
+                echo "  Fresh PVE 9 installs have a correct global_filter by default."
+                echo ""
+                echo -e "  \033[1;32mRecommended fix:\033[0m Add to $LVM_CONF devices { } section:"
+                echo ""
+                echo -e "    \033[1;32mglobal_filter = [ \"r|/dev/mapper/360.*|\", \"r|/dev/dm-|\", \"a|.*|\" ]\033[0m"
+                echo ""
+                echo "  This excludes plugin-managed multipath devices (WWID starting with 360)"
+                echo "  and raw dm-* devices from LVM scanning, while allowing everything else."
+                echo "  Adjust the regex if you have non-plugin multipath devices that LVM should see."
+                echo ""
+                echo "  After editing, run: vgscan --mknodes"
+                echo ""
+                echo -e "\033[1;33m!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!\033[0m"
+                echo ""
+            fi
+        fi
+
         echo "To add storage, use:"
         echo ""
         echo "  pvesm add netappontap <storage-id> \\"
@@ -288,19 +327,41 @@ case "$1" in
             timeout 10 systemctl start multipathd 2>/dev/null || echo "  [FAIL] Could not start multipathd"
         fi
 
-        # Restart PVE services to load the new storage plugin
-        echo "Restarting PVE services to load plugin..."
-        if timeout 30 systemctl restart pvedaemon 2>/dev/null; then
-            echo "  [OK] pvedaemon restarted."
-        else
-            echo "  [WARN] Could not restart pvedaemon. Please run: systemctl restart pvedaemon"
-        fi
-
-        if timeout 30 systemctl restart pveproxy 2>/dev/null; then
-            echo "  [OK] pveproxy restarted."
-        else
-            echo "  [WARN] Could not restart pveproxy. Please run: systemctl restart pveproxy"
-        fi
+        # Reload PVE services to load the new storage plugin code.
+        #
+        # Use 'reload' (SIGHUP) instead of 'restart' when the service is
+        # already running. PVE::Daemon handles SIGHUP by re-exec'ing itself
+        # with the same PID, picking up new Perl modules from disk without
+        # going through a stop phase. This avoids the bootstrapping problem
+        # where the OLD code has already created D-state children (e.g. from
+        # writing to a non-iSCSI SCSI host's scan file on HPE smartpqi),
+        # and 'systemctl restart' hangs waiting for those unkillable children
+        # during the stop phase.
+        #
+        # CRITICAL: pvestatd must also be reloaded. It polls status() every
+        # 10 seconds using whatever plugin code it loaded at startup. If we
+        # only reload pvedaemon+pveproxy but leave pvestatd running old code,
+        # pvestatd continues creating D-state children from old rescan logic.
+        # This was the root cause of a production watchdog-triggered reboot
+        # (v0.2.5 incident: pvestatd with v0.2.4 code kept hitting host1).
+        echo "Reloading PVE services to load plugin..."
+        for svc in pvedaemon pvestatd pveproxy; do
+            if timeout 5 systemctl is-active --quiet "$svc" 2>/dev/null; then
+                # Service is running -> reload (SIGHUP, re-exec with new code)
+                if timeout 15 systemctl reload "$svc" 2>/dev/null; then
+                    echo "  [OK] $svc reloaded."
+                else
+                    echo "  [WARN] Could not reload $svc. Please run: systemctl reload $svc"
+                fi
+            else
+                # Service is not running -> start fresh
+                if timeout 30 systemctl start "$svc" 2>/dev/null; then
+                    echo "  [OK] $svc started."
+                else
+                    echo "  [WARN] Could not start $svc. Please run: systemctl start $svc"
+                fi
+            fi
+        done
 
         echo ""
         echo "Installation complete."

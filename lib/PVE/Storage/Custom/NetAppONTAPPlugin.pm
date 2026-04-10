@@ -46,6 +46,7 @@ use PVE::Storage::Custom::NetAppONTAP::Multipath qw(
     wait_for_multipath_device
     cleanup_lun_devices
     is_device_in_use
+    get_device_usage_details
     sysfs_read_with_timeout
     list_netapp_multipath_devices
 );
@@ -861,14 +862,35 @@ sub _cleanup_orphaned_devices {
             push @untracked, $dev;
         }
         if (@untracked) {
-            warn "Orphan cleanup: detected " . scalar(@untracked) .
-                 " untracked NETAPP multipath device(s) that may be stale.\n";
-            warn "Plugin will NOT auto-clean these (risk of touching manually-managed storage).\n";
-            warn "If you confirm they are NOT in use, clean manually:\n";
+            # Cooldown: only warn once per hour per WWID to avoid flooding
+            # the journal (pvestatd polls status() every 10 seconds).
+            # State dir is /var/run (tmpfs, cleared on reboot).
+            my $cooldown_dir = '/var/run/pve-storage-netapp';
+            mkdir $cooldown_dir, 0755 unless -d $cooldown_dir;
+            my $cooldown_secs = 3600;  # 1 hour
+
+            my @need_warn;
             for my $o (@untracked) {
-                warn "  multipathd disablequeueing map $o->{wwid}\n";
-                warn "  dmsetup message $o->{wwid} 0 fail_if_no_path\n";
-                warn "  multipath -f $o->{wwid}\n";
+                my $flag = "$cooldown_dir/orphan-warn-$o->{wwid}";
+                my $last = (stat($flag))[9] // 0;
+                if ((time() - $last) >= $cooldown_secs) {
+                    push @need_warn, $o;
+                    # Touch the flag file to record this warning
+                    if (open(my $fh, '>', $flag)) { close($fh); }
+                }
+            }
+
+            if (@need_warn) {
+                warn "Orphan cleanup: detected " . scalar(@need_warn) .
+                     " untracked NETAPP multipath device(s) that may be stale.\n";
+                warn "Plugin will NOT auto-clean these (risk of touching manually-managed storage).\n";
+                warn "If you confirm they are NOT in use, clean manually:\n";
+                for my $o (@need_warn) {
+                    warn "  multipathd disablequeueing map $o->{wwid}\n";
+                    warn "  dmsetup message $o->{wwid} 0 fail_if_no_path\n";
+                    warn "  multipath -f $o->{wwid}\n";
+                }
+                warn "(This warning repeats at most once per hour per device.)\n";
             }
         }
     };
@@ -1156,9 +1178,9 @@ sub free_image {
         my $device = get_device_by_wwid($wwid);
         if ($device && -b $device) {
             if (is_device_in_use($device)) {
-                die "Cannot delete volume '$volname': device $device is still in use " .
-                    "(mounted, has holders, or open by process). " .
-                    "Please stop the VM and unmount the device first.";
+                my $details = get_device_usage_details($device);
+                die "Cannot delete volume '$volname': device $device is still in use.\n\n" .
+                    "$details\n";
             }
         }
     }

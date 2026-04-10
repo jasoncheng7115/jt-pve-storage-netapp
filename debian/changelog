@@ -1,3 +1,53 @@
+jt-pve-storage-netapp (0.2.5-1) stable; urgency=critical
+
+  * Non-iSCSI SCSI Host Scan Fix Release (CRITICAL)
+  * Requirements: Proxmox VE 9.1 or later
+  * Critical Bug Fix (production incident):
+    - Fixed rescan_scsi_hosts() and FC.pm rescan_fc_hosts() iterating
+      all entries in /sys/class/scsi_host/ and writing "- - -" to each
+      host's scan file. This included non-iSCSI / non-FC hosts such as
+      HBA RAID controllers, USB card readers, NVMe, virtio-scsi, etc.
+      Writing to a non-iSCSI host's scan file triggers a driver-side
+      full target rescan, which can hang for 600+ seconds inside some
+      drivers. Observed in production on HPE ProLiant servers with the
+      smartpqi driver (P408i-a controller): writes to host1/scan entered
+      D-state for 10+ minutes in sas_user_scan, serializing every
+      subsequent process that touched /sys/class/scsi_host/host1. This
+      cascaded into:
+        * pvedaemon workers unable to release VM config locks
+          -> customer saw repeated "trying to acquire lock... got timeout"
+        * pvestatd unable to complete status() polls
+        * pvedaemon restart hanging indefinitely during postinst upgrade
+        * VM operations (move-disk, resize, config update, boot change)
+          intermittently hanging even on working-path storage
+    - Fix: rescan_scsi_hosts() now sources the host list from
+      /sys/class/iscsi_host/ (maintained by kernel scsi_transport_iscsi).
+      Every iSCSI SCSI host registers there regardless of underlying
+      driver (iscsi_tcp, iser, bnx2i, qla4xxx, qedi, be2iscsi, cxgb3i,
+      cxgb4i, and any future iSCSI driver via iscsi_host_alloc()).
+      Non-iSCSI hosts are categorically absent from that class, so
+      iteration is both exhaustive and safe. Future-proof: new iSCSI
+      drivers added to the kernel are picked up automatically without
+      plugin code changes.
+    - Fix: rescan_fc_hosts() in FC.pm had the same bug in its
+      post-LIP SCSI scan loop. Now only iterates FC hosts from
+      /sys/class/fc_host/ (already enumerated via get_fc_hosts()).
+  * Background:
+    A customer upgraded from v0.1.9 through v0.2.3 to v0.2.4 on a
+    production HPE ProLiant server. After v0.2.3 the node hit
+    "sysfs write to host1/scan timed out" warnings on every VM
+    operation touching the plugin storage, leading to cascading VM
+    lock timeouts and eventually pvedaemon restart hanging during
+    v0.2.4 postinst upgrade. The previous releases had sysfs_write
+    timeout protection (added in v0.2.0) which kept the parent
+    process alive but left the D-state child child pinning the
+    kernel scan lock for host1. The proper fix is to not write to
+    host1 at all -- it is a hardware RAID controller, not an iSCSI
+    target. This release finally addresses that architectural
+    mistake that has existed since v0.1.0.
+
+ -- Jason Cheng <jason@jason.tools>  Fri, 10 Apr 2026 12:00:00 +0800
+
 jt-pve-storage-netapp (0.2.4-1) stable; urgency=high
 
   * Cleanup Path Hardening + Concurrency + Operator UX Release

@@ -286,9 +286,46 @@ sub _run_cmd {
 sub rescan_scsi_hosts {
     my (%opts) = @_;
 
-    opendir(my $dh, SCSI_HOST_PATH) or croak "Cannot open " . SCSI_HOST_PATH . ": $!";
+    # Only rescan iSCSI hosts. Writing "- - -" to a non-iSCSI host's
+    # /sys/class/scsi_host/hostN/scan file triggers a driver-side full
+    # target rescan, which can hang for hundreds of seconds inside HBA
+    # drivers. Observed in production on HPE ProLiant servers with the
+    # smartpqi driver (P408i-a controller): writes to the scan file
+    # enter D-state for 600+ seconds in sas_user_scan, and every
+    # subsequent process that touches /sys/class/scsi_host/hostN
+    # serializes behind the first D-state child. This cascades into:
+    #   - pvedaemon worker cannot release VM config lock
+    #   - pvestatd cannot complete status() poll
+    #   - VM operations hit lock timeouts
+    #   - pvedaemon restart also hangs on storage scan
+    # Fix: source the host list from /sys/class/iscsi_host/ instead of
+    # /sys/class/scsi_host/. The scsi_transport_iscsi layer registers
+    # every iSCSI host (regardless of underlying driver: iscsi_tcp,
+    # iser, bnx2i, qla4xxx, qedi, be2iscsi, cxgb3i, cxgb4i, and any
+    # future iSCSI driver that uses iscsi_host_alloc()) into
+    # /sys/class/iscsi_host/. Non-iSCSI hosts (SAS HBAs, RAID
+    # controllers, USB, NVMe, virtio-scsi, etc.) are categorically
+    # absent from that class, so iterating it is both exhaustive and
+    # safe.
+    #
+    # For FC, see rescan_fc_hosts() in FC.pm which uses /sys/class/fc_host/
+    # with the same architectural principle.
+
+    my $iscsi_class = '/sys/class/iscsi_host';
+    if (! -d $iscsi_class) {
+        # iSCSI transport subsystem not loaded at all -- nothing to do.
+        # This can happen on FC-only setups; the FC code path uses
+        # rescan_fc_hosts() instead and never calls this function.
+        return 1;
+    }
+
+    opendir(my $dh, $iscsi_class) or return 1;
     my @hosts = grep { /^host\d+$/ } readdir($dh);
     closedir($dh);
+
+    # No iSCSI hosts registered yet (e.g. storage not activated,
+    # or all iSCSI sessions disconnected). Nothing for us to rescan.
+    return 1 unless @hosts;
 
     for my $host (@hosts) {
         # Untaint host name (validated by grep above)

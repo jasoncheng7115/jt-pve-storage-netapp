@@ -2,6 +2,29 @@
 
 All notable changes to the NetApp ONTAP Storage Plugin for Proxmox VE are documented here.
 
+## [0.2.5] - 2026-04-10
+
+### Non-iSCSI SCSI Host Scan Fix Release (CRITICAL)
+
+**Critical Bug Fix (production incident on HPE ProLiant):**
+
+- **Fixed `rescan_scsi_hosts()` and `rescan_fc_hosts()` writing to non-iSCSI / non-FC hosts.** Both functions iterated all entries in `/sys/class/scsi_host/` and wrote `"- - -"` to every `hostN/scan` file. This included non-iSCSI / non-FC hosts like HBA RAID controllers, USB card readers, virtio-scsi, etc. Writing to a non-iSCSI host's scan file triggers a driver-side full target rescan which can hang for hundreds of seconds inside some drivers.
+
+  **Observed production symptom** on an HPE ProLiant server with `smartpqi` driver (P408i-a controller): writes to `host1/scan` entered D-state for 10+ minutes in `sas_user_scan`, serializing every subsequent process that touched `/sys/class/scsi_host/host1`. This cascaded into:
+  - pvedaemon workers unable to release VM config locks, causing repeated `trying to acquire lock... got timeout` errors on VM operations
+  - pvestatd unable to complete `status()` polls
+  - `pvedaemon` restart hanging indefinitely during `dpkg --configure`, making plugin upgrades silently fail
+  - VM operations (move-disk, resize, config update, boot order change) intermittently hanging even on working-path storage
+
+  The `sysfs_write_with_timeout()` protection added in v0.2.0 kept the parent process alive (10s timeout), but the child process was stuck in D-state (uninterruptible sleep) pinning the kernel's scan lock for host1. `SIGKILL` cannot reap D-state processes, so the lock persisted until the kernel driver's own timeout expired (~10 minutes), by which time the next PVE operation had already queued up behind it and the cycle repeated.
+
+- **Fix:** `rescan_scsi_hosts()` now sources the host list from `/sys/class/iscsi_host/` (maintained by the kernel's `scsi_transport_iscsi` layer). Every iSCSI SCSI host registers there regardless of underlying driver (`iscsi_tcp`, `iser`, `bnx2i`, `qla4xxx`, `qedi`, `be2iscsi`, `cxgb3i`, `cxgb4i`, and any future iSCSI driver via `iscsi_host_alloc()`). Non-iSCSI hosts are categorically absent from that class, so iteration is both exhaustive and safe. **Future-proof**: new iSCSI drivers added to the kernel are picked up automatically without plugin code changes.
+
+- **Fix:** `rescan_fc_hosts()` in `FC.pm` had the same bug in its post-LIP SCSI scan loop. Now only iterates FC hosts from `/sys/class/fc_host/` (already enumerated via `get_fc_hosts()`).
+
+**Architectural lesson:**
+This bug existed since v0.1.0. Previous releases protected the parent process from hanging but did not prevent the write from reaching the kernel. The correct fix is not to write to non-iSCSI hosts at all -- they are categorically irrelevant to plugin-managed iSCSI LUNs. See `PVE_STORAGE_PLUGIN_DEV_GUIDE.md` Incident 8 for the full analysis.
+
 ## [0.2.4] - 2026-04-09
 
 ### Cleanup Path Hardening + Concurrency + Operator UX Release

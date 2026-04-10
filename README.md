@@ -178,7 +178,7 @@ systemctl enable --now multipathd
 
 # Step 4: Install the plugin package
 # (Automatically configures multipath and restarts PVE services)
-dpkg -i jt-pve-storage-netapp_0.2.4-1_all.deb
+dpkg -i jt-pve-storage-netapp_0.2.5-1_all.deb
 ```
 
 > **Note:** The plugin automatically:
@@ -223,7 +223,7 @@ apt install -y open-iscsi multipath-tools sg3-utils psmisc \
 systemctl enable --now iscsid multipathd
 
 # Install plugin (auto-configures multipath and restarts PVE services)
-dpkg -i jt-pve-storage-netapp_0.2.4-1_all.deb
+dpkg -i jt-pve-storage-netapp_0.2.5-1_all.deb
 ```
 
 **Installation Order for Clusters:**
@@ -260,7 +260,7 @@ done
 
 ```bash
 # Update plugin package
-dpkg -i jt-pve-storage-netapp_0.2.4-1_all.deb
+dpkg -i jt-pve-storage-netapp_0.2.5-1_all.deb
 ```
 
 The postinst will automatically:
@@ -316,7 +316,7 @@ If something goes wrong, you can downgrade:
 
 ```bash
 # Find previous version in apt cache or download from GitHub releases
-dpkg -i jt-pve-storage-netapp_0.2.1-1_all.deb
+dpkg -i jt-pve-storage-netapp_<previous-version>-1_all.deb
 
 # Restore multipath.conf if you modified it
 cp /etc/multipath.conf.bak.<timestamp> /etc/multipath.conf
@@ -971,7 +971,7 @@ storage: No such storage
 **Solution:**
 ```bash
 # Install on the affected node
-dpkg -i jt-pve-storage-netapp_0.2.4-1_all.deb
+dpkg -i jt-pve-storage-netapp_0.2.5-1_all.deb
 apt install -f
 systemctl restart pvedaemon pveproxy
 ```

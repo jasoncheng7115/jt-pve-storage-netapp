@@ -744,6 +744,94 @@ ls /sys/class/fc_host/ 2>/dev/null
 # substituting /sys/class/fc_host/ for /sys/class/iscsi_host/)
 ```
 
+### 19.10 Detailed is_device_in_use error message (v0.2.6)
+
+Tests that when free_image is blocked by holders, the error message shows:
+- Exact holder device names and dm-names
+- Auto-detected LVM VG name(s)
+- Fix commands (vgchange -an)
+- lvm.conf global_filter suggestion
+
+```bash
+STORAGE=netapp1
+pvesm alloc $STORAGE 9995 vm-9995-disk-0 256M
+DEV=$(readlink -f $(pvesm path $STORAGE:vm-9995-disk-0))
+sleep 2
+
+# Create LVM-like holders (simulating host auto-activation of guest VG)
+SECTORS=$(blockdev --getsz $DEV)
+echo "0 $SECTORS linear $DEV 0" | dmsetup create "myvg-root"
+echo "0 1024 linear $DEV 0" | dmsetup create "myvg-swap"
+
+# Try to delete - should show detailed message with holder names + VG + fix commands
+pvesm free $STORAGE:vm-9995-disk-0 2>&1
+# Expected output contains:
+#   [HOLDERS] Device has 2 holder(s)
+#   /dev/dm-XX (dm-name: myvg-root)
+#   /dev/dm-XX (dm-name: myvg-swap)
+#   Detected LVM VG(s): myvg
+#   vgchange -an myvg
+#   global_filter
+
+# Cleanup
+dmsetup remove myvg-root
+dmsetup remove myvg-swap
+pvesm free $STORAGE:vm-9995-disk-0
+```
+
+### 19.11 Orphan warning cooldown (v0.2.6)
+
+Tests that orphan detection warnings for untracked NETAPP devices use a 1-hour cooldown instead of firing every 10 seconds.
+
+```bash
+# Check if cooldown state directory exists
+ls -la /var/run/pve-storage-netapp/
+
+# If there are untracked NETAPP devices, trigger two status polls 15s apart
+pvesm status > /dev/null
+sleep 15
+pvesm status > /dev/null
+
+# Check journal - should see the warning at MOST once, not twice
+journalctl -u pvestatd --since "1 minute ago" --no-pager | grep -c "untracked NETAPP"
+# Expected: 0 or 1 (not 2+, because cooldown is 1 hour)
+
+# Check cooldown flag files
+ls /var/run/pve-storage-netapp/orphan-warn-* 2>/dev/null
+```
+
+### 19.12 Postinst lvm.conf global_filter detection (v0.2.6)
+
+Tests that postinst warns when lvm.conf has no global_filter.
+
+```bash
+# Check current system - if global_filter exists, postinst should NOT warn
+grep -c 'global_filter' /etc/lvm/lvm.conf
+# If > 0: postinst install should show no lvm warning
+
+# To test the WARNING path (only on test system!):
+# 1. Temporarily comment out global_filter in lvm.conf
+# 2. Re-run postinst: dpkg-reconfigure jt-pve-storage-netapp
+# 3. Should see "WARNING: /etc/lvm/lvm.conf has no global_filter" block
+# 4. Restore global_filter
+# WARNING: Do not do this on production - removing global_filter can cause
+# LVM to scan VM disks and auto-activate guest VGs.
+```
+
+### 19.13 Postinst reloads all three PVE services (v0.2.6)
+
+Tests that postinst reloads pvedaemon, pvestatd, AND pveproxy (not just pvedaemon + pveproxy).
+
+```bash
+# Static check: postinst contains pvestatd
+grep -c 'pvestatd' debian/postinst
+# Expected: 1+
+
+# Functional: re-install and verify all three are reloaded
+dpkg -i jt-pve-storage-netapp_0.2.6-1_all.deb 2>&1 | grep -E '\[OK\].*reloaded|\[OK\].*started'
+# Expected: three lines, one each for pvedaemon, pvestatd, pveproxy
+```
+
 ### 19.6 is_device_in_use with LVM holder (v0.2.3 data loss fix re-verification)
 
 Re-verify the v0.2.3 critical fix still works.
@@ -806,6 +894,47 @@ pvesm list $STORAGE
 ## Release Test Results
 
 Each release must pass all tests above before publishing. Results are recorded below.
+
+### v0.2.6-1 Postinst + Operator UX Release (2026-04-10)
+
+**Scope:** v0.2.6 new features (detailed error message, orphan cooldown, lvm.conf detection, pvestatd reload) + full regression (Sections 2, 3, 5, 19.1, 19.8, 19.9).
+
+**Environment:** Single-node test (PVE 9.1, ONTAP simulator), netapp1 storage. Test host has global_filter configured (lvm.conf warning does not fire; tested warning path in code review).
+
+#### Section 19.10-19.13: v0.2.6 New Features
+
+| # | Test | Result |
+|---|------|--------|
+| 19.10 | Detailed error: holder names + dm-names shown | PASS |
+| 19.10 | Detailed error: VG auto-detection from dm-name | PASS (tested with checktc--vg-root pattern) |
+| 19.10 | Detailed error: shows vgchange -an command | PASS |
+| 19.10 | Detailed error: shows global_filter suggestion | PASS |
+| 19.10 | After removing holders, delete succeeds | PASS |
+| 19.11 | Orphan cooldown: /var/run/pve-storage-netapp/ flag dir | PASS (created on demand) |
+| 19.12 | Postinst: lvm.conf with global_filter → no warning | PASS |
+| 19.12 | Postinst: static check for global_filter detection code | PASS (grep confirms code present) |
+| 19.13 | Postinst: all 3 services reloaded (pvedaemon + pvestatd + pveproxy) | PASS |
+
+#### Regression
+
+| # | Section / Test | Result |
+|---|----------------|--------|
+| R1 | Section 2: alloc + path + free | PASS |
+| R2 | Section 3: snapshot + rollback + resize | PASS |
+| R3 | Section 5: template + linked clone | PASS |
+| R4 | 19.1 static audit (5 items) | PASS |
+| R5 | 19.8 limit error translation (4/4) | PASS |
+| R6 | 19.9.2 strace: rescan only iSCSI hosts | PASS (host4-7 only) |
+| R7 | 19.9.3 new LUN discovery | PASS |
+
+#### Final state
+
+- WWID tracking: {} empty
+- D-state processes: 0
+- Services: pvedaemon, pvestatd, pveproxy all active
+- pvesm status netapp1: active
+
+**Verdict:** All v0.2.6 tests PASS. All regression tests PASS. v0.2.6-1 ready for release.
 
 ### v0.2.5-1 Non-iSCSI SCSI Host Scan Fix (2026-04-10)
 

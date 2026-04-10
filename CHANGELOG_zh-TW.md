@@ -2,6 +2,32 @@
 
 NetApp ONTAP Storage Plugin for Proxmox VE 的所有重要變更都記錄在此。
 
+## [0.2.6] - 2026-04-10
+
+### Postinst 服務 Reload + Operator UX Release
+
+**Operator UX -- 詳細的 `is_device_in_use` 錯誤訊息:**
+
+- **`free_image()` 刪除被擋時現在會顯示完整診斷資訊。** 之前只顯示 `device is still in use (mounted, has holders, or open by process)`。現在會顯示:具體的 holder 裝置名稱與 dm-name (例如 `/dev/dm-10 (checktc--vg-root)`)、自動偵測的 LVM VG 名稱、根因說明 (宿主機 LVM auto-activation 客體 VG,常見於 PVE 7->8->9 升級且 `lvm.conf` `global_filter` 未設定)、具體修復指令 (`vgchange -an <vg>`)、以及長期解法 (`global_filter` 設定建議)。mount 和 fuser 檢查也會顯示掛載點或 process 詳情。
+
+**殘留警告 Cooldown:**
+
+- **殘留裝置偵測警告從每 10 秒降為每小時一次 (per device)。** `pvestatd` 每 10 秒 poll 一次 `status()`,每次都會跑殘留偵測,對所有 untracked NETAPP multipath 裝置產生警告。在有客戶手動管理 NetApp LUN 的環境下 (非 plugin 管理),同一條警告每 10 秒重複一次,灌爆 journal。現在使用 per-WWID 的 cooldown flag 存在 `/var/run/pve-storage-netapp/` (tmpfs,reboot 後清除,重開機後會再次警告)。
+
+**Postinst -- `lvm.conf` `global_filter` 偵測:**
+
+- **Postinst 現在會檢查 `/etc/lvm/lvm.conf` 是否有 `global_filter` 設定。** 如果沒有,會顯示醒目警告,說明宿主機 LVM 會自動 activate VM disk 裡面的 VG (出現在 plugin 管理的 multipath LUN 上),導致 `is_device_in_use()` 擋住 volume 刪除以及 `move-disk` 的來源清理。顯示建議的 `global_filter` 設定。這是 PVE 7->8->9 升級節點上最常見的 `Cannot delete volume: device is still in use` 錯誤根因。
+
+**Postinst 修復:**
+
+- **新增 `pvestatd` 到 postinst 的服務 reload 清單。** 之前版本只有 restart `pvedaemon` 和 `pveproxy`,**漏掉 `pvestatd`**,導致 pvestatd 在記憶體中繼續跑舊版 plugin code。pvestatd 每 10 秒 poll 一次 `status()`,用的是舊 code 裡未修復的 `rescan_scsi_hosts()`,繼續對非 iSCSI host 寫入,持續產生 D-state child。在客戶的 HPE ProLiant 上 (同 v0.2.5 事件那台),v0.2.5 安裝後 pvestatd 繼續用舊 code 產生 D-state → **永久性 D-state 累積** → 系統無回應 → iLO 硬體 watchdog 觸發強制重開機。現在 postinst 會 reload 全部三個 PVE 服務 (`pvedaemon`、`pvestatd`、`pveproxy`)。
+
+- **postinst 從 `systemctl restart` 改為 `systemctl reload` (SIGHUP)。** PVE::Daemon 收到 SIGHUP 後會原地 re-exec,從 disk 載入新的 Perl module,不需要經過 stop 階段。這避免了 bootstrapping 問題:舊 code 已經產生了 D-state child (無法被 SIGKILL),`systemctl restart` 的 stop 階段會卡在等待這些不可殺的 child。改用 reload 後,完全不需要 stop — process 在原地替換自己,D-state orphan 被 init 接管。
+
+- **如果安裝時服務沒在運行**,postinst 改用 `systemctl start` (reload 需要 active 的服務)。
+
+**正式環境發現:** 客戶 HPE P408i-a 上的 smartpqi D-state child 持續 **4 小時以上**而沒有任何 timeout。kernel 的 `hung_task_timeout_secs` 在 120 秒後只會 log 警告,不會殺 D-state process。這些 child 實際上在 reboot 前是永久性的。任何在新 code 安裝後仍讓某個 PVE service 跑舊 code 的升級路徑,都會產生新的永久性 D-state child。`reload` 做法完全消除了這個空窗期。
+
 ## [0.2.5] - 2026-04-10
 
 ### 非 iSCSI SCSI host 掃描修復 Release (CRITICAL)

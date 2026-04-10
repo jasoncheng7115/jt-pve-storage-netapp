@@ -520,6 +520,94 @@ pvesm path $STORAGE:vm-9990-disk-0
 pvesm free $STORAGE:vm-9990-disk-0
 ```
 
+### 19.10 is_device_in_use 詳細錯誤訊息 (v0.2.6)
+
+測試當 free_image 因 holder 被阻擋時,錯誤訊息顯示:
+- 確切的 holder 裝置名稱和 dm-name
+- 自動偵測的 LVM VG 名稱
+- 修復指令 (vgchange -an)
+- lvm.conf global_filter 建議
+
+```bash
+STORAGE=netapp1
+pvesm alloc $STORAGE 9995 vm-9995-disk-0 256M
+DEV=$(readlink -f $(pvesm path $STORAGE:vm-9995-disk-0))
+sleep 2
+
+# 建立模擬 LVM holder (模擬 host 自動啟用 guest VG 的情境)
+SECTORS=$(blockdev --getsz $DEV)
+echo "0 $SECTORS linear $DEV 0" | dmsetup create "myvg-root"
+echo "0 1024 linear $DEV 0" | dmsetup create "myvg-swap"
+
+# 嘗試刪除 - 應顯示含 holder 名稱 + VG + 修復指令的詳細訊息
+pvesm free $STORAGE:vm-9995-disk-0 2>&1
+# 預期輸出包含:
+#   [HOLDERS] Device has 2 holder(s)
+#   /dev/dm-XX (dm-name: myvg-root)
+#   /dev/dm-XX (dm-name: myvg-swap)
+#   Detected LVM VG(s): myvg
+#   vgchange -an myvg
+#   global_filter
+
+# 清理
+dmsetup remove myvg-root
+dmsetup remove myvg-swap
+pvesm free $STORAGE:vm-9995-disk-0
+```
+
+### 19.11 殘留裝置警告冷卻機制 (v0.2.6)
+
+測試未追蹤的 NETAPP 殘留裝置偵測警告使用 1 小時冷卻時間,而非每 10 秒觸發一次。
+
+```bash
+# 檢查冷卻狀態目錄是否存在
+ls -la /var/run/pve-storage-netapp/
+
+# 若有未追蹤的 NETAPP 裝置,間隔 15 秒觸發兩次 status 輪詢
+pvesm status > /dev/null
+sleep 15
+pvesm status > /dev/null
+
+# 檢查 journal - 警告最多出現一次,不會出現兩次
+journalctl -u pvestatd --since "1 minute ago" --no-pager | grep -c "untracked NETAPP"
+# 預期: 0 或 1 (不會是 2+,因為冷卻時間為 1 小時)
+
+# 檢查冷卻旗標檔案
+ls /var/run/pve-storage-netapp/orphan-warn-* 2>/dev/null
+```
+
+### 19.12 Postinst lvm.conf global_filter 偵測 (v0.2.6)
+
+測試 postinst 在 lvm.conf 沒有 global_filter 時發出警告。
+
+```bash
+# 檢查目前系統 - 若 global_filter 存在,postinst 不應發出警告
+grep -c 'global_filter' /etc/lvm/lvm.conf
+# 若 > 0: postinst 安裝時不應顯示 lvm 警告
+
+# 測試 WARNING 路徑 (僅在測試系統上操作!):
+# 1. 暫時將 lvm.conf 中的 global_filter 註解掉
+# 2. 重新執行 postinst: dpkg-reconfigure jt-pve-storage-netapp
+# 3. 應看到 "WARNING: /etc/lvm/lvm.conf has no global_filter" 區塊
+# 4. 還原 global_filter
+# 警告: 不要在正式環境操作 - 移除 global_filter 會導致
+# LVM 掃描 VM 磁碟並自動啟用 guest VG。
+```
+
+### 19.13 Postinst 重新載入全部三個 PVE 服務 (v0.2.6)
+
+測試 postinst 重新載入 pvedaemon、pvestatd 和 pveproxy (不只 pvedaemon + pveproxy)。
+
+```bash
+# 靜態檢查: postinst 包含 pvestatd
+grep -c 'pvestatd' debian/postinst
+# 預期: 1+
+
+# 功能測試: 重新安裝並驗證三個服務都被重新載入
+dpkg -i jt-pve-storage-netapp_0.2.6-1_all.deb 2>&1 | grep -E '\[OK\].*reloaded|\[OK\].*started'
+# 預期: 三行輸出,分別對應 pvedaemon、pvestatd、pveproxy
+```
+
 ### 19.6 is_device_in_use with LVM holder (v0.2.3 資料遺失修復重驗)
 
 ```bash
@@ -576,6 +664,47 @@ pvesm list $STORAGE
 ## 發佈測試結果
 
 每個版本發佈前都必須通過上述所有測試。結果記錄於下方。
+
+### v0.2.6-1 Postinst + 操作者 UX 改善版 (2026-04-10)
+
+**範圍:** v0.2.6 新功能 (詳細錯誤訊息、殘留警告冷卻、lvm.conf 偵測、pvestatd 重新載入) + 完整 regression (Section 2、3、5、19.1、19.8、19.9)。
+
+**測試環境:** 單節點測試 (PVE 9.1, ONTAP simulator),netapp1 storage。測試主機已設定 global_filter (lvm.conf 警告不會觸發;已透過程式碼審查驗證警告路徑)。
+
+#### Section 19.10-19.13: v0.2.6 新功能
+
+| # | 測試 | 結果 |
+|---|------|------|
+| 19.10 | 詳細錯誤: 顯示 holder 名稱 + dm-name | PASS |
+| 19.10 | 詳細錯誤: 從 dm-name 自動偵測 VG | PASS (以 checktc--vg-root 模式測試) |
+| 19.10 | 詳細錯誤: 顯示 vgchange -an 指令 | PASS |
+| 19.10 | 詳細錯誤: 顯示 global_filter 建議 | PASS |
+| 19.10 | 移除 holder 後刪除成功 | PASS |
+| 19.11 | 殘留警告冷卻: /var/run/pve-storage-netapp/ 旗標目錄 | PASS (按需建立) |
+| 19.12 | Postinst: lvm.conf 含 global_filter 時不發出警告 | PASS |
+| 19.12 | Postinst: 靜態檢查 global_filter 偵測程式碼 | PASS (grep 確認程式碼存在) |
+| 19.13 | Postinst: 全部 3 個服務重新載入 (pvedaemon + pvestatd + pveproxy) | PASS |
+
+#### Regression
+
+| # | Section / 測試 | 結果 |
+|---|----------------|------|
+| R1 | Section 2: alloc + path + free | PASS |
+| R2 | Section 3: snapshot + rollback + resize | PASS |
+| R3 | Section 5: template + linked clone | PASS |
+| R4 | 19.1 靜態稽核 (5 項) | PASS |
+| R5 | 19.8 limit 錯誤訊息翻譯 (4/4) | PASS |
+| R6 | 19.9.2 strace: 僅 rescan iSCSI host | PASS (僅 host4-7) |
+| R7 | 19.9.3 新 LUN 探索 | PASS |
+
+#### 最終狀態
+
+- WWID 追蹤: {} 空
+- D-state 程序: 0
+- 服務: pvedaemon、pvestatd、pveproxy 全部 active
+- pvesm status netapp1: active
+
+**結論:** 全部 v0.2.6 測試 PASS。全部 regression 測試 PASS。v0.2.6-1 可發佈。
 
 ### v0.2.5-1 非 iSCSI SCSI Host 掃描修復 (2026-04-10)
 

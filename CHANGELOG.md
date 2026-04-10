@@ -2,6 +2,32 @@
 
 All notable changes to the NetApp ONTAP Storage Plugin for Proxmox VE are documented here.
 
+## [0.2.6] - 2026-04-10
+
+### Postinst Service Reload + Operator UX Release
+
+**Operator UX -- Detailed `is_device_in_use` Error Messages:**
+
+- **`free_image()` now shows full diagnostics when deletion is blocked.** Previously showed generic `device is still in use (mounted, has holders, or open by process)`. Now shows: exact holder device names and dm-names (e.g. `/dev/dm-10 (checktc--vg-root)`), auto-detected LVM VG name(s), root cause explanation (host LVM auto-activation of guest VGs, common on PVE 7->8->9 upgrades with stale `lvm.conf` `global_filter`), exact fix command (`vgchange -an <vg>`), and long-term `global_filter` suggestion. For mount and fuser checks, also shows mount point or process details.
+
+**Orphan Warning Cooldown:**
+
+- **Reduced orphan detection warning noise from every 10 seconds to once per hour per device.** `pvestatd` polls `status()` every 10 seconds, and each poll ran orphan detection which warned about any untracked NETAPP multipath devices. On systems with customer-managed NetApp LUNs (not plugin-managed), this produced identical warnings every 10 seconds, flooding the journal. Now uses a per-WWID cooldown flag in `/var/run/pve-storage-netapp/` (tmpfs, cleared on reboot so warnings fire again after reboot).
+
+**Postinst -- `lvm.conf` `global_filter` Detection:**
+
+- **Postinst now checks if `/etc/lvm/lvm.conf` has a `global_filter` setting.** If absent, displays a prominent warning explaining that host-level LVM will auto-activate VGs found inside VM disks on plugin-managed LUNs, causing `is_device_in_use()` to block volume deletion and `move-disk` source cleanup. Shows recommended `global_filter` setting. This is the most common root cause of `Cannot delete volume: device is still in use` errors on PVE nodes upgraded from 7->8->9.
+
+**Postinst Fixes:**
+
+- **Added `pvestatd` to the postinst service reload list.** Previous versions only restarted `pvedaemon` and `pveproxy`, leaving `pvestatd` running with old plugin code in memory. `pvestatd` polls `status()` every 10 seconds; with old code it continued creating D-state children from the pre-v0.2.5 `rescan_scsi_hosts()` that wrote to non-iSCSI hosts. On the customer's HPE ProLiant (same node as the v0.2.5 incident), this caused **permanent D-state accumulation even after v0.2.5 was installed**, eventually triggering an iLO hardware watchdog reboot. Now all three PVE services (`pvedaemon`, `pvestatd`, `pveproxy`) are reloaded.
+
+- **Changed postinst from `systemctl restart` to `systemctl reload` (SIGHUP).** PVE::Daemon handles SIGHUP by re-exec'ing itself with the same PID, picking up new Perl modules from disk without going through a stop phase. This avoids the bootstrapping problem where the OLD code has already created D-state children (unkillable by SIGKILL), and `systemctl restart` hangs waiting for them during the stop phase. With reload, no stop is needed -- the process re-execs in-place and D-state orphans are inherited by init.
+
+- **If a service is not running at install time**, postinst uses `systemctl start` instead of reload (reload requires an active service).
+
+**Production finding:** smartpqi D-state children on the customer's HPE P408i-a lasted **4+ hours** without any timeout. The kernel `hung_task_timeout_secs` warning fires at 120s but does NOT kill D-state processes. These children are effectively immortal until reboot. Any upgrade path that leaves any PVE service running old code while new code is installed creates a window where old rescan behavior generates new permanent D-state children. The `reload` approach eliminates this window entirely.
+
 ## [0.2.5] - 2026-04-10
 
 ### Non-iSCSI SCSI Host Scan Fix Release (CRITICAL)

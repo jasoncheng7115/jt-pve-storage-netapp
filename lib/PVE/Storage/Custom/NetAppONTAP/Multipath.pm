@@ -27,6 +27,7 @@ our @EXPORT_OK = qw(
     get_multipath_slaves
     cleanup_lun_devices
     is_device_in_use
+    get_device_usage_details
     sysfs_write_with_timeout
     sysfs_read_with_timeout
     list_netapp_multipath_devices
@@ -783,6 +784,133 @@ sub is_device_in_use {
     }
 
     return 0;  # Device is not in use
+}
+
+# Return a detailed human-readable string explaining WHY a device is in use.
+# Called from free_image() when is_device_in_use() returns true, to give the
+# operator actionable information instead of a generic "device is still in use"
+# message. This is especially important when holders are host-level LVM
+# auto-activation of VGs from inside VM disks (common on PVE nodes upgraded
+# from 7->8->9 with stale /etc/lvm/lvm.conf global_filter).
+sub get_device_usage_details {
+    my ($device) = @_;
+
+    return "device not specified" unless $device;
+    return "device $device does not exist" unless -b $device;
+
+    my $dev_name = _resolve_block_device_name($device);
+    return "cannot resolve device $device to kernel name" unless $dev_name;
+
+    my @reasons;
+
+    # Check 1: mounted?
+    my $mounts = sysfs_read_with_timeout('/proc/mounts', 5);
+    if ($mounts) {
+        for my $line (split /\n/, $mounts) {
+            if ($line =~ /^\Q$device\E\s+(\S+)/ ||
+                $line =~ /^\/dev\/\Q$dev_name\E\s+(\S+)/) {
+                push @reasons, "[MOUNTED] Device is mounted on $1";
+            }
+        }
+    }
+
+    # Check 2: holders?
+    my $holders_dir = "/sys/block/$dev_name/holders";
+    if (-d $holders_dir) {
+        opendir(my $dh, $holders_dir);
+        my @holders = grep { !/^\./ } readdir($dh);
+        closedir($dh);
+
+        if (@holders) {
+            my @holder_lines;
+            my @detected_vgs;
+            my $has_partition = 0;
+
+            for my $h (sort @holders) {
+                my $detail = "/dev/$h";
+
+                # Read device-mapper name from sysfs (e.g., "checktc--vg-root")
+                my $dm_name_file = "/sys/block/$h/dm/name";
+                if (-r $dm_name_file) {
+                    my $dm_name = sysfs_read_with_timeout($dm_name_file, 3);
+                    if ($dm_name) {
+                        chomp $dm_name;
+                        $detail .= " (dm-name: $dm_name)";
+
+                        # LVM dm names: "vgname-lvname" (with doubled hyphens for
+                        # hyphens in vg/lv names: "my--vg-my--lv")
+                        # Partition kpartx names: "<wwid>1", "<wwid>2", etc.
+                        if ($dm_name =~ /^(.*?[^-])-[^-]/) {
+                            my $vg = $1;
+                            $vg =~ s/--/-/g;  # un-double hyphens
+                            push @detected_vgs, $vg
+                                unless grep { $_ eq $vg } @detected_vgs;
+                        } elsif ($dm_name =~ /^3[0-9a-f]{30,}\d+$/ ||
+                                 $dm_name =~ /part\d+$/) {
+                            $has_partition = 1;
+                        }
+                    }
+                }
+
+                push @holder_lines, "    $detail";
+            }
+
+            my $holder_msg = "[HOLDERS] Device has " . scalar(@holders) .
+                             " holder(s) in /sys/block/$dev_name/holders/:\n" .
+                             join("\n", @holder_lines);
+
+            if (@detected_vgs) {
+                $holder_msg .= "\n\n  Detected LVM VG(s): " .
+                               join(", ", @detected_vgs);
+                $holder_msg .= "\n  These are likely host-level LVM auto-activation " .
+                               "of VGs found inside the VM disk.";
+                $holder_msg .= "\n  The host's LVM scanner (/etc/lvm/lvm.conf " .
+                               "global_filter) is not filtering out";
+                $holder_msg .= "\n  plugin-managed multipath devices, so it reads " .
+                               "VG metadata from inside VM disks";
+                $holder_msg .= "\n  and activates them on the host. This is common " .
+                               "on PVE nodes upgraded from 7->8->9.";
+                $holder_msg .= "\n\n  To resolve:";
+                for my $vg (@detected_vgs) {
+                    $holder_msg .= "\n    vgchange -an $vg";
+                }
+                $holder_msg .= "\n  Then retry the delete operation.";
+                $holder_msg .= "\n\n  To prevent recurrence after reboot, add to " .
+                               "/etc/lvm/lvm.conf devices section:";
+                $holder_msg .= "\n    global_filter = [ \"r|/dev/mapper/360.*|\", " .
+                               "\"a|.*|\" ]";
+                $holder_msg .= "\n  (Adjust the regex to match your environment. " .
+                               "Exclude plugin WWID devices, keep local disks.)";
+            } elsif ($has_partition) {
+                $holder_msg .= "\n\n  Partition table detected on this multipath device.";
+                $holder_msg .= "\n  Someone (or the host's LVM/udev) created partitions " .
+                               "on a plugin-managed LUN.";
+                $holder_msg .= "\n  Use 'dmsetup ls' and 'lsblk /dev/$dev_name' to " .
+                               "identify what is using them.";
+            }
+
+            push @reasons, $holder_msg;
+        }
+    }
+
+    # Check 3: open by process?
+    my $safe_device = _untaint_device_path($device);
+    if ($safe_device) {
+        my ($fuser_out, undef, $fuser_exit) = eval {
+            _run_cmd(['/bin/fuser', '-v', $safe_device],
+                timeout => 10, allow_nonzero => 1, ignore_errors => 1);
+        };
+        if (!$@ && defined $fuser_exit && $fuser_exit == 0 && $fuser_out) {
+            chomp $fuser_out;
+            push @reasons, "[PROCESS] Device is open by process(es):\n    $fuser_out";
+        }
+    }
+
+    if (@reasons) {
+        return join("\n\n", @reasons);
+    }
+
+    return "No usage detected (device may have become free after the initial check).";
 }
 
 1;

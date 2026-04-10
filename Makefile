@@ -1,5 +1,5 @@
 PACKAGE = jt-pve-storage-netapp
-VERSION = 0.2.4
+VERSION = 0.2.5
 RELEASE = 1
 
 DESTDIR =

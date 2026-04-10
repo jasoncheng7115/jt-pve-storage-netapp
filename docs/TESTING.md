@@ -641,6 +641,109 @@ for my $c (@cases) {
 # Expected: all 6 lines say PASS
 ```
 
+### 19.9 rescan_scsi_hosts does not touch non-iSCSI hosts (v0.2.5 Bug Incident 8)
+
+Verifies that `rescan_scsi_hosts()` only writes to the scan files of iSCSI
+hosts (sourced from `/sys/class/iscsi_host/`), and never touches non-iSCSI
+hosts like HBA RAID controllers, USB card readers, or virtio-scsi.
+
+#### 19.9.1 Static code audit
+
+```bash
+cd /root/jt-pve-storage-netapp
+
+# Both rescan functions must source host list from transport-specific class
+grep -n 'iscsi_host' lib/PVE/Storage/Custom/NetAppONTAP/Multipath.pm | grep -v '^\s*#'
+# Expected: at least one line referencing /sys/class/iscsi_host (in rescan_scsi_hosts)
+
+grep -n '/sys/class/scsi_host' lib/PVE/Storage/Custom/NetAppONTAP/*.pm | grep -v '^\s*#' | grep -v 'SCSI_HOST_PATH'
+# Expected: zero matches where scsi_host is opendir'd without iscsi_host/fc_host filter
+
+# rescan_scsi_hosts must not directly opendir /sys/class/scsi_host anymore
+perl -ne 'print "$.: $_" if /opendir.*SCSI_HOST_PATH/' lib/PVE/Storage/Custom/NetAppONTAP/Multipath.pm
+# Expected: zero output (rescan_scsi_hosts uses /sys/class/iscsi_host)
+
+# rescan_fc_hosts must not iterate full /sys/class/scsi_host anymore
+perl -ne '
+  if (/sub rescan_fc_hosts/../^}/) {
+    print "$.: $_" if /opendir.*scsi_host/;
+  }
+' lib/PVE/Storage/Custom/NetAppONTAP/FC.pm
+# Expected: zero output (rescan_fc_hosts iterates only FC hosts from get_fc_hosts)
+```
+
+#### 19.9.2 Runtime behavior on mixed-driver host
+
+```bash
+# Verify the test host has at least one non-iSCSI scsi_host (most PVE hosts do:
+# onboard SATA controllers or HBAs produce ahci / mpt3sas / smartpqi / etc.)
+ls /sys/class/scsi_host/
+# Usually host0, host1, ... some of which are non-iSCSI
+
+ls /sys/class/iscsi_host/ 2>/dev/null
+# Should be a strict subset of /sys/class/scsi_host/
+
+# Show driver for each scsi host
+for h in /sys/class/scsi_host/host*; do
+  echo -n "$(basename $h): "
+  cat $h/proc_name 2>/dev/null
+done
+# You should see a mix. Non-iscsi_tcp hosts must NOT be scanned by the plugin.
+
+# Run rescan_scsi_hosts directly and inotify-watch the non-iSCSI hosts'
+# scan files to confirm no writes arrive at them
+ISCSI_HOSTS=$(ls /sys/class/iscsi_host/ 2>/dev/null)
+NONISCSI_HOSTS=$(comm -23 <(ls /sys/class/scsi_host/ | sort) <(echo "$ISCSI_HOSTS" | sort))
+
+# Snapshot non-iSCSI host state before rescan (mtime of scan file)
+for h in $NONISCSI_HOSTS; do
+  stat -c "%n %Y" /sys/class/scsi_host/$h/scan 2>/dev/null
+done > /tmp/scan-before.txt
+
+perl -I/usr/share/perl5 -e "
+use PVE::Storage::Custom::NetAppONTAP::Multipath qw(rescan_scsi_hosts);
+rescan_scsi_hosts(delay => 0);
+print 'rescan done\n';
+"
+
+# Snapshot again after
+for h in $NONISCSI_HOSTS; do
+  stat -c "%n %Y" /sys/class/scsi_host/$h/scan 2>/dev/null
+done > /tmp/scan-after.txt
+
+# Non-iSCSI scan files must NOT have been written
+diff /tmp/scan-before.txt /tmp/scan-after.txt
+# Expected: empty (mtimes unchanged on non-iSCSI hosts)
+# Note: mtime only reliably changes on write, and some kernel versions don't
+# update mtime on sysfs writes. A more robust test would use BPF tracing:
+#   bpftrace -e 'kprobe:vfs_write /str(args->buf) == "- - -\n"/ { printf("%s\n", comm); }'
+```
+
+#### 19.9.3 Functional regression: new LUN discovery still works
+
+```bash
+# Allocate a new LUN via the plugin — this exercises rescan_scsi_hosts
+# after lun_map. If the new filter broke rescan, the device would not
+# appear and pvesm alloc would fail.
+STORAGE=netapp1
+pvesm alloc $STORAGE 9990 vm-9990-disk-0 256M
+pvesm path $STORAGE:vm-9990-disk-0
+# Expected: returns /dev/mapper/<wwid> (new LUN discovered via iSCSI host scan)
+pvesm free $STORAGE:vm-9990-disk-0
+```
+
+#### 19.9.4 FC host filter (same principle, different transport class)
+
+If test environment has FC hosts:
+
+```bash
+# List FC hosts
+ls /sys/class/fc_host/ 2>/dev/null
+# Run rescan_fc_hosts if FC.pm is available in an FC environment
+# Non-FC scsi_hosts must not be touched (same test pattern as 19.9.2 but
+# substituting /sys/class/fc_host/ for /sys/class/iscsi_host/)
+```
+
 ### 19.6 is_device_in_use with LVM holder (v0.2.3 data loss fix re-verification)
 
 Re-verify the v0.2.3 critical fix still works.
@@ -703,6 +806,55 @@ pvesm list $STORAGE
 ## Release Test Results
 
 Each release must pass all tests above before publishing. Results are recorded below.
+
+### v0.2.5-1 Non-iSCSI SCSI Host Scan Fix (2026-04-10)
+
+**Scope:** Section 19.9 (new Bug Incident 8 regression guard) + regression of Sections 1, 2, 3, 5 + v0.2.4 unit tests.
+
+**Environment:** Single-node test (PVE 9.1, ONTAP simulator), netapp1 storage.
+
+**Test host SCSI inventory (important for 19.9.2):**
+- host0-1: virtio_scsi
+- host2-3: ata_piix
+- host4-7: iscsi_tcp
+
+This is a "mixed driver" environment — the fix must only touch host4-7 (iSCSI) and leave host0-3 untouched.
+
+#### Section 19.9: rescan_scsi_hosts iSCSI-only filter
+
+| # | Test | Result |
+|---|------|--------|
+| 19.9.1 | Static audit: `rescan_scsi_hosts` references `/sys/class/iscsi_host` | PASS |
+| 19.9.1 | Static audit: `rescan_scsi_hosts` does not `opendir` `SCSI_HOST_PATH` | PASS |
+| 19.9.1 | Static audit: `rescan_fc_hosts` does not iterate full `/sys/class/scsi_host` | PASS |
+| 19.9.2 | **Strace proof: `rescan_scsi_hosts()` only opens host4-7 scan files, never host0-3** | **PASS** |
+| 19.9.3 | Functional regression: `pvesm alloc` still discovers new LUN via iSCSI rescan | PASS |
+
+**Key strace output (19.9.2):**
+```
+openat(AT_FDCWD, "/sys/class/scsi_host/host4/scan", O_WRONLY|...)
+openat(AT_FDCWD, "/sys/class/scsi_host/host5/scan", O_WRONLY|...)
+openat(AT_FDCWD, "/sys/class/scsi_host/host6/scan", O_WRONLY|...)
+openat(AT_FDCWD, "/sys/class/scsi_host/host7/scan", O_WRONLY|...)
+```
+No opens to host0/1 (virtio_scsi) or host2/3 (ata_piix). Before v0.2.5 would have shown all 8.
+
+#### Regression: Sections 1, 2, 3, 5 + v0.2.4 unit tests
+
+| # | Section / Test | Result |
+|---|----------------|--------|
+| R1 | Section 1: pvesm status | PASS |
+| R2 | Section 2: alloc + path + free | PASS |
+| R3 | Section 3: VM snapshot + rollback + resize + delsnapshot | PASS |
+| R4 | Section 5: template + linked clone | PASS |
+| R5 | v0.2.4 Section 19.8: limit error translation (6/6 cases) | PASS |
+
+**Final state:**
+- WWID tracking: `{}` empty
+- D-state processes: 0
+- pvedaemon / pveproxy: active
+
+**Verdict:** All Section 19.9 tests PASS. All regression tests PASS. v0.2.5-1 ready for release.
 
 ### v0.2.4-1 Audit Fixes Release (2026-04-09)
 

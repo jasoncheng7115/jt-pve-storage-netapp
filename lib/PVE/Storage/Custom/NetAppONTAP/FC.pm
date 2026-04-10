@@ -215,26 +215,31 @@ sub rescan_fc_hosts {
         }
     }
 
-    # Also trigger SCSI host scan for new devices
+    # Also trigger SCSI host scan for new devices on the FC hosts only.
+    #
+    # CRITICAL: do NOT iterate all of /sys/class/scsi_host/. Writing
+    # "- - -" to a non-FC host's scan file (e.g. smartpqi RAID
+    # controllers, USB SD readers, virtio-scsi, megaraid, mpt3sas)
+    # triggers driver-side full rescans that can hang for hundreds of
+    # seconds in HBA/RAID drivers. Observed in production on HPE
+    # ProLiant with smartpqi: 600+ seconds D-state blocking all
+    # subsequent storage operations.
+    #
+    # Instead, only rescan the SCSI hosts corresponding to the FC hosts
+    # we enumerated via /sys/class/fc_host/. Each FC host is also a
+    # SCSI host with the same hostN name, so /sys/class/scsi_host/hostN
+    # maps to /sys/class/fc_host/hostN for the same N.
     my $scsi_host_path = '/sys/class/scsi_host';
-    if (-d $scsi_host_path) {
-        opendir(my $dh, $scsi_host_path) or do {
-            warn "Cannot open $scsi_host_path: $!\n";
-            sleep($opts{delay} // 2);
-            return $rescanned;
-        };
-        for my $host (grep { /^host\d+$/ } readdir($dh)) {
-            # Untaint host name
-            ($host) = $host =~ /^(host\d+)$/;
-            next unless $host;
+    for my $host (@$hosts) {
+        # Untaint host name (comes from get_fc_hosts() which validates)
+        ($host) = $host =~ /^(host\d+)$/;
+        next unless $host;
 
-            my $scan_file = "$scsi_host_path/$host/scan";
-            if (-w $scan_file) {
-                sysfs_write_with_timeout($scan_file, "- - -\n", 10)
-                    or warn "SCSI rescan failed for $host: timed out\n";
-            }
+        my $scan_file = "$scsi_host_path/$host/scan";
+        if (-w $scan_file) {
+            sysfs_write_with_timeout($scan_file, "- - -\n", 10)
+                or warn "SCSI rescan failed for $host: timed out\n";
         }
-        closedir($dh);
     }
 
     # Give the kernel time to discover devices

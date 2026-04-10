@@ -445,6 +445,81 @@ for my $c (@cases) {
 # 預期:6 行都顯示 PASS
 ```
 
+### 19.9 rescan_scsi_hosts 不會碰非 iSCSI host (v0.2.5 Bug Incident 8)
+
+驗證 `rescan_scsi_hosts()` 只對從 `/sys/class/iscsi_host/` 取得的 iSCSI host 寫入 scan 檔案,絕對不碰非 iSCSI host (像是 HBA RAID、USB 讀卡機、virtio-scsi 等)。
+
+#### 19.9.1 靜態程式碼稽核
+
+```bash
+cd /root/jt-pve-storage-netapp
+
+# rescan 函式必須從 transport-specific class 取得 host 清單
+grep -n 'iscsi_host' lib/PVE/Storage/Custom/NetAppONTAP/Multipath.pm | grep -v '^\s*#'
+# 預期: rescan_scsi_hosts 裡至少一行引用 /sys/class/iscsi_host
+
+# rescan_scsi_hosts 不應該直接 opendir /sys/class/scsi_host
+perl -ne 'print "$.: $_" if /opendir.*SCSI_HOST_PATH/' lib/PVE/Storage/Custom/NetAppONTAP/Multipath.pm
+# 預期: 零輸出
+
+# rescan_fc_hosts 不應該迭代整個 /sys/class/scsi_host
+perl -ne '
+  if (/sub rescan_fc_hosts/../^}/) {
+    print "$.: $_" if /opendir.*scsi_host/;
+  }
+' lib/PVE/Storage/Custom/NetAppONTAP/FC.pm
+# 預期: 零輸出
+```
+
+#### 19.9.2 混合 driver 環境下的執行時行為
+
+```bash
+# 確認測試 host 有至少一個非 iSCSI 的 scsi_host
+ls /sys/class/scsi_host/
+
+ls /sys/class/iscsi_host/ 2>/dev/null
+# 應該是 /sys/class/scsi_host/ 的嚴格子集
+
+# 顯示每個 scsi host 的 driver
+for h in /sys/class/scsi_host/host*; do
+  echo -n "$(basename $h): "
+  cat $h/proc_name 2>/dev/null
+done
+# 會看到各種 driver 混雜。非 iscsi_tcp 的 host 絕對不應該被 plugin scan
+
+# 取出非 iSCSI host 清單,執行 rescan 前後比對 scan 檔案有沒有被寫入
+ISCSI_HOSTS=$(ls /sys/class/iscsi_host/ 2>/dev/null)
+NONISCSI_HOSTS=$(comm -23 <(ls /sys/class/scsi_host/ | sort) <(echo "$ISCSI_HOSTS" | sort))
+
+for h in $NONISCSI_HOSTS; do
+  stat -c "%n %Y" /sys/class/scsi_host/$h/scan 2>/dev/null
+done > /tmp/scan-before.txt
+
+perl -I/usr/share/perl5 -e "
+use PVE::Storage::Custom::NetAppONTAP::Multipath qw(rescan_scsi_hosts);
+rescan_scsi_hosts(delay => 0);
+print 'rescan done\n';
+"
+
+for h in $NONISCSI_HOSTS; do
+  stat -c "%n %Y" /sys/class/scsi_host/$h/scan 2>/dev/null
+done > /tmp/scan-after.txt
+
+diff /tmp/scan-before.txt /tmp/scan-after.txt
+# 預期: 空 (非 iSCSI host 的 mtime 沒變)
+```
+
+#### 19.9.3 功能 regression: 新 LUN 還是能被 discover
+
+```bash
+# 新增一個 LUN — 會觸發 rescan_scsi_hosts,如果新的 filter 壞了,新 LUN 無法 discover
+STORAGE=netapp1
+pvesm alloc $STORAGE 9990 vm-9990-disk-0 256M
+pvesm path $STORAGE:vm-9990-disk-0
+# 預期: 回傳 /dev/mapper/<wwid>
+pvesm free $STORAGE:vm-9990-disk-0
+```
+
 ### 19.6 is_device_in_use with LVM holder (v0.2.3 資料遺失修復重驗)
 
 ```bash
@@ -502,6 +577,55 @@ pvesm list $STORAGE
 
 每個版本發佈前都必須通過上述所有測試。結果記錄於下方。
 
+### v0.2.5-1 非 iSCSI SCSI Host 掃描修復 (2026-04-10)
+
+**範圍:** Section 19.9 (新增 Bug Incident 8 regression guard) + Section 1、2、3、5 的 regression + v0.2.4 的單元測試。
+
+**測試環境:** 單節點 PVE 9.1 + ONTAP simulator,netapp1 storage。
+
+**測試 host 的 SCSI 清單 (對 19.9.2 很重要):**
+- host0-1: virtio_scsi
+- host2-3: ata_piix
+- host4-7: iscsi_tcp
+
+這是「混合 driver」環境 — 修復必須只碰 host4-7 (iSCSI),完全不碰 host0-3。
+
+#### Section 19.9: rescan_scsi_hosts 只過濾 iSCSI
+
+| # | 測試 | 結果 |
+|---|------|------|
+| 19.9.1 | 靜態稽核: `rescan_scsi_hosts` 引用 `/sys/class/iscsi_host` | PASS |
+| 19.9.1 | 靜態稽核: `rescan_scsi_hosts` 不再 `opendir` `SCSI_HOST_PATH` | PASS |
+| 19.9.1 | 靜態稽核: `rescan_fc_hosts` 不再迭代整個 `/sys/class/scsi_host` | PASS |
+| 19.9.2 | **strace 證明: `rescan_scsi_hosts()` 只打開 host4-7 的 scan 檔案,完全沒碰 host0-3** | **PASS** |
+| 19.9.3 | 功能 regression: `pvesm alloc` 仍能透過 iSCSI rescan 找到新 LUN | PASS |
+
+**關鍵 strace 輸出 (19.9.2):**
+```
+openat(AT_FDCWD, "/sys/class/scsi_host/host4/scan", O_WRONLY|...)
+openat(AT_FDCWD, "/sys/class/scsi_host/host5/scan", O_WRONLY|...)
+openat(AT_FDCWD, "/sys/class/scsi_host/host6/scan", O_WRONLY|...)
+openat(AT_FDCWD, "/sys/class/scsi_host/host7/scan", O_WRONLY|...)
+```
+完全沒有 open host0/1 (virtio_scsi) 或 host2/3 (ata_piix)。v0.2.5 之前會看到 8 個全部被開。
+
+#### Regression: Sections 1、2、3、5 + v0.2.4 單元測試
+
+| # | 章節 / 測試 | 結果 |
+|---|-------------|------|
+| R1 | Section 1: pvesm status | PASS |
+| R2 | Section 2: alloc + path + free | PASS |
+| R3 | Section 3: VM snapshot + rollback + resize + delsnapshot | PASS |
+| R4 | Section 5: template + linked clone | PASS |
+| R5 | v0.2.4 Section 19.8: limit error translation (6/6 cases) | PASS |
+
+**最終狀態:**
+- WWID tracking: `{}` 空
+- D-state processes: 0
+- pvedaemon / pveproxy: active
+
+**結論:** Section 19.9 全部 PASS。所有 regression 全部 PASS。v0.2.5-1 可以發佈。
+
 ### v0.2.4-1 稽核修復 Release (2026-04-09)
 
 **範圍:** Section 19 (新增 v0.2.4 cleanup 順序 / snapshot 落盤 / 無用程式碼修復測試),加上 Section 1、2、3、5 的 regression。
@@ -526,7 +650,7 @@ pvesm list $STORAGE
 #### Section 19.2 詳細觀察
 
 - 兩個 clones 在 destroy 時都正確觸發 `dmsetup remove --force --retry` fallback (在這個 simulator 帶 legacy `queue_if_no_path` 設定下,這是 v0.2.3 預期行為)
-- Template volume 命中已知的 ONTAP simulator stale clone metadata 錯誤後,`status()` 的 auto-import 自動清除了該孤兒 WWID,證明 v0.2.3 的 cluster 收斂機制在 v0.2.4 仍正常運作
+- Template volume 命中已知的 ONTAP simulator stale clone metadata 錯誤後,`status()` 的 auto-import 自動清除了該殘留 WWID,證明 v0.2.3 的 cluster 收斂機制在 v0.2.4 仍正常運作
 
 #### Section 19.6 詳細觀察
 

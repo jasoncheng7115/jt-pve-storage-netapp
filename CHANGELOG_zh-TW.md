@@ -2,6 +2,29 @@
 
 NetApp ONTAP Storage Plugin for Proxmox VE 的所有重要變更都記錄在此。
 
+## [0.2.5] - 2026-04-10
+
+### 非 iSCSI SCSI host 掃描修復 Release (CRITICAL)
+
+**重大 Bug 修復 (HPE ProLiant 正式環境事件):**
+
+- **修復 `rescan_scsi_hosts()` 與 `rescan_fc_hosts()` 會對非 iSCSI / 非 FC host 寫入。** 兩個 function 原本都會迭代 `/sys/class/scsi_host/` 下的所有條目,然後對每個 `hostN/scan` 檔案寫入 `"- - -"`。這包含了非 iSCSI / 非 FC 的 host,例如硬體 RAID 控制器、USB 讀卡機、virtio-scsi 等等。對非 iSCSI host 的 scan 檔案寫入會觸發 driver 端的完整 target 重掃,在某些 driver 裡可能卡上數百秒。
+
+  **正式環境觀察到的症狀** 發生在一台 HPE ProLiant 伺服器,使用 `smartpqi` driver (P408i-a 控制器): 寫入 `host1/scan` 進入 D-state 超過 10 分鐘,卡在 `sas_user_scan`,使**每一個**後續存取 `/sys/class/scsi_host/host1` 的 process 都必須排在它後面。連鎖效應:
+  - pvedaemon worker 無法釋放 VM config lock,客戶看到 VM 操作反覆出現 `trying to acquire lock... got timeout`
+  - pvestatd 無法完成 `status()` poll
+  - `pvedaemon` 在 `dpkg --configure` 期間 restart 永遠卡住,plugin 升級變相失敗
+  - VM 操作 (move-disk、resize、config update、開機順序調整) 即使 storage 路徑完全健康也會間歇性卡住
+
+  v0.2.0 加的 `sysfs_write_with_timeout()` 保護讓 parent process 不會跟著卡 (10 秒 timeout),但 child process 進入 D-state (uninterruptible sleep),持續占著 kernel 對 host1 的 scan lock。`SIGKILL` 無法 reap D-state process,所以 lock 會一直持續直到 kernel driver 自己的 timeout 過期 (約 10 分鐘),這時下一個 PVE 操作又已經排到後面,循環繼續。
+
+- **修復方式:** `rescan_scsi_hosts()` 改從 `/sys/class/iscsi_host/` 取得 host 清單 (由 kernel 的 `scsi_transport_iscsi` 層維護)。所有 iSCSI SCSI host 都會註冊到這個 class,不論底層 driver 是什麼 (`iscsi_tcp`、`iser`、`bnx2i`、`qla4xxx`、`qedi`、`be2iscsi`、`cxgb3i`、`cxgb4i`,以及任何未來透過 `iscsi_host_alloc()` 註冊的 iSCSI driver)。非 iSCSI host 絕對不會出現在這個 class,所以迭代它既完整又安全。**未來相容**: kernel 新加的 iSCSI driver 會被自動涵蓋,plugin 不用改 code。
+
+- **修復方式:** `FC.pm` 的 `rescan_fc_hosts()` 在 post-LIP 的 SCSI scan loop 有一樣的 bug。現在只迭代從 `/sys/class/fc_host/` 來的 FC host (透過 `get_fc_hosts()` 已經 enumerate 過)。
+
+**架構層級的教訓:**
+這個 bug 從 v0.1.0 就存在了。之前的版本只是保護 parent process 不會跟著 hang,並沒有真的阻止寫入到達 kernel。正確的解法是**根本不要對非 iSCSI host 寫入** — 那些 host 跟 plugin 管理的 iSCSI LUN 完全無關。詳細分析見 `PVE_STORAGE_PLUGIN_DEV_GUIDE.md` Incident 8。
+
 ## [0.2.4] - 2026-04-09
 
 ### Cleanup 路徑強化 + 並行 + Operator UX Release

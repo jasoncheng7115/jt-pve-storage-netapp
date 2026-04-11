@@ -2,6 +2,20 @@
 
 All notable changes to the NetApp ONTAP Storage Plugin for Proxmox VE are documented here.
 
+## [0.2.8] - 2026-04-11
+
+### Code Review Fix Release
+
+**Bug Fixes (from automated code review):**
+
+- **Fixed orphan cleanup unconditionally untracking WWIDs.** `_cleanup_orphaned_devices()` previously called `_untrack_wwid()` after `cleanup_lun_devices()` regardless of whether the device was actually removed. Now mirrors `free_image()` logic: only untracks if `get_multipath_device()` confirms the device is gone. Prevents permanently orphaned devices when cleanup partially fails (e.g. kpartx holders blocking multipath -f).
+
+- **Fixed `alloc_image()` TOCTOU race retry.** The `volume_create()` race handler was single-shot (one retry). Now uses a proper bounded retry loop (max 5 iterations) matching `clone_image()` pattern. Multiple concurrent `alloc_image()` calls on the same VM no longer fail after the first collision.
+
+- **Removed all `multipath -F` (capital F) recommendations** from code and documentation. `deactivate_storage()` API-unreachable warning no longer suggests `multipath -F`. Documentation (CONFIGURATION.md, README.md, both zh-TW) no longer recommends it as a cleanup command. Only per-WWID cleanup (`multipath -f <wwid>`) is recommended. All existing warnings about the dangers of `-F` are preserved.
+
+- **Fixed bare `glob()` without alarm timeout** in `ISCSI.pm get_device_by_serial()`. The `/dev/disk/by-id/` glob call is now wrapped in `alarm(5)` per anti-hang rules, matching all other glob calls in the codebase.
+
 ## [0.2.7] - 2026-04-11
 
 ### kpartx Partition Holder Fix Release (CRITICAL)

@@ -426,9 +426,17 @@ sub get_device_by_serial {
     my $mpath = _find_multipath_device($serial);
     return $mpath if $mpath;  # Already untainted
 
-    # Fall back to /dev/disk/by-id
+    # Fall back to /dev/disk/by-id (with timeout to prevent hang on
+    # unresponsive device subsystem -- same anti-hang rule as Multipath.pm)
     (my $safe_serial = $serial) =~ s/([\[\]{}*?\\])/\\$1/g;
-    my @devices = glob("/dev/disk/by-id/scsi-*$safe_serial*");
+    my @devices;
+    eval {
+        local $SIG{ALRM} = sub { die "timeout\n" };
+        alarm(5);
+        @devices = glob("/dev/disk/by-id/scsi-*$safe_serial*");
+        alarm(0);
+    };
+    alarm(0);  # ensure alarm is cleared on any exit path
     if (@devices) {
         return _untaint_device_path($devices[0]);
     }

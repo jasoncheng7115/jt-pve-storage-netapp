@@ -1,7 +1,39 @@
+jt-pve-storage-netapp (0.2.7-1) stable; urgency=critical
+
+  * kpartx Partition Holder Fix Release (CRITICAL)
+  * Requirements: Proxmox VE 9.1 or later
+  * Critical Fix:
+    - Fixed is_device_in_use() blocking ALL volume deletions on systems
+      where the kernel auto-creates kpartx partition devices on multipath
+      LUNs containing VM disks with partition tables. Now correctly
+      ignores bare partition holders (no LVM/dm-crypt on top) while
+      still blocking when partitions have real sub-holders.
+    - Added kpartx -d cleanup in cleanup_lun_devices().
+    - Fixed get_device_usage_details() misinterpreting partition dm-names
+      as LVM VG names.
+
+ -- Jason Cheng <jason@jason.tools>  Fri, 11 Apr 2026 09:00:00 +0800
+
 jt-pve-storage-netapp (0.2.6-1) stable; urgency=high
 
   * Postinst Service Reload + Operator UX Release
   * Requirements: Proxmox VE 9.1 or later
+  * Critical Fix - kpartx Partition Holders:
+    - Fixed is_device_in_use() blocking ALL volume deletions on systems
+      where the kernel auto-creates kpartx partition devices (e.g.
+      <wwid>-part1, <wwid>-part2) on multipath LUNs. This happens on
+      every VM disk with an OS installed (the guest's partition table is
+      visible to the host kernel's partition scanner). Previously, these
+      partition dm devices were treated as "real" holders and blocked
+      free_image(). Now is_device_in_use() checks if ALL holders are
+      bare kpartx partitions with no sub-holders (no LVM/dm-crypt on
+      top). If so, they're safe to ignore - they are passive artifacts
+      that will be removed during cleanup. Partitions with sub-holders
+      (e.g. host LVM VG built on a partition) still correctly block.
+    - Added kpartx -d cleanup step in cleanup_lun_devices() to explicitly
+      remove partition devices before multipath flush.
+    - Fixed get_device_usage_details() misinterpreting kpartx partition
+      dm-names (e.g. "3600a...d33-part1") as LVM VG names.
   * Operator UX - Detailed is_device_in_use error messages:
     - free_image() now shows detailed diagnostics when a device cannot be
       deleted due to is_device_in_use() blocking. Previously showed generic

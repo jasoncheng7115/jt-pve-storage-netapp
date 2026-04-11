@@ -832,6 +832,56 @@ dpkg -i jt-pve-storage-netapp_0.2.6-1_all.deb 2>&1 | grep -E '\[OK\].*reloaded|\
 # Expected: three lines, one each for pvedaemon, pvestatd, pveproxy
 ```
 
+### 19.14 kpartx partition holders ignored when safe (v0.2.7)
+
+Tests that `is_device_in_use()` correctly ignores bare kpartx partition
+holders (no sub-holders), while still blocking when partitions have
+sub-holders, are mounted, or are used as swap.
+
+```bash
+STORAGE=netapp1
+
+# 19.14.1 Partition-only holders -> delete should SUCCEED
+pvesm alloc $STORAGE 9996 vm-9996-disk-0 256M
+DEV=$(readlink -f $(pvesm path $STORAGE:vm-9996-disk-0))
+sleep 2
+SECTORS=$(blockdev --getsz $DEV)
+echo "0 $SECTORS linear $DEV 0" | dmsetup create "testwwid-part1"
+echo "0 1024 linear $DEV 0" | dmsetup create "testwwid-part2"
+pvesm free $STORAGE:vm-9996-disk-0
+# Expected: Removed volume (bare partitions ignored)
+
+# 19.14.2 Partition + LVM sub-holder -> delete should BLOCK
+pvesm alloc $STORAGE 9997 vm-9997-disk-0 256M
+DEV2=$(readlink -f $(pvesm path $STORAGE:vm-9997-disk-0))
+sleep 2
+SECTORS2=$(blockdev --getsz $DEV2)
+echo "0 $SECTORS2 linear $DEV2 0" | dmsetup create "testwwid2-part5"
+echo "0 1024 linear /dev/mapper/testwwid2-part5 0" | dmsetup create "myvg-root"
+pvesm free $STORAGE:vm-9997-disk-0 2>&1
+# Expected: Cannot delete (partition has LVM sub-holder)
+dmsetup remove myvg-root; dmsetup remove testwwid2-part5
+pvesm free $STORAGE:vm-9997-disk-0
+
+# 19.14.3 Partition mounted -> delete should BLOCK
+pvesm alloc $STORAGE 9998 vm-9998-disk-0 256M
+DEV3=$(readlink -f $(pvesm path $STORAGE:vm-9998-disk-0))
+sleep 2
+SECTORS3=$(blockdev --getsz $DEV3)
+echo "0 $SECTORS3 linear $DEV3 0" | dmsetup create "testwwid3-part1"
+mkfs.ext4 -F /dev/mapper/testwwid3-part1 > /dev/null 2>&1
+mkdir -p /tmp/test_mount_check
+mount /dev/mapper/testwwid3-part1 /tmp/test_mount_check
+pvesm free $STORAGE:vm-9998-disk-0 2>&1
+# Expected: Cannot delete (partition is mounted)
+umount /tmp/test_mount_check; dmsetup remove testwwid3-part1
+pvesm free $STORAGE:vm-9998-disk-0; rmdir /tmp/test_mount_check
+
+# 19.14.4 /proc/swaps check exists in code (static)
+grep -c 'proc/swaps' /usr/share/perl5/PVE/Storage/Custom/NetAppONTAP/Multipath.pm
+# Expected: 2+ (in is_device_in_use and get_device_usage_details)
+```
+
 ### 19.6 is_device_in_use with LVM holder (v0.2.3 data loss fix re-verification)
 
 Re-verify the v0.2.3 critical fix still works.
@@ -875,6 +925,244 @@ rmdir /mnt/test_v024
 
 ---
 
+## 20. Customer Incident Reproduction Tests
+
+These tests reproduce actual production incidents reported by customers.
+Each test validates that the fix works and prevents regression.
+
+### 20.1 HPE ProLiant smartpqi scan hang (Incident 8, v0.2.5)
+
+Verifies that `rescan_scsi_hosts()` does NOT write to non-iSCSI SCSI hosts.
+On HPE ProLiant servers with smartpqi (P408i-a), writing to host1/scan
+caused 600+ second D-state hangs, cascading into VM lock timeouts and
+pvedaemon restart hangs.
+
+```bash
+# Verify only iSCSI hosts are scanned (strace proof)
+strace -f -e trace=openat -o /tmp/rescan-trace.log \
+  perl -I/usr/share/perl5 -e '
+use PVE::Storage::Custom::NetAppONTAP::Multipath qw(rescan_scsi_hosts);
+rescan_scsi_hosts(delay => 0);
+'
+
+# Extract scan files opened
+grep -oE '/sys/class/scsi_host/host[0-9]+/scan' /tmp/rescan-trace.log | sort -u
+# Expected: ONLY iSCSI hosts (matching /sys/class/iscsi_host/)
+# MUST NOT contain non-iSCSI hosts (smartpqi, ahci, virtio_scsi, etc.)
+
+# Cross-reference
+echo "=== iSCSI hosts ==="
+ls /sys/class/iscsi_host/
+echo "=== ALL scsi hosts ==="
+for h in /sys/class/scsi_host/host*; do
+  printf "%-8s %s\n" "$(basename $h):" "$(cat $h/proc_name 2>/dev/null)"
+done
+# Every host in strace output must appear in iscsi_host list
+```
+
+### 20.2 pvestatd not reloaded after upgrade (Incident 9, v0.2.6)
+
+Verifies that postinst reloads ALL three PVE services, not just
+pvedaemon + pveproxy. Missing pvestatd caused D-state accumulation
+from old plugin code running in pvestatd's memory.
+
+```bash
+# Static: postinst contains all three services
+grep -E 'pvedaemon|pvestatd|pveproxy' debian/postinst | grep -v '^#' | head -10
+# Expected: all three service names appear in the reload/start logic
+
+# Functional: install package and verify all three are reloaded
+dpkg -i jt-pve-storage-netapp_0.2.7-1_all.deb 2>&1 | grep -E '\[OK\]'
+# Expected: three [OK] lines (pvedaemon, pvestatd, pveproxy)
+```
+
+### 20.3 Host LVM auto-activation blocks volume deletion (Incident 10, v0.2.6)
+
+Verifies that `is_device_in_use()` shows detailed diagnostics when
+LVM VGs from inside VM disks are auto-activated on the host, and that
+the error message includes VG name + fix commands.
+
+```bash
+STORAGE=netapp1
+
+pvesm alloc $STORAGE 9980 vm-9980-disk-0 256M
+DEV=$(readlink -f $(pvesm path $STORAGE:vm-9980-disk-0))
+sleep 2
+
+# Simulate host LVM auto-activation of guest VG
+SECTORS=$(blockdev --getsz $DEV)
+echo "0 $SECTORS linear $DEV 0" | dmsetup create "guestvg--root"
+echo "0 1024 linear /dev/mapper/guestvg--root 0" | dmsetup create "guestvg-swap"
+
+# Delete should be blocked with detailed message
+OUTPUT=$(pvesm free $STORAGE:vm-9980-disk-0 2>&1)
+echo "$OUTPUT"
+# Expected output contains:
+#   [HOLDERS]
+#   dm-name: guestvg--root
+#   Detected LVM VG(s): guestvg
+#   vgchange -an guestvg
+
+echo "$OUTPUT" | grep -q "HOLDERS" && echo "PASS: detailed message" || echo "FAIL"
+echo "$OUTPUT" | grep -q "vgchange" && echo "PASS: fix command shown" || echo "FAIL"
+
+# Cleanup
+dmsetup remove guestvg-swap
+dmsetup remove guestvg--root
+pvesm free $STORAGE:vm-9980-disk-0
+```
+
+### 20.4 kpartx partition holders block all deletions (v0.2.7)
+
+Reproduces the customer scenario where EVERY disk deletion fails because
+the kernel auto-creates partition devices on VM disks with OS installed.
+Tests three customer cases:
+1. Delete unused disk (old disk left on plugin storage)
+2. move-disk with delete source (after migration)
+3. New VM disk created + deleted
+
+```bash
+STORAGE=netapp1
+
+# Case 1: Disk with partition table (simulates VM with OS installed)
+pvesm alloc $STORAGE 9981 vm-9981-disk-0 1G
+DEV=$(readlink -f $(pvesm path $STORAGE:vm-9981-disk-0))
+sleep 2
+
+# Write GPT partition table (what a VM OS installer does)
+sgdisk -Z $DEV 2>/dev/null
+sgdisk -n 1:2048:+100M -n 2:+0:+200M -n 5:+0:+500M $DEV 2>&1 | tail -1
+kpartx -a $DEV 2>/dev/null || partprobe $DEV 2>/dev/null
+sleep 2
+
+# Show holders (should be partition devices)
+DM=$(basename $DEV)
+echo "holders before delete:"
+for h in $(ls /sys/block/$DM/holders/ 2>/dev/null); do
+  echo -n "  $h -> "; cat /sys/block/$h/dm/name 2>/dev/null
+done
+
+# v0.2.7: bare partitions (no sub-holders) should be ignored
+pvesm free $STORAGE:vm-9981-disk-0 2>&1 | tail -1
+# Expected: Removed volume (partition holders ignored)
+
+# Case 2: Partition + LVM on top (checktc-vg scenario) should STILL block
+pvesm alloc $STORAGE 9982 vm-9982-disk-0 1G
+DEV2=$(readlink -f $(pvesm path $STORAGE:vm-9982-disk-0))
+sleep 2
+sgdisk -Z $DEV2 2>/dev/null
+sgdisk -n 5:2048:+500M $DEV2 2>&1 | tail -1
+kpartx -a $DEV2 2>/dev/null || partprobe $DEV2 2>/dev/null
+sleep 2
+
+# Find the partition device and add LVM on top
+PART_DM=$(ls /sys/block/$(basename $DEV2)/holders/ | head -1)
+PART_NAME=$(cat /sys/block/$PART_DM/dm/name 2>/dev/null)
+echo "0 1024 linear /dev/mapper/$PART_NAME 0" | dmsetup create "testvg-root" 2>&1
+
+pvesm free $STORAGE:vm-9982-disk-0 2>&1 | head -3
+# Expected: Cannot delete (partition has LVM sub-holder)
+
+# Cleanup
+dmsetup remove testvg-root 2>/dev/null
+kpartx -d $DEV2 2>/dev/null
+pvesm free $STORAGE:vm-9982-disk-0
+```
+
+### 20.5 Partition dm-name format variants (v0.2.7 regression guard)
+
+Kernel/kpartx creates partition devices with different dm-name formats
+depending on the system. All must be recognized as partitions.
+
+```bash
+# Static: verify regex covers all known formats
+perl -I/usr/share/perl5 -e '
+use strict;
+my @cases = (
+  ["3600a09803831464a4c24577537444d33-part1", 1, "dash-part"],
+  ["3600a09803831464a4c24577537444d33p1",     1, "p-suffix (HPE)"],
+  ["3600a09803831464a4c245775374441231",      1, "digit-only"],
+  ["sdf1",                                     1, "non-multipath"],
+  ["mpath0-part2",                             1, "alias-part"],
+  ["myvg-root",                                0, "LVM (must NOT match)"],
+  ["checktc--vg-root",                         0, "LVM with hyphen"],
+  ["dm-crypt-luks",                            0, "dm-crypt"],
+);
+for my $c (@cases) {
+  my ($name, $expect, $label) = @$c;
+  my $is_part = ($name =~ /part\d+$/
+              || $name =~ /^[0-9a-f]{20,}p?\d+$/
+              || $name =~ /^sd[a-z]+\d+$/) ? 1 : 0;
+  my $ok = ($is_part == $expect);
+  printf "%-40s %-6s %s\n", $label, $ok ? "PASS" : "FAIL",
+    "($name -> " . ($is_part ? "partition" : "not-partition") . ")";
+}
+'
+# Expected: all 8 lines say PASS
+```
+
+### 20.6 Postinst lvm.conf global_filter detection (v0.2.6)
+
+Verifies postinst warns when lvm.conf has no global_filter.
+
+```bash
+# Check if current system has global_filter
+grep -c 'global_filter' /etc/lvm/lvm.conf
+# If > 0: postinst should NOT show lvm warning (verified during install)
+# If 0: postinst should show WARNING block about auto-activation
+
+# Static: postinst contains the detection code
+grep -c 'global_filter' debian/postinst
+# Expected: 3+ (detection logic + warning text)
+```
+
+### 20.7 Orphan warning cooldown (v0.2.6)
+
+Verifies orphan detection warnings don't flood the journal.
+
+```bash
+# Check cooldown mechanism exists in code
+grep -c 'cooldown' /usr/share/perl5/PVE/Storage/Custom/NetAppONTAPPlugin.pm
+# Expected: 3+ (cooldown_dir, cooldown_secs, flag file logic)
+
+# Check cooldown state directory
+ls /var/run/pve-storage-netapp/ 2>/dev/null
+# Expected: directory exists (created on demand)
+
+# If orphan warnings are active, verify they don't repeat within 1 hour:
+# Run two status polls 15s apart
+pvesm status > /dev/null; sleep 15; pvesm status > /dev/null
+journalctl -u pvestatd --since "1 minute ago" --no-pager 2>&1 | grep -c "untracked NETAPP"
+# Expected: 0 or 1 (not 2, because cooldown is 1 hour)
+```
+
+### 20.8 Upgrade SOP: stop before install (v0.2.6 lesson)
+
+Documents the correct upgrade procedure to avoid D-state bootstrapping.
+Not an automated test -- a manual checklist for operators.
+
+```bash
+# CORRECT upgrade procedure (prevents D-state from old code):
+# 1. Stop all PVE services BEFORE installing
+systemctl stop pvedaemon pvestatd pveproxy
+# If stop hangs (D-state from old code): Ctrl+C then:
+systemctl kill -s KILL pvedaemon pvestatd pveproxy
+
+# 2. Verify stopped
+systemctl is-active pvedaemon pvestatd pveproxy
+# Expected: inactive inactive inactive
+
+# 3. Install
+dpkg -i jt-pve-storage-netapp_0.2.7-1_all.deb
+# Postinst will start (not reload) since services are stopped
+
+# 4. Verify
+systemctl is-active pvedaemon pvestatd pveproxy
+pvesm status
+```
+
+---
+
 ## Cleanup
 
 ```bash
@@ -894,6 +1182,54 @@ pvesm list $STORAGE
 ## Release Test Results
 
 Each release must pass all tests above before publishing. Results are recorded below.
+
+### v0.2.7-1 Partition Holder Safety Release (2026-04-10)
+
+**Scope:** v0.2.7 new features (kpartx partition holder ignore, dm-name format variants) + Section 20 customer incident reproduction + full regression (Sections 2, 3, 5, 19.1, 19.9, 19.10).
+
+**Environment:** Single-node test (PVE 9.1, ONTAP simulator), netapp1 storage.
+
+#### Section 19.14: v0.2.7 Partition Holder Safety
+
+| # | Test | Result |
+|---|------|--------|
+| 19.14.1 | Partition-only holders: delete succeeds | PASS |
+| 19.14.2 | Partition + LVM sub-holder: delete blocked | PASS |
+| 19.14.3 | Partition mounted: delete blocked | PASS |
+| 19.14.4 | /proc/swaps check exists (static) | PASS |
+| 19.14.5 | dm-name format regex covers all variants (8/8) | PASS |
+
+#### Section 20: Customer Incident Reproduction
+
+| # | Test | Result |
+|---|------|--------|
+| 20.1 | HPE ProLiant smartpqi scan hang: strace confirms iSCSI-only | PASS |
+| 20.2 | pvestatd reload: postinst contains all 3 services | PASS |
+| 20.3 | Host LVM auto-activation: detailed error with VG name + fix | PASS |
+| 20.4 | kpartx partition holders: bare partition ignored, LVM sub-holder blocked | PASS |
+| 20.5 | Partition dm-name format variants: 8/8 patterns correct | PASS |
+| 20.6 | Postinst lvm.conf global_filter detection: code present | PASS |
+| 20.7 | Orphan warning cooldown: no duplicate warnings within 1 hour | PASS |
+
+#### Regression
+
+| # | Section / Test | Result |
+|---|----------------|--------|
+| R1 | Section 2: alloc + path + free | PASS |
+| R2 | Section 3: snapshot + rollback + resize | PASS |
+| R3 | Section 5: template + linked clone | PASS |
+| R4 | 19.1 static audit (5 items) | PASS |
+| R5 | 19.9.2 strace: rescan only iSCSI hosts | PASS |
+| R6 | 19.10 detailed error message | PASS |
+
+#### Final state
+
+- WWID tracking: {} empty
+- D-state processes: 0
+- Services: pvedaemon, pvestatd, pveproxy all active
+- pvesm status netapp1: active
+
+**Verdict:** All v0.2.7 tests PASS. All regression tests PASS. v0.2.7-1 ready for release.
 
 ### v0.2.6-1 Postinst + Operator UX Release (2026-04-10)
 

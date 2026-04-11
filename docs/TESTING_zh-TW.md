@@ -346,7 +346,7 @@ qm destroy $VMID --purge
 
 ### 19.4 volume_snapshot 對運行中 VM (regression)
 
-驗證 pre-flush 在 device 被使用時正確 skip,不會 block live VM。
+驗證 pre-flush 在 device 被使用時正確 skip，不會 block live VM。
 
 ```bash
 STORAGE=netapp1
@@ -391,7 +391,7 @@ qm destroy $VMID --purge
 
 ### 19.7 clone_image 並行 race (Bug H)
 
-驗證 v0.2.4 在 `clone_image` 的 TOCTOU race 修復。三個並行的 template clone 應該全部成功並有不同的 disk ID,沒有 "already exists" 錯誤。
+驗證 v0.2.4 在 `clone_image` 的 TOCTOU race 修復。三個並行的 template clone 應該全部成功並有不同的 disk ID，沒有 "already exists" 錯誤。
 
 ```bash
 STORAGE=netapp1
@@ -447,7 +447,7 @@ for my $c (@cases) {
 
 ### 19.9 rescan_scsi_hosts 不會碰非 iSCSI host (v0.2.5 Bug Incident 8)
 
-驗證 `rescan_scsi_hosts()` 只對從 `/sys/class/iscsi_host/` 取得的 iSCSI host 寫入 scan 檔案,絕對不碰非 iSCSI host (像是 HBA RAID、USB 讀卡機、virtio-scsi 等)。
+驗證 `rescan_scsi_hosts()` 只對從 `/sys/class/iscsi_host/` 取得的 iSCSI host 寫入 scan 檔案，絕對不碰非 iSCSI host (像是 HBA RAID、USB 讀卡機、virtio-scsi 等)。
 
 #### 19.9.1 靜態程式碼稽核
 
@@ -522,7 +522,7 @@ pvesm free $STORAGE:vm-9990-disk-0
 
 ### 19.10 is_device_in_use 詳細錯誤訊息 (v0.2.6)
 
-測試當 free_image 因 holder 被阻擋時,錯誤訊息顯示:
+測試當 free_image 因 holder 被阻擋時，錯誤訊息顯示：
 - 確切的 holder 裝置名稱和 dm-name
 - 自動偵測的 LVM VG 名稱
 - 修復指令 (vgchange -an)
@@ -557,7 +557,7 @@ pvesm free $STORAGE:vm-9995-disk-0
 
 ### 19.11 殘留裝置警告冷卻機制 (v0.2.6)
 
-測試未追蹤的 NETAPP 殘留裝置偵測警告使用 1 小時冷卻時間,而非每 10 秒觸發一次。
+測試未追蹤的 NETAPP 殘留裝置偵測警告使用 1 小時冷卻時間，而非每 10 秒觸發一次。
 
 ```bash
 # 檢查冷卻狀態目錄是否存在
@@ -608,6 +608,55 @@ dpkg -i jt-pve-storage-netapp_0.2.6-1_all.deb 2>&1 | grep -E '\[OK\].*reloaded|\
 # 預期: 三行輸出,分別對應 pvedaemon、pvestatd、pveproxy
 ```
 
+### 19.14 kpartx partition holders 安全時忽略 (v0.2.7)
+
+驗證 `is_device_in_use()` 正確忽略 bare kpartx partition holders (沒有 sub-holders)，
+但在 partition 有 sub-holders、被 mount、或被 swap 時仍然擋住。
+
+```bash
+STORAGE=netapp1
+
+# 19.14.1 只有 partition holders → 刪除應該成功
+pvesm alloc $STORAGE 9996 vm-9996-disk-0 256M
+DEV=$(readlink -f $(pvesm path $STORAGE:vm-9996-disk-0))
+sleep 2
+SECTORS=$(blockdev --getsz $DEV)
+echo "0 $SECTORS linear $DEV 0" | dmsetup create "testwwid-part1"
+echo "0 1024 linear $DEV 0" | dmsetup create "testwwid-part2"
+pvesm free $STORAGE:vm-9996-disk-0
+# 預期：成功刪除 (bare partition 被忽略)
+
+# 19.14.2 Partition + LVM sub-holder → 刪除應該被擋
+pvesm alloc $STORAGE 9997 vm-9997-disk-0 256M
+DEV2=$(readlink -f $(pvesm path $STORAGE:vm-9997-disk-0))
+sleep 2
+SECTORS2=$(blockdev --getsz $DEV2)
+echo "0 $SECTORS2 linear $DEV2 0" | dmsetup create "testwwid2-part5"
+echo "0 1024 linear /dev/mapper/testwwid2-part5 0" | dmsetup create "myvg-root"
+pvesm free $STORAGE:vm-9997-disk-0 2>&1
+# 預期：無法刪除 (partition 有 LVM sub-holder)
+dmsetup remove myvg-root; dmsetup remove testwwid2-part5
+pvesm free $STORAGE:vm-9997-disk-0
+
+# 19.14.3 Partition 被 mount → 刪除應該被擋
+pvesm alloc $STORAGE 9998 vm-9998-disk-0 256M
+DEV3=$(readlink -f $(pvesm path $STORAGE:vm-9998-disk-0))
+sleep 2
+SECTORS3=$(blockdev --getsz $DEV3)
+echo "0 $SECTORS3 linear $DEV3 0" | dmsetup create "testwwid3-part1"
+mkfs.ext4 -F /dev/mapper/testwwid3-part1 > /dev/null 2>&1
+mkdir -p /tmp/test_mount_check
+mount /dev/mapper/testwwid3-part1 /tmp/test_mount_check
+pvesm free $STORAGE:vm-9998-disk-0 2>&1
+# 預期：無法刪除 (partition 被 mount)
+umount /tmp/test_mount_check; dmsetup remove testwwid3-part1
+pvesm free $STORAGE:vm-9998-disk-0; rmdir /tmp/test_mount_check
+
+# 19.14.4 /proc/swaps 檢查存在 (靜態)
+grep -c 'proc/swaps' /usr/share/perl5/PVE/Storage/Custom/NetAppONTAP/Multipath.pm
+# 預期：2+ (在 is_device_in_use 和 get_device_usage_details 裡)
+```
+
 ### 19.6 is_device_in_use with LVM holder (v0.2.3 資料遺失修復重驗)
 
 ```bash
@@ -645,6 +694,242 @@ rmdir /mnt/test_v024
 
 ---
 
+## 20. 客戶事件重現測試
+
+這些測試重現客戶在正式環境中回報的實際事件。
+每項測試驗證修復是否有效並防止 regression。
+
+### 20.1 HPE ProLiant smartpqi 掃描卡住 (Incident 8，v0.2.5)
+
+驗證 `rescan_scsi_hosts()` 不會對非 iSCSI 的 SCSI host 寫入。
+在搭載 smartpqi (P408i-a) 的 HPE ProLiant 伺服器上，寫入 host1/scan
+會導致超過 600 秒的 D-state 卡住，進而連鎖觸發 VM lock timeout 以及
+pvedaemon restart 卡住。
+
+```bash
+# Verify only iSCSI hosts are scanned (strace proof)
+strace -f -e trace=openat -o /tmp/rescan-trace.log \
+  perl -I/usr/share/perl5 -e '
+use PVE::Storage::Custom::NetAppONTAP::Multipath qw(rescan_scsi_hosts);
+rescan_scsi_hosts(delay => 0);
+'
+
+# Extract scan files opened
+grep -oE '/sys/class/scsi_host/host[0-9]+/scan' /tmp/rescan-trace.log | sort -u
+# Expected: ONLY iSCSI hosts (matching /sys/class/iscsi_host/)
+# MUST NOT contain non-iSCSI hosts (smartpqi, ahci, virtio_scsi, etc.)
+
+# Cross-reference
+echo "=== iSCSI hosts ==="
+ls /sys/class/iscsi_host/
+echo "=== ALL scsi hosts ==="
+for h in /sys/class/scsi_host/host*; do
+  printf "%-8s %s\n" "$(basename $h):" "$(cat $h/proc_name 2>/dev/null)"
+done
+# Every host in strace output must appear in iscsi_host list
+```
+
+### 20.2 pvestatd 升級後未 reload (Incident 9，v0.2.6)
+
+驗證 postinst 會重新載入全部三個 PVE 服務，而非僅 pvedaemon + pveproxy。
+遺漏 pvestatd 會導致舊版 plugin 程式碼在 pvestatd 的記憶體中持續運行，造成
+D-state 累積。
+
+```bash
+# Static: postinst contains all three services
+grep -E 'pvedaemon|pvestatd|pveproxy' debian/postinst | grep -v '^#' | head -10
+# Expected: all three service names appear in the reload/start logic
+
+# Functional: install package and verify all three are reloaded
+dpkg -i jt-pve-storage-netapp_0.2.7-1_all.deb 2>&1 | grep -E '\[OK\]'
+# Expected: three [OK] lines (pvedaemon, pvestatd, pveproxy)
+```
+
+### 20.3 宿主機 LVM auto-activation 擋住 volume 刪除 (Incident 10，v0.2.6)
+
+驗證 `is_device_in_use()` 在宿主機自動啟用 VM 磁碟內部 LVM VG 時，
+會顯示詳細的診斷訊息，且錯誤訊息包含 VG 名稱與修復指令。
+
+```bash
+STORAGE=netapp1
+
+pvesm alloc $STORAGE 9980 vm-9980-disk-0 256M
+DEV=$(readlink -f $(pvesm path $STORAGE:vm-9980-disk-0))
+sleep 2
+
+# Simulate host LVM auto-activation of guest VG
+SECTORS=$(blockdev --getsz $DEV)
+echo "0 $SECTORS linear $DEV 0" | dmsetup create "guestvg--root"
+echo "0 1024 linear /dev/mapper/guestvg--root 0" | dmsetup create "guestvg-swap"
+
+# Delete should be blocked with detailed message
+OUTPUT=$(pvesm free $STORAGE:vm-9980-disk-0 2>&1)
+echo "$OUTPUT"
+# Expected output contains:
+#   [HOLDERS]
+#   dm-name: guestvg--root
+#   Detected LVM VG(s): guestvg
+#   vgchange -an guestvg
+
+echo "$OUTPUT" | grep -q "HOLDERS" && echo "PASS: detailed message" || echo "FAIL"
+echo "$OUTPUT" | grep -q "vgchange" && echo "PASS: fix command shown" || echo "FAIL"
+
+# Cleanup
+dmsetup remove guestvg-swap
+dmsetup remove guestvg--root
+pvesm free $STORAGE:vm-9980-disk-0
+```
+
+### 20.4 kpartx partition holders 擋住所有刪除 (v0.2.7)
+
+重現客戶場景：每次磁碟刪除都失敗，因為 kernel 自動在已安裝 OS 的 VM 磁碟上
+建立 partition device。測試三種客戶案例：
+1. 刪除閒置磁碟（舊磁碟遺留在 plugin storage 上）
+2. move-disk 並刪除來源（遷移後）
+3. 新建 VM 磁碟 + 刪除
+
+```bash
+STORAGE=netapp1
+
+# Case 1: Disk with partition table (simulates VM with OS installed)
+pvesm alloc $STORAGE 9981 vm-9981-disk-0 1G
+DEV=$(readlink -f $(pvesm path $STORAGE:vm-9981-disk-0))
+sleep 2
+
+# Write GPT partition table (what a VM OS installer does)
+sgdisk -Z $DEV 2>/dev/null
+sgdisk -n 1:2048:+100M -n 2:+0:+200M -n 5:+0:+500M $DEV 2>&1 | tail -1
+kpartx -a $DEV 2>/dev/null || partprobe $DEV 2>/dev/null
+sleep 2
+
+# Show holders (should be partition devices)
+DM=$(basename $DEV)
+echo "holders before delete:"
+for h in $(ls /sys/block/$DM/holders/ 2>/dev/null); do
+  echo -n "  $h -> "; cat /sys/block/$h/dm/name 2>/dev/null
+done
+
+# v0.2.7: bare partitions (no sub-holders) should be ignored
+pvesm free $STORAGE:vm-9981-disk-0 2>&1 | tail -1
+# Expected: Removed volume (partition holders ignored)
+
+# Case 2: Partition + LVM on top (checktc-vg scenario) should STILL block
+pvesm alloc $STORAGE 9982 vm-9982-disk-0 1G
+DEV2=$(readlink -f $(pvesm path $STORAGE:vm-9982-disk-0))
+sleep 2
+sgdisk -Z $DEV2 2>/dev/null
+sgdisk -n 5:2048:+500M $DEV2 2>&1 | tail -1
+kpartx -a $DEV2 2>/dev/null || partprobe $DEV2 2>/dev/null
+sleep 2
+
+# Find the partition device and add LVM on top
+PART_DM=$(ls /sys/block/$(basename $DEV2)/holders/ | head -1)
+PART_NAME=$(cat /sys/block/$PART_DM/dm/name 2>/dev/null)
+echo "0 1024 linear /dev/mapper/$PART_NAME 0" | dmsetup create "testvg-root" 2>&1
+
+pvesm free $STORAGE:vm-9982-disk-0 2>&1 | head -3
+# Expected: Cannot delete (partition has LVM sub-holder)
+
+# Cleanup
+dmsetup remove testvg-root 2>/dev/null
+kpartx -d $DEV2 2>/dev/null
+pvesm free $STORAGE:vm-9982-disk-0
+```
+
+### 20.5 Partition dm-name 格式變體 (v0.2.7 regression guard)
+
+Kernel/kpartx 根據系統不同，會建立不同 dm-name 格式的 partition device。
+全部都必須被正確辨識為 partition。
+
+```bash
+# Static: verify regex covers all known formats
+perl -I/usr/share/perl5 -e '
+use strict;
+my @cases = (
+  ["3600a09803831464a4c24577537444d33-part1", 1, "dash-part"],
+  ["3600a09803831464a4c24577537444d33p1",     1, "p-suffix (HPE)"],
+  ["3600a09803831464a4c245775374441231",      1, "digit-only"],
+  ["sdf1",                                     1, "non-multipath"],
+  ["mpath0-part2",                             1, "alias-part"],
+  ["myvg-root",                                0, "LVM (must NOT match)"],
+  ["checktc--vg-root",                         0, "LVM with hyphen"],
+  ["dm-crypt-luks",                            0, "dm-crypt"],
+);
+for my $c (@cases) {
+  my ($name, $expect, $label) = @$c;
+  my $is_part = ($name =~ /part\d+$/
+              || $name =~ /^[0-9a-f]{20,}p?\d+$/
+              || $name =~ /^sd[a-z]+\d+$/) ? 1 : 0;
+  my $ok = ($is_part == $expect);
+  printf "%-40s %-6s %s\n", $label, $ok ? "PASS" : "FAIL",
+    "($name -> " . ($is_part ? "partition" : "not-partition") . ")";
+}
+'
+# Expected: all 8 lines say PASS
+```
+
+### 20.6 Postinst lvm.conf global_filter 偵測 (v0.2.6)
+
+驗證 postinst 在 lvm.conf 缺少 global_filter 時會發出警告。
+
+```bash
+# Check if current system has global_filter
+grep -c 'global_filter' /etc/lvm/lvm.conf
+# If > 0: postinst should NOT show lvm warning (verified during install)
+# If 0: postinst should show WARNING block about auto-activation
+
+# Static: postinst contains the detection code
+grep -c 'global_filter' debian/postinst
+# Expected: 3+ (detection logic + warning text)
+```
+
+### 20.7 殘留裝置警告冷卻機制 (v0.2.6)
+
+驗證殘留偵測警告不會灌爆 journal。
+
+```bash
+# Check cooldown mechanism exists in code
+grep -c 'cooldown' /usr/share/perl5/PVE/Storage/Custom/NetAppONTAPPlugin.pm
+# Expected: 3+ (cooldown_dir, cooldown_secs, flag file logic)
+
+# Check cooldown state directory
+ls /var/run/pve-storage-netapp/ 2>/dev/null
+# Expected: directory exists (created on demand)
+
+# If orphan warnings are active, verify they don't repeat within 1 hour:
+# Run two status polls 15s apart
+pvesm status > /dev/null; sleep 15; pvesm status > /dev/null
+journalctl -u pvestatd --since "1 minute ago" --no-pager 2>&1 | grep -c "untracked NETAPP"
+# Expected: 0 or 1 (not 2, because cooldown is 1 hour)
+```
+
+### 20.8 升級 SOP：安裝前先停止服務 (v0.2.6 教訓)
+
+記錄正確的升級程序，避免舊 code 的 D-state 在升級過程中累積。
+這不是自動化測試，是給操作人員的手動 checklist。
+
+```bash
+# CORRECT upgrade procedure (prevents D-state from old code):
+# 1. Stop all PVE services BEFORE installing
+systemctl stop pvedaemon pvestatd pveproxy
+# If stop hangs (D-state from old code): Ctrl+C then:
+systemctl kill -s KILL pvedaemon pvestatd pveproxy
+
+# 2. Verify stopped
+systemctl is-active pvedaemon pvestatd pveproxy
+# Expected: inactive inactive inactive
+
+# 3. Install
+dpkg -i jt-pve-storage-netapp_0.2.7-1_all.deb
+# Postinst will start (not reload) since services are stopped
+
+# 4. Verify
+systemctl is-active pvedaemon pvestatd pveproxy
+pvesm status
+```
+
+---
+
 ## 清除
 
 ```bash
@@ -655,7 +940,7 @@ qm destroy 9902 --purge 2>/dev/null
 qm destroy 9903 --purge 2>/dev/null
 pct destroy 9910 --purge 2>/dev/null
 
-# 驗證 ONTAP 上無孤立 volume
+# 驗證 ONTAP 上無殘留 volume
 pvesm list $STORAGE
 ```
 
@@ -665,22 +950,70 @@ pvesm list $STORAGE
 
 每個版本發佈前都必須通過上述所有測試。結果記錄於下方。
 
+### v0.2.7-1 Partition Holder 安全性 Release (2026-04-10)
+
+**範圍：** v0.2.7 新功能 (kpartx partition holder 忽略、dm-name 格式變體) + Section 20 客戶事件重現 + 完整 regression (Section 2、3、5、19.1、19.9、19.10)。
+
+**測試環境：** 單節點測試 (PVE 9.1, ONTAP simulator)，netapp1 storage。
+
+#### Section 19.14: v0.2.7 Partition Holder 安全性
+
+| # | 測試 | 結果 |
+|---|------|------|
+| 19.14.1 | 只有 partition holders：刪除成功 | PASS |
+| 19.14.2 | Partition + LVM sub-holder：刪除被擋 | PASS |
+| 19.14.3 | Partition 被 mount：刪除被擋 | PASS |
+| 19.14.4 | /proc/swaps 檢查存在（靜態） | PASS |
+| 19.14.5 | dm-name 格式 regex 涵蓋所有變體 (8/8) | PASS |
+
+#### Section 20: 客戶事件重現
+
+| # | 測試 | 結果 |
+|---|------|------|
+| 20.1 | HPE ProLiant smartpqi 掃描卡住：strace 確認僅 iSCSI | PASS |
+| 20.2 | pvestatd reload：postinst 包含全部 3 個服務 | PASS |
+| 20.3 | 宿主機 LVM auto-activation：詳細錯誤含 VG 名稱 + 修復指令 | PASS |
+| 20.4 | kpartx partition holders：bare partition 忽略，LVM sub-holder 擋住 | PASS |
+| 20.5 | Partition dm-name 格式變體：8/8 模式正確 | PASS |
+| 20.6 | Postinst lvm.conf global_filter 偵測：程式碼存在 | PASS |
+| 20.7 | 殘留警告冷卻：1 小時內無重複警告 | PASS |
+
+#### Regression
+
+| # | Section / 測試 | 結果 |
+|---|----------------|------|
+| R1 | Section 2: alloc + path + free | PASS |
+| R2 | Section 3: snapshot + rollback + resize | PASS |
+| R3 | Section 5: template + linked clone | PASS |
+| R4 | 19.1 靜態稽核 (5 項) | PASS |
+| R5 | 19.9.2 strace: 僅 rescan iSCSI host | PASS |
+| R6 | 19.10 詳細錯誤訊息 | PASS |
+
+#### 最終狀態
+
+- WWID 追蹤： {} 空
+- D-state 程序： 0
+- 服務： pvedaemon、pvestatd、pveproxy 全部 active
+- pvesm status netapp1: active
+
+**結論：** 全部 v0.2.7 測試 PASS。全部 regression 測試 PASS。v0.2.7-1 可發佈。
+
 ### v0.2.6-1 Postinst + 操作者 UX 改善版 (2026-04-10)
 
-**範圍:** v0.2.6 新功能 (詳細錯誤訊息、殘留警告冷卻、lvm.conf 偵測、pvestatd 重新載入) + 完整 regression (Section 2、3、5、19.1、19.8、19.9)。
+**範圍：** v0.2.6 新功能 (詳細錯誤訊息、殘留警告冷卻、lvm.conf 偵測、pvestatd 重新載入) + 完整 regression (Section 2、3、5、19.1、19.8、19.9)。
 
-**測試環境:** 單節點測試 (PVE 9.1, ONTAP simulator),netapp1 storage。測試主機已設定 global_filter (lvm.conf 警告不會觸發;已透過程式碼審查驗證警告路徑)。
+**測試環境：** 單節點測試 (PVE 9.1, ONTAP simulator),netapp1 storage。測試主機已設定 global_filter (lvm.conf 警告不會觸發；已透過程式碼審查驗證警告路徑)。
 
 #### Section 19.10-19.13: v0.2.6 新功能
 
 | # | 測試 | 結果 |
 |---|------|------|
-| 19.10 | 詳細錯誤: 顯示 holder 名稱 + dm-name | PASS |
-| 19.10 | 詳細錯誤: 從 dm-name 自動偵測 VG | PASS (以 checktc--vg-root 模式測試) |
-| 19.10 | 詳細錯誤: 顯示 vgchange -an 指令 | PASS |
-| 19.10 | 詳細錯誤: 顯示 global_filter 建議 | PASS |
+| 19.10 | 詳細錯誤： 顯示 holder 名稱 + dm-name | PASS |
+| 19.10 | 詳細錯誤： 從 dm-name 自動偵測 VG | PASS (以 checktc--vg-root 模式測試) |
+| 19.10 | 詳細錯誤： 顯示 vgchange -an 指令 | PASS |
+| 19.10 | 詳細錯誤： 顯示 global_filter 建議 | PASS |
 | 19.10 | 移除 holder 後刪除成功 | PASS |
-| 19.11 | 殘留警告冷卻: /var/run/pve-storage-netapp/ 旗標目錄 | PASS (按需建立) |
+| 19.11 | 殘留警告冷卻： /var/run/pve-storage-netapp/ 旗標目錄 | PASS (按需建立) |
 | 19.12 | Postinst: lvm.conf 含 global_filter 時不發出警告 | PASS |
 | 19.12 | Postinst: 靜態檢查 global_filter 偵測程式碼 | PASS (grep 確認程式碼存在) |
 | 19.13 | Postinst: 全部 3 個服務重新載入 (pvedaemon + pvestatd + pveproxy) | PASS |
@@ -699,34 +1032,34 @@ pvesm list $STORAGE
 
 #### 最終狀態
 
-- WWID 追蹤: {} 空
-- D-state 程序: 0
-- 服務: pvedaemon、pvestatd、pveproxy 全部 active
+- WWID 追蹤： {} 空
+- D-state 程序： 0
+- 服務： pvedaemon、pvestatd、pveproxy 全部 active
 - pvesm status netapp1: active
 
-**結論:** 全部 v0.2.6 測試 PASS。全部 regression 測試 PASS。v0.2.6-1 可發佈。
+**結論：** 全部 v0.2.6 測試 PASS。全部 regression 測試 PASS。v0.2.6-1 可發佈。
 
 ### v0.2.5-1 非 iSCSI SCSI Host 掃描修復 (2026-04-10)
 
-**範圍:** Section 19.9 (新增 Bug Incident 8 regression guard) + Section 1、2、3、5 的 regression + v0.2.4 的單元測試。
+**範圍：** Section 19.9 (新增 Bug Incident 8 regression guard) + Section 1、2、3、5 的 regression + v0.2.4 的單元測試。
 
-**測試環境:** 單節點 PVE 9.1 + ONTAP simulator,netapp1 storage。
+**測試環境：** 單節點 PVE 9.1 + ONTAP simulator,netapp1 storage。
 
 **測試 host 的 SCSI 清單 (對 19.9.2 很重要):**
 - host0-1: virtio_scsi
 - host2-3: ata_piix
 - host4-7: iscsi_tcp
 
-這是「混合 driver」環境 — 修復必須只碰 host4-7 (iSCSI),完全不碰 host0-3。
+這是「混合 driver」環境 — 修復必須只碰 host4-7 (iSCSI)，完全不碰 host0-3。
 
 #### Section 19.9: rescan_scsi_hosts 只過濾 iSCSI
 
 | # | 測試 | 結果 |
 |---|------|------|
-| 19.9.1 | 靜態稽核: `rescan_scsi_hosts` 引用 `/sys/class/iscsi_host` | PASS |
-| 19.9.1 | 靜態稽核: `rescan_scsi_hosts` 不再 `opendir` `SCSI_HOST_PATH` | PASS |
-| 19.9.1 | 靜態稽核: `rescan_fc_hosts` 不再迭代整個 `/sys/class/scsi_host` | PASS |
-| 19.9.2 | **strace 證明: `rescan_scsi_hosts()` 只打開 host4-7 的 scan 檔案,完全沒碰 host0-3** | **PASS** |
+| 19.9.1 | 靜態稽核： `rescan_scsi_hosts` 引用 `/sys/class/iscsi_host` | PASS |
+| 19.9.1 | 靜態稽核： `rescan_scsi_hosts` 不再 `opendir` `SCSI_HOST_PATH` | PASS |
+| 19.9.1 | 靜態稽核： `rescan_fc_hosts` 不再迭代整個 `/sys/class/scsi_host` | PASS |
+| 19.9.2 | **strace 證明： `rescan_scsi_hosts()` 只打開 host4-7 的 scan 檔案，完全沒碰 host0-3** | **PASS** |
 | 19.9.3 | 功能 regression: `pvesm alloc` 仍能透過 iSCSI rescan 找到新 LUN | PASS |
 
 **關鍵 strace 輸出 (19.9.2):**
@@ -748,46 +1081,46 @@ openat(AT_FDCWD, "/sys/class/scsi_host/host7/scan", O_WRONLY|...)
 | R4 | Section 5: template + linked clone | PASS |
 | R5 | v0.2.4 Section 19.8: limit error translation (6/6 cases) | PASS |
 
-**最終狀態:**
+**最終狀態：**
 - WWID tracking: `{}` 空
 - D-state processes: 0
 - pvedaemon / pveproxy: active
 
-**結論:** Section 19.9 全部 PASS。所有 regression 全部 PASS。v0.2.5-1 可以發佈。
+**結論：** Section 19.9 全部 PASS。所有 regression 全部 PASS。v0.2.5-1 可以發佈。
 
 ### v0.2.4-1 稽核修復 Release (2026-04-09)
 
-**範圍:** Section 19 (新增 v0.2.4 cleanup 順序 / snapshot 落盤 / 無用程式碼修復測試),加上 Section 1、2、3、5 的 regression。
+**範圍：** Section 19 (新增 v0.2.4 cleanup 順序 / snapshot 落盤 / 無用程式碼修復測試)，加上 Section 1、2、3、5 的 regression。
 
-**測試環境:** 單節點 PVE 9.1 + ONTAP simulator,netapp1 storage,2 個 iSCSI portal,multipath 為 `dev_loss_tmo 60` + `no_path_retry 30`。Plugin 透過 `make deb` 建置並以 `dpkg -i jt-pve-storage-netapp_0.2.4-1_all.deb` 安裝。
+**測試環境：** 單節點 PVE 9.1 + ONTAP simulator,netapp1 storage,2 個 iSCSI portal,multipath 為 `dev_loss_tmo 60` + `no_path_retry 30`。Plugin 透過 `make deb` 建置並以 `dpkg -i jt-pve-storage-netapp_0.2.4-1_all.deb` 安裝。
 
 #### Section 19: v0.2.4 稽核修復測試
 
 | #  | 測試 | 結果 |
 |----|------|------|
-| 19.1.1 | Cleanup 路徑沒有 `volume_delete` 缺少前置 `lun_unmap_all` | PASS (alloc_image:1063, clone_image:2071+2112, free_image:1149, temp clone:1529 全部驗證;alloc_image:1028 是 LUN-create 失敗路徑,當下沒有 LUN 可 unmap,安全) |
-| 19.1.2 | Multipath.pm 沒有不安全的 `basename()` 在 `/sys/block/` 附近使用 | PASS (剩下的都是安全用法:resolver 自身、傳給 dmsetup/multipathd 的 map name、操作 /sys/block/sd* 個別 path) |
+| 19.1.1 | Cleanup 路徑沒有 `volume_delete` 缺少前置 `lun_unmap_all` | PASS (alloc_image:1063, clone_image:2071+2112, free_image:1149, temp clone:1529 全部驗證；alloc_image:1028 是 LUN-create 失敗路徑，當下沒有 LUN 可 unmap，安全) |
+| 19.1.2 | Multipath.pm 沒有不安全的 `basename()` 在 `/sys/block/` 附近使用 | PASS (剩下的都是安全用法：resolver 自身、傳給 dmsetup/multipathd 的 map name、操作 /sys/block/sd* 個別 path) |
 | 19.1.3 | 無用程式碼 `get_multipath_wwid()` 已刪除 | PASS (zero matches) |
 | 19.1.4 | 沒有 bare `system()` 呼叫 | PASS (zero matches) |
 | 19.1.5 | 沒有 bare `open()` 寫到 `/sys/` | PASS (zero matches) |
 | 19.2 | clone_image happy path:linked clone + full clone + destroy 不留下殘留 | PASS (沒有 failed multipath,WWID tracking 在 status() poll 後自動收斂為空) |
-| 19.3 | 對停機 VM 做 volume_snapshot,觸發 pre-flush 路徑成功 | PASS (snapshot 建立成功,dmesg 無 flush 錯誤,rollback 正常) |
-| 19.4 | 對運行中 VM 做 volume_snapshot,正確 skip flush (device in use) | PASS (沒有 hang、沒有 flush 警告,snapshot 成功) |
-| 19.5 | 對運行中 VM 執行 qm resize (v0.2.3 regression check) | PASS (沒有 "Cannot grow device files" 錯誤,blockdev --getsize64 確認 1610612736 bytes,從 1G 加 512M) |
-| 19.6 | is_device_in_use 偵測 `/dev/mapper/<wwid>` 上的 dm-linear holder (v0.2.3 資料遺失修復重驗) | PASS (回傳 IN_USE,pvesm free 正確拒絕並顯示清楚錯誤訊息,volume 保留) |
+| 19.3 | 對停機 VM 做 volume_snapshot，觸發 pre-flush 路徑成功 | PASS (snapshot 建立成功，dmesg 無 flush 錯誤，rollback 正常) |
+| 19.4 | 對運行中 VM 做 volume_snapshot，正確 skip flush (device in use) | PASS (沒有 hang、沒有 flush 警告，snapshot 成功) |
+| 19.5 | 對運行中 VM 執行 qm resize (v0.2.3 regression check) | PASS (沒有 "Cannot grow device files" 錯誤，blockdev --getsize64 確認 1610612736 bytes，從 1G 加 512M) |
+| 19.6 | is_device_in_use 偵測 `/dev/mapper/<wwid>` 上的 dm-linear holder (v0.2.3 資料遺失修復重驗) | PASS (回傳 IN_USE,pvesm free 正確拒絕並顯示清楚錯誤訊息，volume 保留) |
 
 #### Section 19.2 詳細觀察
 
-- 兩個 clones 在 destroy 時都正確觸發 `dmsetup remove --force --retry` fallback (在這個 simulator 帶 legacy `queue_if_no_path` 設定下,這是 v0.2.3 預期行為)
-- Template volume 命中已知的 ONTAP simulator stale clone metadata 錯誤後,`status()` 的 auto-import 自動清除了該殘留 WWID,證明 v0.2.3 的 cluster 收斂機制在 v0.2.4 仍正常運作
+- 兩個 clones 在 destroy 時都正確觸發 `dmsetup remove --force --retry` fallback (在這個 simulator 帶 legacy `queue_if_no_path` 設定下，這是 v0.2.3 預期行為)
+- Template volume 命中已知的 ONTAP simulator stale clone metadata 錯誤後，`status()` 的 auto-import 自動清除了該殘留 WWID，證明 v0.2.3 的 cluster 收斂機制在 v0.2.4 仍正常運作
 
 #### Section 19.6 詳細觀察
 
-- 使用 `dmsetup create test_holder ... linear /dev/mapper/<wwid>` 建立真實的 holder 關係 (這個 PVE host 的 LVM filter 會拒絕 multipath 裝置,所以直接用 dm-linear 是更可靠的 holder 測試)
-- Resolver 解出來後:`/sys/block/dm-9/holders/dm-10` 正確列出
+- 使用 `dmsetup create test_holder ... linear /dev/mapper/<wwid>` 建立真實的 holder 關係 (這個 PVE host 的 LVM filter 會拒絕 multipath 裝置，所以直接用 dm-linear 是更可靠的 holder 測試)
+- Resolver 解出來後：`/sys/block/dm-9/holders/dm-10` 正確列出
 - `is_device_in_use('/dev/mapper/3600a09807770457a795d5a7653705a63')` 回傳 1
-- `pvesm free` 拒絕並回覆:`Cannot delete volume 'vm-9963-disk-0': device /dev/mapper/3600a09807770457a795d5a7653705a63 is still in use (mounted, has holders, or open by process)`
-- 執行 `dmsetup remove test_holder_v024` 之後,`pvesm free` 正常成功
+- `pvesm free` 拒絕並回覆：`Cannot delete volume 'vm-9963-disk-0': device /dev/mapper/3600a09807770457a795d5a7653705a63 is still in use (mounted, has holders, or open by process)`
+- 執行 `dmsetup remove test_holder_v024` 之後，`pvesm free` 正常成功
 
 #### Regression: Sections 1、2、3、5
 
@@ -799,16 +1132,16 @@ openat(AT_FDCWD, "/sys/class/scsi_host/host7/scan", O_WRONLY|...)
 | R4 | Section 3.5: rollback snap2 | PASS |
 | R5 | Section 3.6: qm resize +512M | PASS (config 顯示 1536M) |
 | R6 | Section 5.1: qm clone --full 1 | PASS |
-| R7 | Section 5.2: qm template + linked clone | PASS (功能正常;template volume 命中 ONTAP simulator stale clone metadata 限制,已記錄於 CLAUDE.md,不是 plugin bug) |
+| R7 | Section 5.2: qm template + linked clone | PASS (功能正常；template volume 命中 ONTAP simulator stale clone metadata 限制，已記錄於 CLAUDE.md，不是 plugin bug) |
 
 #### 最終狀態
 
-- WWID tracking 檔案:`{}` (空,完全收斂)
-- multipath:沒有任何 failed 狀態的 NETAPP 裝置
-- Process 狀態:沒有 D-state process
-- 服務:pvedaemon active、pveproxy active
+- WWID tracking 檔案：`{}` (空，完全收斂)
+- multipath：沒有任何 failed 狀態的 NETAPP 裝置
+- Process 狀態：沒有 D-state process
+- 服務：pvedaemon active、pveproxy active
 
-**結論:** Section 19 全部 PASS,所有 regression PASS。v0.2.4-1 可以發佈。
+**結論：** Section 19 全部 PASS，所有 regression PASS。v0.2.4-1 可以發佈。
 
 ### v0.2.2-1 擴展測試套件 (2026-04-08)
 

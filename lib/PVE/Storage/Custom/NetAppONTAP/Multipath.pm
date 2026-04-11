@@ -710,7 +710,20 @@ sub cleanup_lun_devices {
                 timeout => 10, allow_nonzero => 1, ignore_errors => 1); };
         }
 
-        # Step 3: Remove the multipath device using multipathd (with timeout)
+        # Step 3: Remove kpartx partition devices before multipath removal.
+        # The kernel's partition scanner auto-creates partition dm devices
+        # (e.g. <wwid>-part1, <wwid>-part2) when it finds a partition table
+        # inside a multipath device. These are present on any VM disk with
+        # an OS installed. They must be removed before multipath -f, otherwise
+        # the multipath device has holders and the flush fails.
+        if ($safe_mpath) {
+            eval {
+                _run_cmd(['/sbin/kpartx', '-d', $safe_mpath],
+                    allow_nonzero => 1, ignore_errors => 1, timeout => 10);
+            };
+        }
+
+        # Step 4: Remove the multipath device using multipathd (with timeout)
         if ($safe_name) {
             eval {
                 _run_cmd([MULTIPATHD, 'remove', 'map', $safe_name],
@@ -718,7 +731,7 @@ sub cleanup_lun_devices {
             };
         }
 
-        # Step 4: Also try multipath -f as fallback
+        # Step 5: Also try multipath -f as fallback
         multipath_flush($mpath);
 
         # Step 5: Brief pause to let device-mapper settle
@@ -746,14 +759,22 @@ sub is_device_in_use {
     my $dev_name = _resolve_block_device_name($device);
     return 0 unless $dev_name;
 
-    # Check 1: Is device mounted? (use sysfs_read_with_timeout to prevent hang
-    # if a mounted filesystem on another device is unresponsive)
+    # Check 1a: Is device mounted?
     my $mounts = sysfs_read_with_timeout('/proc/mounts', 5);
     if ($mounts) {
         for my $line (split /\n/, $mounts) {
-            # Check both the original device path and the resolved /dev/<dev_name>
             if ($line =~ /^\Q$device\E\s/ || $line =~ /^\/dev\/\Q$dev_name\E\s/) {
                 return 1;  # Device is mounted
+            }
+        }
+    }
+
+    # Check 1b: Is device used as swap?
+    my $swaps = sysfs_read_with_timeout('/proc/swaps', 5);
+    if ($swaps) {
+        for my $line (split /\n/, $swaps) {
+            if ($line =~ /^\Q$device\E\s/ || $line =~ /^\/dev\/\Q$dev_name\E\s/) {
+                return 1;  # Device is swap
             }
         }
     }
@@ -762,13 +783,94 @@ sub is_device_in_use {
     # CRITICAL: must use resolved kernel name (dm-N), not basename of /dev/mapper/<wwid>.
     # Otherwise LVM holders on multipath devices are missed and free_image would
     # happily delete a mounted/in-use volume.
+    #
+    # HOWEVER: kpartx partition devices are an exception. The kernel's block
+    # layer automatically creates partition dm devices (e.g. <wwid>-part1,
+    # <wwid>-part2) when it detects a partition table inside a multipath
+    # device. This happens on EVERY VM disk that has an OS installed (the VM
+    # guest created a GPT/MBR partition table). These partition devices are
+    # passive artifacts -- they are not mounted or used by any host process.
+    # They will be removed along with the multipath device during cleanup.
+    #
+    # So: if ALL holders are kpartx partition devices AND none of them have
+    # sub-holders of their own (no LVM/dm-crypt on top of the partitions),
+    # it's safe to proceed with deletion. If any holder is NOT a partition,
+    # or if any partition has its own holders (e.g. checktc-vg LVM on part5),
+    # we must block.
     my $holders_dir = "/sys/block/$dev_name/holders";
     if (-d $holders_dir) {
         opendir(my $dh, $holders_dir);
         my @holders = grep { !/^\./ } readdir($dh);
         closedir($dh);
+
         if (@holders) {
-            return 1;  # Device has holders
+            my $has_real_holders = 0;
+
+            for my $h (@holders) {
+                # Read dm-name to check if this is a kpartx partition
+                my $dm_name = '';
+                my $dm_name_file = "/sys/block/$h/dm/name";
+                if (-r $dm_name_file) {
+                    $dm_name = sysfs_read_with_timeout($dm_name_file, 3) // '';
+                    chomp $dm_name;
+                }
+
+                # Kpartx/kernel partition dm-names vary by configuration:
+                #   "<wwid>-part1"    (dash-part format)
+                #   "<wwid>p1"        (p-suffix, seen on HPE ProLiant)
+                #   "<wwid>1"         (digit-only suffix)
+                #   "<alias>-part1"   (with user_friendly_names)
+                #   "sdf1"            (non-multipath, kpartx on raw sd device)
+                my $is_partition = ($dm_name =~ /part\d+$/
+                                 || $dm_name =~ /^[0-9a-f]{20,}p?\d+$/
+                                 || $dm_name =~ /^sd[a-z]+\d+$/);
+
+                if (!$is_partition) {
+                    # Not a partition (could be LVM LV, dm-crypt, etc.)
+                    $has_real_holders = 1;
+                    last;
+                }
+
+                # Even if it IS a partition, check if it's genuinely in use:
+
+                # 2a. Sub-holders (LVM VG, dm-crypt, MD RAID on partition)
+                my $sub_dir = "/sys/block/$h/holders";
+                if (-d $sub_dir) {
+                    opendir(my $sdh, $sub_dir);
+                    my @sub = grep { !/^\./ } readdir($sdh);
+                    closedir($sdh);
+                    if (@sub) {
+                        $has_real_holders = 1;
+                        last;
+                    }
+                }
+
+                # 2b. Partition mounted directly (e.g. ext4 on partition)
+                # Check both /dev/<dm-N> and /dev/mapper/<dm_name> because
+                # /proc/mounts records whichever path was used for mount().
+                my $part_dev = "/dev/$h";
+                my $part_mapper = $dm_name ? "/dev/mapper/$dm_name" : '';
+                if ($mounts) {
+                    if ($mounts =~ /^\Q$part_dev\E\s/m ||
+                        ($part_mapper && $mounts =~ /^\Q$part_mapper\E\s/m)) {
+                        $has_real_holders = 1;
+                        last;
+                    }
+                }
+
+                # 2c. Partition used as swap
+                if ($swaps) {
+                    if ($swaps =~ /^\Q$part_dev\E\s/m ||
+                        ($part_mapper && $swaps =~ /^\Q$part_mapper\E\s/m)) {
+                        $has_real_holders = 1;
+                        last;
+                    }
+                }
+            }
+
+            return 1 if $has_real_holders;
+            # All holders are bare kpartx partitions with no sub-holders.
+            # Safe to proceed — cleanup_lun_devices will remove them.
         }
     }
 
@@ -814,6 +916,16 @@ sub get_device_usage_details {
         }
     }
 
+    # Check 1b: swap?
+    my $swaps = sysfs_read_with_timeout('/proc/swaps', 5);
+    if ($swaps) {
+        for my $line (split /\n/, $swaps) {
+            if ($line =~ /^\Q$device\E\s/ || $line =~ /^\/dev\/\Q$dev_name\E\s/) {
+                push @reasons, "[SWAP] Device is used as swap";
+            }
+        }
+    }
+
     # Check 2: holders?
     my $holders_dir = "/sys/block/$dev_name/holders";
     if (-d $holders_dir) {
@@ -837,17 +949,26 @@ sub get_device_usage_details {
                         chomp $dm_name;
                         $detail .= " (dm-name: $dm_name)";
 
-                        # LVM dm names: "vgname-lvname" (with doubled hyphens for
-                        # hyphens in vg/lv names: "my--vg-my--lv")
-                        # Partition kpartx names: "<wwid>1", "<wwid>2", etc.
-                        if ($dm_name =~ /^(.*?[^-])-[^-]/) {
+                        # Classify: is this a kpartx partition or an LVM LV?
+                        #
+                        # Partition dm-names:
+                        #   "<wwid>-part1", "<wwid>1", "<alias>-part1"
+                        #   Pattern: ends with "partN" or is <hex30+><digit>
+                        #
+                        # LVM dm-names:
+                        #   "vgname-lvname" (doubled hyphens for literal hyphens)
+                        #   Pattern: not a partition, contains single-hyphen separator
+                        my $is_part = ($dm_name =~ /part\d+$/
+                                    || $dm_name =~ /^[0-9a-f]{20,}p?\d+$/
+                                    || $dm_name =~ /^sd[a-z]+\d+$/);
+
+                        if ($is_part) {
+                            $has_partition = 1;
+                        } elsif ($dm_name =~ /^(.*?[^-])-[^-]/) {
                             my $vg = $1;
                             $vg =~ s/--/-/g;  # un-double hyphens
                             push @detected_vgs, $vg
                                 unless grep { $_ eq $vg } @detected_vgs;
-                        } elsif ($dm_name =~ /^3[0-9a-f]{30,}\d+$/ ||
-                                 $dm_name =~ /part\d+$/) {
-                            $has_partition = 1;
                         }
                     }
                 }

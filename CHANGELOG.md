@@ -2,6 +2,18 @@
 
 All notable changes to the NetApp ONTAP Storage Plugin for Proxmox VE are documented here.
 
+## [0.2.7] - 2026-04-11
+
+### kpartx Partition Holder Fix Release (CRITICAL)
+
+**Critical Fix:**
+
+- **Fixed `is_device_in_use()` blocking ALL volume deletions on systems with kpartx partition scanning.** The kernel's partition scanner auto-creates partition dm devices (e.g. `<wwid>-part1`) on multipath LUNs when it detects a partition table inside a VM disk. These passive artifacts were treated as "real" holders, blocking every `free_image()` call. Now `is_device_in_use()` checks if ALL holders are bare kpartx partitions with no sub-holders; if so, they are safely ignored. Partitions with sub-holders (e.g. host LVM VG on a partition) still correctly block deletion.
+
+- **Added `kpartx -d` cleanup step** in `cleanup_lun_devices()` to remove partition devices before multipath flush.
+
+- **Fixed `get_device_usage_details()` misinterpreting partition dm-names** (e.g. `3600a...d33-part1`) as LVM VG names.
+
 ## [0.2.6] - 2026-04-10
 
 ### Postinst Service Reload + Operator UX Release

@@ -789,9 +789,6 @@ After editing `/etc/multipath.conf`:
 # multipath maps. Stale maps from deleted LUNs will persist until restart.
 systemctl restart multipathd
 
-# Alternatively, flush only unused/stale maps without restarting the daemon:
-multipath -F
-
 # Verify the new settings are active
 multipathd show config local
 
@@ -799,7 +796,7 @@ multipathd show config local
 multipath -ll
 ```
 
-> **Why not `reload`?** `systemctl reload multipathd` only tells the daemon to re-parse `/etc/multipath.conf`. It applies new settings to *future* devices but does **not** clean up existing multipath maps. If you have stale maps from deleted LUNs (e.g., dm-X devices showing all paths in "failed faulty" state), `reload` will not remove them. Use `restart` or `multipath -F`.
+> **Why not `reload`?** `systemctl reload multipathd` only tells the daemon to re-parse `/etc/multipath.conf`. It applies new settings to *future* devices but does **not** clean up existing multipath maps. If you have stale maps from deleted LUNs (e.g., dm-X devices showing all paths in "failed faulty" state), `reload` will not remove them. Use `restart`.
 
 ### Coexistence with Existing Storage
 

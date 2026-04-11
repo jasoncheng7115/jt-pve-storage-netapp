@@ -1163,6 +1163,76 @@ pvesm status
 
 ---
 
+## 21. Code Review Regression Guards
+
+Static and functional tests derived from automated code review findings.
+These verify that known anti-patterns stay fixed.
+
+### 21.1 Orphan cleanup conditional untrack (codex review)
+
+Verifies that `_cleanup_orphaned_devices()` only untracks a WWID when the
+local multipath device is actually gone, matching `free_image()` logic.
+
+```bash
+# Static: code must check device existence AFTER cleanup before untracking
+grep -A5 'still_exists.*get_multipath' lib/PVE/Storage/Custom/NetAppONTAPPlugin.pm | head -6
+# Expected: conditional logic - only _untrack_wwid if !still_exists
+```
+
+### 21.2 alloc_image bounded TOCTOU retry (codex review)
+
+Verifies that `alloc_image()` volume_create race handling uses a proper
+bounded retry loop (not a single retry), matching `clone_image()` pattern.
+
+```bash
+# Static: must have a retry loop variable
+grep -c 'max_create_retries\|create_try' lib/PVE/Storage/Custom/NetAppONTAPPlugin.pm
+# Expected: 4+ (loop variable + loop + check + die)
+
+# Verify it's a real loop, not a single if-then-retry
+grep -A2 'create_try' lib/PVE/Storage/Custom/NetAppONTAPPlugin.pm | grep -c 'for\|next'
+# Expected: 2+ (for loop + next statement)
+```
+
+### 21.3 No multipath -F recommendations (codex review)
+
+Verifies that no code or documentation recommends `multipath -F` (capital F,
+flushes ALL maps). Warnings about NOT using it are allowed and expected.
+
+```bash
+# Code: only "DO NOT" context allowed
+grep -n 'multipath -F' lib/PVE/Storage/Custom/NetAppONTAPPlugin.pm
+# Expected: only lines containing "DO NOT" or "NEVER" or similar warning
+
+# Docs: no recommendation context
+grep -rn 'multipath -F' docs/ README*.md | grep -vi 'never\|not\|don.t\|warning\|forbidden\|不要\|絕對\|禁止\|警告'
+# Expected: only informational/symptom table entries, no "run this command" suggestions
+
+# Multipath.pm: warning comment only
+grep -n 'multipath -F' lib/PVE/Storage/Custom/NetAppONTAP/Multipath.pm
+# Expected: only WARNING comment
+```
+
+### 21.4 All glob() calls have alarm timeout (codex review)
+
+Verifies that every `glob("/dev/disk/by-id/...")` call in the codebase is
+wrapped in `alarm()` to prevent hang on unresponsive device subsystem.
+
+```bash
+# Find all glob calls on /dev/disk
+grep -rn 'glob.*dev.disk' lib/PVE/Storage/Custom/NetAppONTAP/*.pm
+# For each: check that alarm(5) appears within 3 lines before it
+# (Manual review -- verify each glob is inside an eval { alarm(5); ... alarm(0); } block)
+
+# Quick count check
+GLOB_COUNT=$(grep -c 'glob.*dev.disk' lib/PVE/Storage/Custom/NetAppONTAP/ISCSI.pm lib/PVE/Storage/Custom/NetAppONTAP/Multipath.pm 2>/dev/null)
+ALARM_COUNT=$(grep -c 'alarm(5)' lib/PVE/Storage/Custom/NetAppONTAP/ISCSI.pm lib/PVE/Storage/Custom/NetAppONTAP/Multipath.pm 2>/dev/null)
+echo "glob calls: $GLOB_COUNT, alarm wraps: $ALARM_COUNT"
+# Expected: alarm count >= glob count
+```
+
+---
+
 ## Cleanup
 
 ```bash

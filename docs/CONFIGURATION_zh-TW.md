@@ -789,9 +789,6 @@ devices {
 # 已刪除 LUN 的殘留 map 會持續存在直到 restart。
 systemctl restart multipathd
 
-# 或者，只清除未使用/殘留的 map，不重啟 daemon：
-multipath -F
-
 # 驗證新設定已生效
 multipathd show config local
 
@@ -799,7 +796,7 @@ multipathd show config local
 multipath -ll
 ```
 
-> **為何不用 `reload`？** `systemctl reload multipathd` 只會命令 daemon 重新解析 `/etc/multipath.conf`。新設定僅套用於 *未來* 建立的裝置，**不會**清除既有的多重路徑 map。若系統已有已刪除 LUN 的殘留 map (例如 dm-X 裝置所有路徑顯示為 "failed faulty")，`reload` 並不會移除它們。請使用 `restart` 或 `multipath -F`。
+> **為何不用 `reload`？** `systemctl reload multipathd` 只會命令 daemon 重新解析 `/etc/multipath.conf`。新設定僅套用於 *未來* 建立的裝置，**不會**清除既有的多重路徑 map。若系統已有已刪除 LUN 的殘留 map (例如 dm-X 裝置所有路徑顯示為 "failed faulty")，`reload` 並不會移除它們。請使用 `restart`。
 
 ### 與既有儲存共存
 

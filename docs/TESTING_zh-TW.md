@@ -930,6 +930,71 @@ pvesm status
 
 ---
 
+## 21. 程式碼審查 Regression Guards
+
+從自動化程式碼審查結果衍生的靜態和功能測試。驗證已知的反模式持續被修正。
+
+### 21.1 殘留清理條件式 untrack (codex review)
+
+驗證 `_cleanup_orphaned_devices()` 僅在本機 multipath 裝置確實已消失時才 untrack WWID，與 `free_image()` 邏輯一致。
+
+```bash
+# Static: code must check device existence AFTER cleanup before untracking
+grep -A5 'still_exists.*get_multipath' lib/PVE/Storage/Custom/NetAppONTAPPlugin.pm | head -6
+# Expected: conditional logic - only _untrack_wwid if !still_exists
+```
+
+### 21.2 alloc_image 有界 TOCTOU retry (codex review)
+
+驗證 `alloc_image()` 的 volume_create 競爭處理使用正確的有界重試迴圈（非單次重試），與 `clone_image()` 模式一致。
+
+```bash
+# Static: must have a retry loop variable
+grep -c 'max_create_retries\|create_try' lib/PVE/Storage/Custom/NetAppONTAPPlugin.pm
+# Expected: 4+ (loop variable + loop + check + die)
+
+# Verify it's a real loop, not a single if-then-retry
+grep -A2 'create_try' lib/PVE/Storage/Custom/NetAppONTAPPlugin.pm | grep -c 'for\|next'
+# Expected: 2+ (for loop + next statement)
+```
+
+### 21.3 不推薦 multipath -F (codex review)
+
+驗證程式碼和文件中不會推薦使用 `multipath -F`（大寫 F，會清除所有 maps）。關於「不要使用」的警告是允許且預期存在的。
+
+```bash
+# Code: only "DO NOT" context allowed
+grep -n 'multipath -F' lib/PVE/Storage/Custom/NetAppONTAPPlugin.pm
+# Expected: only lines containing "DO NOT" or "NEVER" or similar warning
+
+# Docs: no recommendation context
+grep -rn 'multipath -F' docs/ README*.md | grep -vi 'never\|not\|don.t\|warning\|forbidden\|不要\|絕對\|禁止\|警告'
+# Expected: only informational/symptom table entries, no "run this command" suggestions
+
+# Multipath.pm: warning comment only
+grep -n 'multipath -F' lib/PVE/Storage/Custom/NetAppONTAP/Multipath.pm
+# Expected: only WARNING comment
+```
+
+### 21.4 所有 glob() 呼叫有 alarm timeout (codex review)
+
+驗證程式碼中每個 `glob("/dev/disk/by-id/...")` 呼叫皆包裹在 `alarm()` 中，以防止裝置子系統無回應時造成程式掛住。
+
+```bash
+# Find all glob calls on /dev/disk
+grep -rn 'glob.*dev.disk' lib/PVE/Storage/Custom/NetAppONTAP/*.pm
+# For each: check that alarm(5) appears within 3 lines before it
+# (Manual review -- verify each glob is inside an eval { alarm(5); ... alarm(0); } block)
+
+# Quick count check
+GLOB_COUNT=$(grep -c 'glob.*dev.disk' lib/PVE/Storage/Custom/NetAppONTAP/ISCSI.pm lib/PVE/Storage/Custom/NetAppONTAP/Multipath.pm 2>/dev/null)
+ALARM_COUNT=$(grep -c 'alarm(5)' lib/PVE/Storage/Custom/NetAppONTAP/ISCSI.pm lib/PVE/Storage/Custom/NetAppONTAP/Multipath.pm 2>/dev/null)
+echo "glob calls: $GLOB_COUNT, alarm wraps: $ALARM_COUNT"
+# Expected: alarm count >= glob count
+```
+
+---
+
 ## 清除
 
 ```bash

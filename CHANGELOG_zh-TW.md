@@ -2,6 +2,20 @@
 
 NetApp ONTAP Storage Plugin for Proxmox VE 的所有重要變更都記錄在此。
 
+## [0.2.8] - 2026-04-11
+
+### 程式碼審查修復 Release
+
+**Bug 修復 (來自自動化程式碼審查)：**
+
+- **修復殘留清理無條件 untrack WWID。** `_cleanup_orphaned_devices()` 之前在 `cleanup_lun_devices()` 後不管裝置是否真的消失都 untrack。現在比照 `free_image()` 邏輯：只有 `get_multipath_device()` 確認裝置已消失才 untrack。避免 cleanup 部分失敗時 (例如 kpartx holders 擋住 multipath -f) 造成永久殘留裝置。
+
+- **修復 `alloc_image()` TOCTOU race retry。** `volume_create()` 碰到 race 時原本只重試一次，現在改用有界 retry loop (最多 5 次)，跟 `clone_image()` 一致。多個並行的 `alloc_image()` 不再在第一次碰撞後就失敗。
+
+- **移除所有 `multipath -F` (大寫 F) 建議**，包含程式碼和文件。`deactivate_storage()` 的 API 無法連線警告不再建議 `multipath -F`。文件 (CONFIGURATION.md、README.md、兩個 zh-TW 版) 也不再推薦。只建議 per-WWID 清理 (`multipath -f <wwid>`)。所有關於 `-F` 危險性的警告都保留。
+
+- **修復 `ISCSI.pm get_device_by_serial()` 的 bare `glob()`。** `/dev/disk/by-id/` 的 glob 呼叫現在用 `alarm(5)` 包裹，符合 anti-hang 規則，跟 codebase 裡其他所有 glob 一致。
+
 ## [0.2.7] - 2026-04-11
 
 ### kpartx Partition Holder 修復 Release (CRITICAL)

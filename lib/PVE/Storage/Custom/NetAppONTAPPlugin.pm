@@ -535,7 +535,8 @@ sub deactivate_storage {
     if (!$api) {
         warn "WARNING: Cannot connect to ONTAP API.\n";
         warn "  - Local multipath devices cannot be identified for cleanup.\n";
-        warn "  - Manual cleanup may be required: multipath -F\n";
+        warn "  - Manual cleanup may be required per-device: multipath -f <wwid>\n";
+        warn "  - DO NOT use 'multipath -F' (capital F) -- it flushes ALL maps.\n";
         warn "  - iSCSI sessions not logged out.\n";
         multipath_reload();
         return 1;
@@ -840,8 +841,16 @@ sub _cleanup_orphaned_devices {
             warn "Orphan cleanup error for $wwid: $@\n" if $@;
         }
 
-        # Untrack the WWID regardless (it's gone from ONTAP)
-        _untrack_wwid($storeid, $wwid);
+        # Only untrack if local cleanup actually succeeded (multipath device
+        # gone). If device still exists, keep tracked so next status() poll
+        # retries cleanup. Mirrors free_image() conditional untrack logic.
+        my $still_exists = get_multipath_device($wwid);
+        if ($still_exists) {
+            warn "Orphan cleanup: device for WWID $wwid still exists after cleanup, " .
+                 "keeping tracked for retry.\n";
+        } else {
+            _untrack_wwid($storeid, $wwid);
+        }
         $cleaned++;
     }
 
@@ -1063,33 +1072,41 @@ sub alloc_image {
         }
     }
 
-    # Create FlexVol (with race condition handling for concurrent allocation)
-    eval {
-        $api->volume_create(
-            name      => $ontap_volname,
-            aggregate => $scfg->{'ontap-aggregate'},
-            size      => $vol_size,
-            thin      => $scfg->{'ontap-thin'} // 1,
-        );
-    };
-    if ($@ && $@ =~ /already exists|duplicate|entry.*exists|unique/i && $voltype eq 'disk') {
-        # TOCTOU race: another process created this volume between our check and create
-        # Retry with next disk ID
-        warn "Volume '$ontap_volname' race detected, retrying with next disk ID\n";
-        $diskid++;
-        $ontap_volname = encode_volume_name($storeid, $vmid, $diskid);
-        $lun_path = encode_lun_path($ontap_volname);
-        $pve_volname = "vm-${vmid}-disk-${diskid}";
-        $api->volume_create(
-            name      => $ontap_volname,
-            aggregate => $scfg->{'ontap-aggregate'},
-            size      => $vol_size,
-            thin      => $scfg->{'ontap-thin'} // 1,
-        );
-    } elsif ($@) {
+    # Create FlexVol with bounded TOCTOU retry (same pattern as clone_image).
+    # The pre-check loop above finds a free disk ID, but another process can
+    # grab it between the check and the create. If volume_create fails with
+    # "already exists", advance to the next disk ID and retry.
+    my $vol_created = 0;
+    my $max_create_retries = 5;
+
+    for my $create_try (0 .. $max_create_retries) {
+        eval {
+            $api->volume_create(
+                name      => $ontap_volname,
+                aggregate => $scfg->{'ontap-aggregate'},
+                size      => $vol_size,
+                thin      => $scfg->{'ontap-thin'} // 1,
+            );
+        };
+        if (!$@) {
+            $vol_created = 1;
+            last;
+        }
+        if ($@ =~ /already exists|duplicate|entry.*exists|unique/i && $voltype eq 'disk') {
+            warn "Volume '$ontap_volname' race detected, retrying with next disk ID\n";
+            $diskid++;
+            $ontap_volname = encode_volume_name($storeid, $vmid, $diskid);
+            $lun_path = encode_lun_path($ontap_volname);
+            $pve_volname = "vm-${vmid}-disk-${diskid}";
+            next if $create_try < $max_create_retries;
+            die "Cannot find free disk ID for VM $vmid after $max_create_retries race retries: $@";
+        }
+        # Any other error: not a race, fail immediately
         die "Failed to create volume '$ontap_volname': " .
             _translate_limit_error($@, 'volume creation');
     }
+    die "Failed to create volume after $max_create_retries retries"
+        unless $vol_created;
 
     # Warn if aggregate is running low on space (thin provisioning overcommit risk)
     if ($thin) {

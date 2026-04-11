@@ -1,3 +1,23 @@
+jt-pve-storage-netapp (0.2.8-1) stable; urgency=high
+
+  * Code Review Fix Release
+  * Requirements: Proxmox VE 9.1 or later
+  * Bug Fixes (from automated code review):
+    - Fixed orphan cleanup unconditionally untracking WWIDs after
+      cleanup_lun_devices(). Now mirrors free_image() logic: only
+      untracks if multipath device actually disappeared. Prevents
+      permanently orphaned devices when cleanup partially fails.
+    - Fixed alloc_image() TOCTOU race retry: was single-shot, now
+      uses bounded retry loop (max 5) matching clone_image() pattern.
+    - Removed all multipath -F (capital F) recommendations from code
+      and documentation. Only per-WWID cleanup (multipath -f <wwid>)
+      is recommended. Warnings about dangers of -F are preserved.
+    - Fixed bare glob() without alarm timeout in ISCSI.pm
+      get_device_by_serial(). All /dev/disk/by-id/ glob calls now
+      have alarm(5) protection per anti-hang rules.
+
+ -- Jason Cheng <jason@jason.tools>  Fri, 11 Apr 2026 12:00:00 +0800
+
 jt-pve-storage-netapp (0.2.7-1) stable; urgency=critical
 
   * kpartx Partition Holder Fix Release (CRITICAL)

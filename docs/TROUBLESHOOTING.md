@@ -580,6 +580,68 @@ vol delete -vserver <svm> -volume <vol-name>
 
 ---
 
+## Cannot Delete Volume: LVM on Plugin-Managed LUN
+
+**Symptom:**
+```
+Cannot delete volume 'vm-XXXXX-disk-0': device /dev/mapper/3600a... is still in use.
+[HOLDERS] Device has N holder(s):
+    /dev/dm-XX (3600a...-part3)
+      sub-holder: /dev/dm-XX (pbs-data)
+  Detected LVM VG(s): pbs
+```
+
+**Cause:** Someone created LVM volume groups directly on a plugin-managed multipath LUN (or its partitions) at the PVE host level. Common scenarios:
+- PBS (Proxmox Backup Server) storage built on a plugin LUN partition
+- Manual LVM VG created for host-level storage on a plugin LUN
+- Host LVM auto-activation of VGs from inside VM disks (PVE 7->8->9 upgrade without lvm.conf global_filter)
+
+Plugin-managed LUNs are designed to be used exclusively by PVE as VM/CT disks (whole LUN passed to QEMU). Building host-level LVM on them conflicts with the plugin's lifecycle management.
+
+**Resolution:**
+
+1. Confirm the LVM VG data is no longer needed (or has been migrated elsewhere).
+
+2. Deactivate the VG:
+   ```bash
+   vgchange -an <vg_name>
+   ```
+
+3. If the VG name is duplicated (two VGs with the same name):
+   ```bash
+   # Find the correct UUID
+   vgs -o vg_name,vg_uuid,pv_name
+   # Deactivate by UUID
+   vgchange -an --select 'vg_uuid=<UUID>'
+   ```
+
+4. Retry the delete:
+   ```bash
+   pvesm free <storage>:<volname>
+   ```
+
+**Prevention:**
+- Do not create LVM, PBS storage, or any host-level storage on plugin-managed LUNs
+- Use customer-managed storage (e.g. manual iSCSI LVM) for host-level LVM needs
+- Add `global_filter` to `/etc/lvm/lvm.conf` to prevent auto-activation:
+  ```
+  global_filter = [ "r|/dev/mapper/360.*|", "r|/dev/dm-|", "a|.*|" ]
+  ```
+
+## Cannot Delete Volume: Bare Partition Holders (Fixed in v0.2.7)
+
+**Symptom (v0.2.6 and earlier):**
+```
+Cannot delete volume: device is still in use (mounted, has holders, or open by process)
+```
+Every disk deletion fails, even on disks with no LVM or mount.
+
+**Cause:** The kernel auto-creates partition dm devices on multipath LUNs when it detects a partition table inside a VM disk. Before v0.2.7, `is_device_in_use()` treated ALL holders as "in use", including these harmless partition artifacts.
+
+**Resolution:** Upgrade to v0.2.7 or later. The plugin now correctly ignores bare kpartx partition holders (no LVM/mount/swap on top) while still blocking when partitions have real sub-holders.
+
+---
+
 ## Getting Help
 
 1. **Collect diagnostic information:**

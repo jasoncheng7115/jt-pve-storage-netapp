@@ -1161,6 +1161,117 @@ systemctl is-active pvedaemon pvestatd pveproxy
 pvesm status
 ```
 
+### 20.9 Partition with LVM sub-holder shows detailed fix instructions (v0.2.8)
+
+Reproduces the customer scenario where a plugin-managed LUN has partitions
+with LVM VG on top (e.g. PBS storage built on a partition). The error
+message must show: sub-holder details, VG name, vgchange command, and
+duplicate VG UUID handling.
+
+```bash
+STORAGE=netapp1
+pvesm alloc $STORAGE 9985 vm-9985-disk-0 256M
+DEV=$(readlink -f $(pvesm path $STORAGE:vm-9985-disk-0))
+sleep 2
+S=$(blockdev --getsz $DEV)
+
+# Simulate: partition with PBS LVM VG on top
+echo "0 $S linear $DEV 0" | dmsetup create "testwwid-part3"
+echo "0 1024 linear /dev/mapper/testwwid-part3 0" | dmsetup create "pbs-data"
+echo "0 512 linear /dev/mapper/testwwid-part3 1024" | dmsetup create "pbs-db"
+
+# Try to delete — should block with detailed sub-holder info
+OUTPUT=$(pvesm free $STORAGE:vm-9985-disk-0 2>&1)
+echo "$OUTPUT"
+
+# Verify message quality
+echo "$OUTPUT" | grep -q "sub-holder" && echo "PASS: sub-holders shown" || echo "FAIL"
+echo "$OUTPUT" | grep -q "pbs" && echo "PASS: VG name detected" || echo "FAIL"
+echo "$OUTPUT" | grep -q "vgchange -an" && echo "PASS: fix command shown" || echo "FAIL"
+echo "$OUTPUT" | grep -q "vg_uuid" && echo "PASS: duplicate VG handling shown" || echo "FAIL"
+
+# Cleanup
+dmsetup remove pbs-data; dmsetup remove pbs-db
+dmsetup remove testwwid-part3
+pvesm free $STORAGE:vm-9985-disk-0
+```
+
+### 20.10 ASA eventual consistency: lun_map retry (v0.2.9)
+
+Verifies that `lun_map()` retries the LUN UUID lookup when the LUN is not
+immediately visible after creation. This fixes intermittent "LUN not found"
+errors on NetApp ASA systems where POST (create) and GET (query) have a
+brief propagation delay.
+
+#### 20.10.1 Static code audit
+
+```bash
+# Verify lun_map has retry logic
+grep -A15 'sub lun_map' lib/PVE/Storage/Custom/NetAppONTAP/API.pm | head -20
+# Expected: retry loop with sleep 1, up to 5 attempts
+
+# Verify retry count
+grep -c 'attempt.*5\|1\.\.5' lib/PVE/Storage/Custom/NetAppONTAP/API.pm
+# Expected: 1+ (the retry loop)
+
+# Verify warning message on retry
+grep 'not yet visible' lib/PVE/Storage/Custom/NetAppONTAP/API.pm
+# Expected: warn message mentioning attempt count
+```
+
+#### 20.10.2 Functional: move-disk round trip
+
+Tests the full code path that the customer hit (move-disk triggers
+alloc_image -> lun_create -> lun_map).
+
+```bash
+STORAGE=netapp1
+VMID=9986
+
+# Create VM with disk on local
+qm create $VMID --name asa-test --memory 256 --cores 1 \
+  --scsi0 local-lvm:1 --kvm 0 --ostype l26 --scsihw virtio-scsi-single
+
+# Move to NetApp (exercises alloc_image -> lun_create -> lun_map)
+qm move-disk $VMID scsi0 $STORAGE --delete 1
+qm config $VMID | grep scsi0
+# Expected: scsi0 on $STORAGE, no "LUN not found" error
+
+# Move back (exercises clone path)
+qm move-disk $VMID scsi0 local-lvm --delete 1
+qm config $VMID | grep scsi0
+# Expected: scsi0 on local-lvm
+
+qm destroy $VMID --purge
+```
+
+#### 20.10.3 Functional: parallel alloc + map (stress test)
+
+Multiple concurrent alloc operations to stress the create-then-map path.
+
+```bash
+STORAGE=netapp1
+
+# 3 parallel allocs
+pvesm alloc $STORAGE 9987 vm-9987-disk-0 64M > /tmp/a1.log 2>&1 &
+pvesm alloc $STORAGE 9988 vm-9988-disk-0 64M > /tmp/a2.log 2>&1 &
+pvesm alloc $STORAGE 9989 vm-9989-disk-0 64M > /tmp/a3.log 2>&1 &
+wait
+
+# All should succeed
+cat /tmp/a1.log /tmp/a2.log /tmp/a3.log
+# Expected: 3 success lines, no "LUN not found" errors
+
+# Check if any retries were needed
+grep "not yet visible" /tmp/a*.log
+# Expected: empty on FAS/AFF. On ASA, may show retry messages (which is OK)
+
+# Cleanup
+pvesm free $STORAGE:vm-9987-disk-0
+pvesm free $STORAGE:vm-9988-disk-0
+pvesm free $STORAGE:vm-9989-disk-0
+```
+
 ---
 
 ## 21. Code Review Regression Guards
@@ -1252,6 +1363,76 @@ pvesm list $STORAGE
 ## Release Test Results
 
 Each release must pass all tests above before publishing. Results are recorded below.
+
+### v0.2.9-1 ASA Eventual Consistency Fix Release (2026-04-26)
+
+**Scope:** v0.2.9 new feature (lun_map retry) + comprehensive regression across Sections 1-5, 12, 17, 19, 20, 21.
+
+**Environment:** Single-node test (PVE 9.1, ONTAP simulator), netapp1 storage, 2 iSCSI sessions.
+
+#### Section 20.10: v0.2.9 ASA Eventual Consistency
+
+| # | Test | Result |
+|---|------|--------|
+| 20.10.1 | Static: lun_map has retry loop (5 attempts, 1s interval, warn message) | PASS |
+| 20.10.2 | Functional: move-disk NetApp -> local-lvm -> NetApp (no "LUN not found") | PASS |
+| 20.10.3 | Functional: 3 parallel alloc (all succeed, no retry needed on simulator) | PASS |
+
+#### Regression: Core Operations (Sections 1-5, 12, 17)
+
+| # | Section / Test | Result |
+|---|----------------|--------|
+| 1 | Basic connectivity: storage active, 2 iSCSI sessions | PASS |
+| 2.1-2.5 | VM disk lifecycle: alloc + path + R/W + free | PASS |
+| 3.1-3.7 | VM operations: snapshot + rollback + resize | PASS |
+| 4.1-4.2 | Disk migration: move-disk round trip | PASS |
+| 5.1 | Full clone | PASS |
+| 5.2 | Template + linked clone | PASS |
+| 12.1 | Stale device prevention: no residual after free | PASS |
+| 12.2 | No failed faulty multipath paths | PASS |
+| 17.1 | Status performance: < 2 seconds | PASS |
+
+#### Regression: Audit Fixes (Section 19)
+
+| # | Test | Result |
+|---|------|--------|
+| 19.1.1 | No volume_delete without lun_unmap_all in cleanup | PASS |
+| 19.1.2 | No unsafe basename near /sys/block | PASS |
+| 19.1.3 | get_multipath_wwid removed | PASS |
+| 19.1.4 | No bare system() calls | PASS |
+| 19.1.5 | No bare open /sys | PASS |
+| 19.3 | Snapshot stopped VM (flush before snap) | PASS |
+| 19.8 | ONTAP limit error translation (6/6 patterns) | PASS |
+| 19.9.1 | Static: rescan uses /sys/class/iscsi_host | PASS |
+| 19.9.2 | Strace: only host4+host5 scanned (iSCSI), not host0-3 | PASS |
+| 19.9.3 | New LUN discovery via iSCSI rescan | PASS |
+| 19.13 | Postinst reloads all 3 services (static) | PASS |
+
+#### Regression: Customer Incidents (Section 20)
+
+| # | Test | Result |
+|---|------|--------|
+| 20.2 | pvestatd reload: postinst contains all 3 services | PASS |
+| 20.5 | Partition dm-name format variants (8/8 patterns) | PASS |
+
+#### Regression: Code Review Guards (Section 21)
+
+| # | Test | Result |
+|---|------|--------|
+| 21.1 | Orphan cleanup conditional untrack | PASS |
+| 21.2 | alloc_image bounded TOCTOU retry (5 retries) | PASS |
+| 21.3 | No multipath -F recommendations | PASS |
+| 21.4 | All glob() have alarm timeout | PASS |
+
+#### Final state
+
+- WWID tracking: empty (no residual)
+- D-state processes: 0
+- Multipath NETAPP devices: 0
+- Services: pvedaemon, pvestatd, pveproxy all active
+- pvesm status netapp1: active, 1s response
+
+**Verdict:** All v0.2.9 tests PASS. All regression tests PASS. v0.2.9-1 ready for release.
 
 ### v0.2.7-1 Partition Holder Safety Release (2026-04-10)
 

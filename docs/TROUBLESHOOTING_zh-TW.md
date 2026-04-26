@@ -580,6 +580,68 @@ vol delete -vserver <svm> -volume <vol-name>
 
 ---
 
+## 無法刪除 Volume：Plugin 管理的 LUN 上有 LVM
+
+**症狀：**
+```
+Cannot delete volume 'vm-XXXXX-disk-0': device /dev/mapper/3600a... is still in use.
+[HOLDERS] Device has N holder(s):
+    /dev/dm-XX (3600a...-part3)
+      sub-holder: /dev/dm-XX (pbs-data)
+  Detected LVM VG(s): pbs
+```
+
+**原因：** 有人直接在 plugin 管理的 multipath LUN（或其 partition）上，於 PVE 主機層級建立了 LVM volume group。常見情境：
+- 在 plugin LUN 的 partition 上建立 PBS（Proxmox Backup Server）儲存
+- 在 plugin LUN 上手動建立 LVM VG 作為主機層級儲存
+- 主機 LVM 自動啟用了 VM 磁碟內部的 VG（PVE 7->8->9 升級時未設定 lvm.conf global_filter）
+
+Plugin 管理的 LUN 設計上專供 PVE 作為 VM/CT 磁碟使用（整顆 LUN 傳遞給 QEMU）。在上面建立主機層級的 LVM 會與 plugin 的生命週期管理衝突。
+
+**解決方式：**
+
+1. 確認 LVM VG 資料已不再需要（或已遷移至其他位置）。
+
+2. 停用 VG：
+   ```bash
+   vgchange -an <vg_name>
+   ```
+
+3. 如果 VG 名稱重複（兩個 VG 同名）：
+   ```bash
+   # 找到正確的 UUID
+   vgs -o vg_name,vg_uuid,pv_name
+   # 透過 UUID 停用
+   vgchange -an --select 'vg_uuid=<UUID>'
+   ```
+
+4. 重新執行刪除：
+   ```bash
+   pvesm free <storage>:<volname>
+   ```
+
+**預防措施：**
+- 不要在 plugin 管理的 LUN 上建立 LVM、PBS 儲存或任何主機層級儲存
+- 主機層級 LVM 需求請使用客戶自行管理的儲存（例如手動 iSCSI LVM）
+- 在 `/etc/lvm/lvm.conf` 中加入 `global_filter` 以防止自動啟用：
+  ```
+  global_filter = [ "r|/dev/mapper/360.*|", "r|/dev/dm-|", "a|.*|" ]
+  ```
+
+## 無法刪除 Volume：Bare Partition Holders (v0.2.7 已修復)
+
+**症狀（v0.2.6 及更早版本）：**
+```
+Cannot delete volume: device is still in use (mounted, has holders, or open by process)
+```
+所有磁碟刪除都失敗，即使磁碟上沒有 LVM 或掛載。
+
+**原因：** 當 kernel 偵測到 VM 磁碟內有 partition table 時，會自動在 multipath LUN 上建立 partition dm 裝置。在 v0.2.7 之前，`is_device_in_use()` 將所有 holder 都視為「使用中」，包括這些無害的 partition 殘留。
+
+**解決方式：** 升級至 v0.2.7 或更新版本。Plugin 現在能正確忽略 bare kpartx partition holder（上面沒有 LVM/掛載/swap），同時在 partition 有真正的 sub-holder 時仍會阻擋刪除。
+
+---
+
 ## 取得協助
 
 1. **收集診斷資訊：**

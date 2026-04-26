@@ -745,9 +745,9 @@ dpkg -i jt-pve-storage-netapp_0.2.7-1_all.deb 2>&1 | grep -E '\[OK\]'
 # Expected: three [OK] lines (pvedaemon, pvestatd, pveproxy)
 ```
 
-### 20.3 宿主機 LVM auto-activation 擋住 volume 刪除 (Incident 10，v0.2.6)
+### 20.3 PVE 主機 LVM auto-activation 擋住 volume 刪除 (Incident 10，v0.2.6)
 
-驗證 `is_device_in_use()` 在宿主機自動啟用 VM 磁碟內部 LVM VG 時，
+驗證 `is_device_in_use()` 在PVE 主機自動啟用 VM 磁碟內部 LVM VG 時，
 會顯示詳細的診斷訊息，且錯誤訊息包含 VG 名稱與修復指令。
 
 ```bash
@@ -928,6 +928,110 @@ systemctl is-active pvedaemon pvestatd pveproxy
 pvesm status
 ```
 
+### 20.9 Partition 有 LVM sub-holder 時顯示詳細修復指引 (v0.2.8)
+
+重現客戶情境：plugin 管理的 LUN 上的 partition 有 LVM VG（例如在 partition 上建了 PBS 儲存）。錯誤訊息必須顯示：sub-holder 詳情、VG 名稱、vgchange 指令、以及 duplicate VG 的 UUID 處理方式。
+
+```bash
+STORAGE=netapp1
+pvesm alloc $STORAGE 9985 vm-9985-disk-0 256M
+DEV=$(readlink -f $(pvesm path $STORAGE:vm-9985-disk-0))
+sleep 2
+S=$(blockdev --getsz $DEV)
+
+# Simulate: partition with PBS LVM VG on top
+echo "0 $S linear $DEV 0" | dmsetup create "testwwid-part3"
+echo "0 1024 linear /dev/mapper/testwwid-part3 0" | dmsetup create "pbs-data"
+echo "0 512 linear /dev/mapper/testwwid-part3 1024" | dmsetup create "pbs-db"
+
+# Try to delete — should block with detailed sub-holder info
+OUTPUT=$(pvesm free $STORAGE:vm-9985-disk-0 2>&1)
+echo "$OUTPUT"
+
+# Verify message quality
+echo "$OUTPUT" | grep -q "sub-holder" && echo "PASS: sub-holders shown" || echo "FAIL"
+echo "$OUTPUT" | grep -q "pbs" && echo "PASS: VG name detected" || echo "FAIL"
+echo "$OUTPUT" | grep -q "vgchange -an" && echo "PASS: fix command shown" || echo "FAIL"
+echo "$OUTPUT" | grep -q "vg_uuid" && echo "PASS: duplicate VG handling shown" || echo "FAIL"
+
+# Cleanup
+dmsetup remove pbs-data; dmsetup remove pbs-db
+dmsetup remove testwwid-part3
+pvesm free $STORAGE:vm-9985-disk-0
+```
+
+### 20.10 ASA 最終一致性：lun_map retry (v0.2.9)
+
+驗證 `lun_map()` 在 LUN 建立後若無法立即查到 UUID 時會重試。修復 NetApp ASA 系統上間歇性出現的「LUN not found」錯誤，原因是 POST（建立）和 GET（查詢）之間有短暫的傳播延遲。
+
+#### 20.10.1 靜態程式碼審查
+
+```bash
+# 驗證 lun_map 有 retry 邏輯
+grep -A15 'sub lun_map' lib/PVE/Storage/Custom/NetAppONTAP/API.pm | head -20
+# 預期：retry loop，sleep 1，最多 5 次嘗試
+
+# 驗證重試次數
+grep -c 'attempt.*5\|1\.\.5' lib/PVE/Storage/Custom/NetAppONTAP/API.pm
+# 預期：1+（retry loop）
+
+# 驗證重試時的警告訊息
+grep 'not yet visible' lib/PVE/Storage/Custom/NetAppONTAP/API.pm
+# 預期：warn 訊息包含嘗試次數
+```
+
+#### 20.10.2 功能測試：move-disk 往返
+
+測試客戶遇到的完整程式碼路徑（move-disk 觸發 alloc_image -> lun_create -> lun_map）。
+
+```bash
+STORAGE=netapp1
+VMID=9986
+
+# 在 local 建立 VM
+qm create $VMID --name asa-test --memory 256 --cores 1 \
+  --scsi0 local-lvm:1 --kvm 0 --ostype l26 --scsihw virtio-scsi-single
+
+# 搬到 NetApp（走 alloc_image -> lun_create -> lun_map）
+qm move-disk $VMID scsi0 $STORAGE --delete 1
+qm config $VMID | grep scsi0
+# 預期：scsi0 在 $STORAGE 上，沒有「LUN not found」錯誤
+
+# 搬回去（走 clone 路徑）
+qm move-disk $VMID scsi0 local-lvm --delete 1
+qm config $VMID | grep scsi0
+# 預期：scsi0 在 local-lvm 上
+
+qm destroy $VMID --purge
+```
+
+#### 20.10.3 功能測試：並行 alloc + map（壓力測試）
+
+多個並行 alloc 操作，壓力測試 create-then-map 路徑。
+
+```bash
+STORAGE=netapp1
+
+# 3 個並行 alloc
+pvesm alloc $STORAGE 9987 vm-9987-disk-0 64M > /tmp/a1.log 2>&1 &
+pvesm alloc $STORAGE 9988 vm-9988-disk-0 64M > /tmp/a2.log 2>&1 &
+pvesm alloc $STORAGE 9989 vm-9989-disk-0 64M > /tmp/a3.log 2>&1 &
+wait
+
+# 全部應該成功
+cat /tmp/a1.log /tmp/a2.log /tmp/a3.log
+# 預期：3 行成功，沒有「LUN not found」錯誤
+
+# 檢查是否有重試
+grep "not yet visible" /tmp/a*.log
+# 預期：在 FAS/AFF 上應為空。在 ASA 上可能出現 retry 訊息（正常）
+
+# 清理
+pvesm free $STORAGE:vm-9987-disk-0
+pvesm free $STORAGE:vm-9988-disk-0
+pvesm free $STORAGE:vm-9989-disk-0
+```
+
 ---
 
 ## 21. 程式碼審查 Regression Guards
@@ -1015,6 +1119,76 @@ pvesm list $STORAGE
 
 每個版本發佈前都必須通過上述所有測試。結果記錄於下方。
 
+### v0.2.9-1 ASA 最終一致性修復 Release (2026-04-26)
+
+**範圍：** v0.2.9 新功能 (lun_map retry) + 全面 regression (Section 1-5、12、17、19、20、21)。
+
+**測試環境：** 單節點測試 (PVE 9.1, ONTAP simulator)，netapp1 storage，2 個 iSCSI session。
+
+#### Section 20.10：v0.2.9 ASA 最終一致性
+
+| # | 測試 | 結果 |
+|---|------|------|
+| 20.10.1 | 靜態：lun_map 有 retry loop（5 次、1 秒間隔、warn 訊息） | PASS |
+| 20.10.2 | 功能：move-disk NetApp -> local-lvm -> NetApp（無「LUN not found」）| PASS |
+| 20.10.3 | 功能：3 個並行 alloc（全部成功，simulator 上無需 retry） | PASS |
+
+#### Regression：核心操作 (Section 1-5、12、17)
+
+| # | Section / 測試 | 結果 |
+|---|----------------|------|
+| 1 | 基本連線：storage active，2 個 iSCSI session | PASS |
+| 2.1-2.5 | VM 磁碟生命週期：alloc + path + R/W + free | PASS |
+| 3.1-3.7 | VM 操作：快照 + 回溯 + 調整大小 | PASS |
+| 4.1-4.2 | 磁碟遷移：move-disk 往返 | PASS |
+| 5.1 | Full clone | PASS |
+| 5.2 | Template + linked clone | PASS |
+| 12.1 | 殘留裝置防護：free 後無殘留 | PASS |
+| 12.2 | 無 failed faulty multipath 路徑 | PASS |
+| 17.1 | Status 效能：< 2 秒 | PASS |
+
+#### Regression：審查修復 (Section 19)
+
+| # | 測試 | 結果 |
+|---|------|------|
+| 19.1.1 | cleanup 路徑沒有 volume_delete 缺少前置 lun_unmap_all | PASS |
+| 19.1.2 | /sys/block 附近無不安全的 basename | PASS |
+| 19.1.3 | get_multipath_wwid 已刪除 | PASS |
+| 19.1.4 | 無 bare system() 呼叫 | PASS |
+| 19.1.5 | 無 bare open /sys | PASS |
+| 19.3 | 停止的 VM 快照（snap 前 flush） | PASS |
+| 19.8 | ONTAP limit 錯誤翻譯（6/6 pattern） | PASS |
+| 19.9.1 | 靜態：rescan 使用 /sys/class/iscsi_host | PASS |
+| 19.9.2 | Strace：只掃描 host4+host5 (iSCSI)，不碰 host0-3 | PASS |
+| 19.9.3 | 新 LUN 透過 iSCSI rescan 探索 | PASS |
+| 19.13 | Postinst reload 全部 3 個服務（靜態） | PASS |
+
+#### Regression：客戶事件 (Section 20)
+
+| # | 測試 | 結果 |
+|---|------|------|
+| 20.2 | pvestatd reload：postinst 包含 3 個服務 | PASS |
+| 20.5 | Partition dm-name 格式變體（8/8 pattern） | PASS |
+
+#### Regression：程式碼審查 Guards (Section 21)
+
+| # | 測試 | 結果 |
+|---|------|------|
+| 21.1 | 殘留清理條件式 untrack | PASS |
+| 21.2 | alloc_image 有界 TOCTOU retry（5 次） | PASS |
+| 21.3 | 無 multipath -F 推薦 | PASS |
+| 21.4 | 所有 glob() 有 alarm timeout | PASS |
+
+#### Final state
+
+- WWID 追蹤：空（無殘留）
+- D-state 行程：0
+- Multipath NETAPP 裝置：0
+- 服務：pvedaemon、pvestatd、pveproxy 全部 active
+- pvesm status netapp1：active，1 秒回應
+
+**結論：** 所有 v0.2.9 測試 PASS。所有 regression 測試 PASS。v0.2.9-1 可發佈。
+
 ### v0.2.7-1 Partition Holder 安全性 Release (2026-04-10)
 
 **範圍：** v0.2.7 新功能 (kpartx partition holder 忽略、dm-name 格式變體) + Section 20 客戶事件重現 + 完整 regression (Section 2、3、5、19.1、19.9、19.10)。
@@ -1037,7 +1211,7 @@ pvesm list $STORAGE
 |---|------|------|
 | 20.1 | HPE ProLiant smartpqi 掃描卡住：strace 確認僅 iSCSI | PASS |
 | 20.2 | pvestatd reload：postinst 包含全部 3 個服務 | PASS |
-| 20.3 | 宿主機 LVM auto-activation：詳細錯誤含 VG 名稱 + 修復指令 | PASS |
+| 20.3 | PVE 主機 LVM auto-activation：詳細錯誤含 VG 名稱 + 修復指令 | PASS |
 | 20.4 | kpartx partition holders：bare partition 忽略，LVM sub-holder 擋住 | PASS |
 | 20.5 | Partition dm-name 格式變體：8/8 模式正確 | PASS |
 | 20.6 | Postinst lvm.conf global_filter 偵測：程式碼存在 | PASS |

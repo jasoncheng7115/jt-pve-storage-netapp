@@ -964,6 +964,41 @@ sub get_device_usage_details {
 
                         if ($is_part) {
                             $has_partition = 1;
+
+                            # Check sub-holders on this partition (LVM, dm-crypt, etc.)
+                            my $sub_dir = "/sys/block/$h/holders";
+                            if (-d $sub_dir) {
+                                opendir(my $sdh, $sub_dir);
+                                my @subs = grep { !/^\./ } readdir($sdh);
+                                closedir($sdh);
+                                for my $sh (@subs) {
+                                    my $sub_dm_file = "/sys/block/$sh/dm/name";
+                                    if (-r $sub_dm_file) {
+                                        my $sub_dm = sysfs_read_with_timeout($sub_dm_file, 3) // '';
+                                        chomp $sub_dm;
+                                        $detail .= "\n      sub-holder: /dev/$sh ($sub_dm)";
+                                        # Parse VG name from sub-holder dm-name
+                                        if ($sub_dm =~ /^(.*?[^-])-[^-]/) {
+                                            my $vg = $1;
+                                            $vg =~ s/--/-/g;
+                                            push @detected_vgs, $vg
+                                                unless grep { $_ eq $vg } @detected_vgs;
+                                        }
+                                    }
+                                }
+                            }
+
+                            # Check if partition is mounted or swapped
+                            my $part_mapper = "/dev/mapper/$dm_name";
+                            my $part_dm_dev = "/dev/$h";
+                            if ($mounts && ($mounts =~ /^\Q$part_dm_dev\E\s+(\S+)/m ||
+                                            $mounts =~ /^\Q$part_mapper\E\s+(\S+)/m)) {
+                                $detail .= "\n      mounted on: $1";
+                            }
+                            if ($swaps && ($swaps =~ /^\Q$part_dm_dev\E\s/m ||
+                                           $swaps =~ /^\Q$part_mapper\E\s/m)) {
+                                $detail .= "\n      used as swap";
+                            }
                         } elsif ($dm_name =~ /^(.*?[^-])-[^-]/) {
                             my $vg = $1;
                             $vg =~ s/--/-/g;  # un-double hyphens
@@ -983,31 +1018,27 @@ sub get_device_usage_details {
             if (@detected_vgs) {
                 $holder_msg .= "\n\n  Detected LVM VG(s): " .
                                join(", ", @detected_vgs);
-                $holder_msg .= "\n  These are likely host-level LVM auto-activation " .
-                               "of VGs found inside the VM disk.";
-                $holder_msg .= "\n  The host's LVM scanner (/etc/lvm/lvm.conf " .
-                               "global_filter) is not filtering out";
-                $holder_msg .= "\n  plugin-managed multipath devices, so it reads " .
-                               "VG metadata from inside VM disks";
-                $holder_msg .= "\n  and activates them on the host. This is common " .
-                               "on PVE nodes upgraded from 7->8->9.";
-                $holder_msg .= "\n\n  To resolve:";
+                $holder_msg .= "\n\n  This device has active LVM volume group(s) on " .
+                               "its partition(s).";
+                $holder_msg .= "\n  Deletion is blocked to prevent data loss.";
+                $holder_msg .= "\n\n  To resolve (after confirming data is no longer needed):";
                 for my $vg (@detected_vgs) {
                     $holder_msg .= "\n    vgchange -an $vg";
                 }
                 $holder_msg .= "\n  Then retry the delete operation.";
-                $holder_msg .= "\n\n  To prevent recurrence after reboot, add to " .
+                $holder_msg .= "\n\n  If VG name is duplicated (two VGs with same name),";
+                $holder_msg .= "\n  use UUID to specify which one:";
+                $holder_msg .= "\n    vgs -o vg_name,vg_uuid,pv_name";
+                $holder_msg .= "\n    vgchange -an --select 'vg_uuid=<UUID>'";
+                $holder_msg .= "\n\n  To prevent recurrence, add to " .
                                "/etc/lvm/lvm.conf devices section:";
                 $holder_msg .= "\n    global_filter = [ \"r|/dev/mapper/360.*|\", " .
                                "\"a|.*|\" ]";
-                $holder_msg .= "\n  (Adjust the regex to match your environment. " .
-                               "Exclude plugin WWID devices, keep local disks.)";
             } elsif ($has_partition) {
                 $holder_msg .= "\n\n  Partition table detected on this multipath device.";
-                $holder_msg .= "\n  Someone (or the host's LVM/udev) created partitions " .
-                               "on a plugin-managed LUN.";
-                $holder_msg .= "\n  Use 'dmsetup ls' and 'lsblk /dev/$dev_name' to " .
-                               "identify what is using them.";
+                $holder_msg .= "\n  Someone created partitions on a plugin-managed LUN.";
+                $holder_msg .= "\n  Use 'lsblk /dev/$dev_name' to identify what is " .
+                               "using them.";
             }
 
             push @reasons, $holder_msg;

@@ -2,6 +2,14 @@
 
 All notable changes to the NetApp ONTAP Storage Plugin for Proxmox VE are documented here.
 
+## [0.2.9] - 2026-04-25
+
+### ASA Eventual Consistency Fix Release
+
+**Bug Fix:**
+
+- **Fixed `lun_map()` failing with "LUN not found" on NetApp ASA systems.** After `lun_create()` successfully creates a LUN via POST, `lun_map()` immediately queries the LUN UUID via GET. On NetApp ASA (All-SAN Array) systems under load, the LUN may not be immediately visible due to ONTAP internal propagation delay (eventual consistency). `lun_map()` now retries the UUID lookup up to 5 times with 1-second intervals before failing. This fixes intermittent "storage migration failed: Failed to map LUN" errors during move-disk, clone, and alloc operations. The fix is in `API.pm lun_map()`, so all callers benefit automatically: `alloc_image()`, `clone_image()`, `activate_volume()`, and `_ensure_temp_clone()`.
+
 ## [0.2.8] - 2026-04-11
 
 ### Code Review Fix Release

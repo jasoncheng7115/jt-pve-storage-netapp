@@ -178,7 +178,7 @@ systemctl enable --now multipathd
 
 # 步驟 4：安裝外掛程式套件
 # （自動配置 multipath 並重新啟動 PVE 服務）
-dpkg -i jt-pve-storage-netapp_0.2.8-1_all.deb
+dpkg -i jt-pve-storage-netapp_0.2.9-1_all.deb
 ```
 
 > **注意：** 外掛程式會自動：
@@ -223,7 +223,7 @@ apt install -y open-iscsi multipath-tools sg3-utils psmisc \
 systemctl enable --now iscsid multipathd
 
 # 安裝外掛程式（自動配置 multipath 並重新啟動 PVE 服務）
-dpkg -i jt-pve-storage-netapp_0.2.8-1_all.deb
+dpkg -i jt-pve-storage-netapp_0.2.9-1_all.deb
 ```
 
 **叢集安裝順序：**
@@ -260,7 +260,7 @@ done
 
 ```bash
 # 升級 plugin 套件
-dpkg -i jt-pve-storage-netapp_0.2.8-1_all.deb
+dpkg -i jt-pve-storage-netapp_0.2.9-1_all.deb
 ```
 
 postinst 會自動：
@@ -961,7 +961,7 @@ storage: No such storage
 **解決方案：**
 ```bash
 # 在受影響的節點上安裝
-dpkg -i jt-pve-storage-netapp_0.2.8-1_all.deb
+dpkg -i jt-pve-storage-netapp_0.2.9-1_all.deb
 apt install -f
 systemctl restart pvedaemon pveproxy
 ```

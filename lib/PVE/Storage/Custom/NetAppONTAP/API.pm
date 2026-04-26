@@ -811,8 +811,19 @@ sub igroup_remove_initiator {
 sub lun_map {
     my ($self, $lun_path, $igroup_name, $lun_id) = @_;
 
-    my $lun_uuid = $self->lun_get_uuid($lun_path);
-    croak "LUN '$lun_path' not found" unless $lun_uuid;
+    # Retry LUN lookup to handle ONTAP eventual consistency delay.
+    # On ASA (All-SAN Array) systems, a LUN may not be immediately
+    # queryable via GET after a successful POST (lun_create).
+    my $lun_uuid;
+    for my $try (1..5) {
+        $lun_uuid = $self->lun_get_uuid($lun_path);
+        last if $lun_uuid;
+        if ($try < 5) {
+            warn "LUN '$lun_path' not yet visible (attempt $try/5), retrying in 1s...\n";
+            sleep 1;
+        }
+    }
+    croak "LUN '$lun_path' not found after 5 attempts (ONTAP propagation timeout)" unless $lun_uuid;
 
     my $igroup = $self->igroup_get($igroup_name);
     croak "igroup '$igroup_name' not found" unless $igroup;

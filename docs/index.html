@@ -204,8 +204,8 @@
                 <span class="lang-zh">1 VM Disk = 1 LUN = 1 FlexVol</span>
             </div>
             <div class="card__desc">
-                <span class="lang-en">Clean snapshot semantics matching the PVE model. Each disk is an independent ONTAP volume.</span>
-                <span class="lang-zh">乾淨的快照語意，完全匹配 PVE 模型。每個磁碟都是獨立的 ONTAP volume。</span>
+                <span class="lang-en">Clean snapshot semantics matching the Proxmox VE model. Each disk is an independent ONTAP volume.</span>
+                <span class="lang-zh">乾淨的快照語意，完全匹配 Proxmox VE 模型。每個磁碟都是獨立的 ONTAP volume。</span>
             </div>
         </div>
         <div class="card">
@@ -270,8 +270,8 @@
                 <span class="lang-zh">叢集感知即時遷移</span>
             </div>
             <div class="card__desc">
-                <span class="lang-en">LUNs mapped to all node igroups for seamless live migration between PVE nodes.</span>
-                <span class="lang-zh">LUN 對應至所有節點 igroup，實現 PVE 節點間的無縫即時遷移。</span>
+                <span class="lang-en">LUNs mapped to all node igroups for seamless live migration between Proxmox VE nodes.</span>
+                <span class="lang-zh">LUN 對應至所有節點 igroup，實現 Proxmox VE 節點間的無縫即時遷移。</span>
             </div>
         </div>
         <div class="card">
@@ -369,8 +369,8 @@
     </ul>
 
     <h3 class="subsection-title">
-        <span class="lang-en">PVE Node Dependencies</span>
-        <span class="lang-zh">PVE 節點相依套件</span>
+        <span class="lang-en">Proxmox VE Node Dependencies</span>
+        <span class="lang-zh">Proxmox VE 節點相依套件</span>
     </h3>
     <div class="table-wrap">
         <table>
@@ -507,8 +507,8 @@
             </div>
             <pre><span class="cmd">dpkg</span> <span class="flag">-i</span> jt-pve-storage-netapp_0.2.9-1_all.deb</pre>
             <p>
-                <span class="lang-en">The plugin automatically configures multipath and reloads PVE services (pvedaemon, pvestatd, pveproxy).</span>
-                <span class="lang-zh">Plugin 會自動設定 multipath 並重新載入 PVE 服務（pvedaemon、pvestatd、pveproxy）。</span>
+                <span class="lang-en">The plugin automatically configures multipath and reloads Proxmox VE services (pvedaemon, pvestatd, pveproxy).</span>
+                <span class="lang-zh">Plugin 會自動設定 multipath 並重新載入 Proxmox VE 服務（pvedaemon、pvestatd、pveproxy）。</span>
             </p>
         </div>
     </div>
@@ -765,8 +765,8 @@
     </div>
 
     <h3 class="subsection-title">
-        <span class="lang-en">PVE Standard Storage Options</span>
-        <span class="lang-zh">PVE 標準儲存選項</span>
+        <span class="lang-en">Proxmox VE Standard Storage Options</span>
+        <span class="lang-zh">Proxmox VE 標準儲存選項</span>
     </h3>
     <p>
         <span class="lang-en">These are standard Proxmox VE storage options that apply to all storage types, including this plugin.</span>
@@ -794,8 +794,8 @@
                     <span class="lang-zh">此儲存可存放的內容類型。使用 <code>images</code> 僅支援 VM 磁碟，或使用 <code>images,rootdir</code> 同時支援 LXC 容器。其他值：<code>iso</code>、<code>vztmpl</code>、<code>backup</code>（本外掛不支援）。</span>
                 </td></tr>
                 <tr><td><code>shared</code></td><td><code>0</code></td><td>
-                    <span class="lang-en">Mark storage as shared across cluster nodes. <strong>Must set to <code>1</code></strong> for this plugin -- required for live migration. Without this, PVE will try to copy disk data during migration instead of using the shared SAN path.</span>
-                    <span class="lang-zh">標記儲存為叢集節點間共享。本外掛<strong>必須設為 <code>1</code></strong> -- 即時遷移所需。若未設定，PVE 會在遷移時嘗試複製磁碟資料，而非使用共享 SAN 路徑。</span>
+                    <span class="lang-en">Mark storage as shared across cluster nodes. <strong>Must set to <code>1</code></strong> for this plugin -- required for live migration. Without this, Proxmox VE will try to copy disk data during migration instead of using the shared SAN path.</span>
+                    <span class="lang-zh">標記儲存為叢集節點間共享。本外掛<strong>必須設為 <code>1</code></strong> -- 即時遷移所需。若未設定，Proxmox VE 會在遷移時嘗試複製磁碟資料，而非使用共享 SAN 路徑。</span>
                 </td></tr>
                 <tr><td><code>nodes</code></td><td>
                     <span class="lang-en">(all)</span>
@@ -896,8 +896,8 @@
         <table>
             <thead><tr>
                 <th>
-                    <span class="lang-en">PVE Object</span>
-                    <span class="lang-zh">PVE 物件</span>
+                    <span class="lang-en">Proxmox VE Object</span>
+                    <span class="lang-zh">Proxmox VE 物件</span>
                 </th>
                 <th>
                     <span class="lang-en">ONTAP Object</span>
@@ -916,7 +916,7 @@
                 <tr><td>VM Disk</td><td>FlexVol</td><td><code>pve_{storage}_{vmid}_disk{id}</code></td></tr>
                 <tr><td>VM Disk</td><td>LUN</td><td><code>/vol/{flexvol}/lun0</code></td></tr>
                 <tr><td>Snapshot</td><td>Volume Snapshot</td><td><code>pve_snap_{snapname}</code></td></tr>
-                <tr><td>PVE Node</td><td>igroup</td><td><code>pve_{cluster}_{node}</code></td></tr>
+                <tr><td>Proxmox VE Node</td><td>igroup</td><td><code>pve_{cluster}_{node}</code></td></tr>
                 <tr><td>Cloud-init</td><td>FlexVol</td><td><code>pve_{storage}_{vmid}_cloudinit</code></td></tr>
                 <tr><td>VM State</td><td>FlexVol</td><td><code>pve_{storage}_{vmid}_state_{snap}</code></td></tr>
             </tbody>
@@ -931,8 +931,8 @@
         <div class="module-item">
             <div class="module-item__name">NetAppONTAPPlugin.pm</div>
             <div class="module-item__desc">
-                <span class="lang-en">Main plugin -- PVE Storage Plugin API implementation. Volumes, snapshots, clones.</span>
-                <span class="lang-zh">主 plugin -- PVE Storage Plugin API 實作。Volumes、快照、複製。</span>
+                <span class="lang-en">Main plugin -- Proxmox VE Storage Plugin API implementation. Volumes, snapshots, clones.</span>
+                <span class="lang-zh">主 plugin -- Proxmox VE Storage Plugin API 實作。Volumes、快照、複製。</span>
             </div>
         </div>
         <div class="module-item">
@@ -966,8 +966,8 @@
         <div class="module-item">
             <div class="module-item__name">Naming.pm</div>
             <div class="module-item__desc">
-                <span class="lang-en">PVE to ONTAP naming conventions. Volume names, LUN paths, igroup names.</span>
-                <span class="lang-zh">PVE 至 ONTAP 命名規則。Volume 名稱、LUN 路徑、igroup 名稱。</span>
+                <span class="lang-en">Proxmox VE to ONTAP naming conventions. Volume names, LUN paths, igroup names.</span>
+                <span class="lang-zh">Proxmox VE 至 ONTAP 命名規則。Volume 名稱、LUN 路徑、igroup 名稱。</span>
             </div>
         </div>
     </div>
@@ -981,7 +981,7 @@
     </h2>
     <div class="alert alert--danger">
         <strong>
-            <span class="lang-en">READ THIS BEFORE INSTALLING. These rules prevent PVE node hangs and accidental disconnection of other storage.</span>
+            <span class="lang-en">READ THIS BEFORE INSTALLING. These rules prevent Proxmox VE node hangs and accidental disconnection of other storage.</span>
             <span class="lang-zh">安裝前請務必閱讀。這些規則防止 PVE 節點當機及意外斷開其他儲存。</span>
         </strong>
     </div>

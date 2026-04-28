@@ -480,11 +480,11 @@ p code, li code {
     border-radius: var(--radius-lg);
     border: 1px solid rgba(255,255,255,0.04);
     overflow-x: auto;
-    font-family: "Courier New", Courier, monospace;
-    font-size: 13px; line-height: 1.35;
+    font-family: Menlo, "DejaVu Sans Mono", "Liberation Mono", "Courier New", monospace;
+    font-size: 12.5px; line-height: 1.4;
     margin: 14px 0; white-space: pre;
-    -webkit-font-smoothing: none;
-    -moz-osx-font-smoothing: unset;
+    font-variant-ligatures: none;
+    -webkit-text-size-adjust: none;
 }
 
 /* ============================================================

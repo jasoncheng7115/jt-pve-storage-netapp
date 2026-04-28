@@ -600,22 +600,22 @@ details .detail-content {
    Footer
    ============================================================ */
 .footer {
-    background: var(--navy);
-    color: rgba(255,255,255,0.5);
+    background: var(--surface-2);
+    color: var(--text-secondary);
     padding: 24px var(--section-px);
     font-size: 0.78rem;
-    border-top: 1px solid rgba(255,255,255,0.06);
+    border-top: 1px solid var(--border);
 }
 .footer__inner {
     max-width: var(--content-w); margin: 0 auto;
     display: flex; justify-content: space-between;
     align-items: center; flex-wrap: wrap; gap: 12px;
 }
-.footer__center { color: rgba(255,255,255,0.35); font-size: 0.74rem; }
-.footer__center a { color: rgba(255,255,255,0.45); }
-.footer__center a:hover { color: rgba(255,255,255,0.75); }
-.footer a { color: rgba(255,255,255,0.6); }
-.footer a:hover { color: #fff; }
+.footer__center { color: var(--text-muted); font-size: 0.74rem; }
+.footer__center a { color: var(--text-secondary); }
+.footer__center a:hover { color: var(--indigo); }
+.footer a { color: var(--text-secondary); }
+.footer a:hover { color: var(--indigo); }
 
 /* ============================================================
    Utility

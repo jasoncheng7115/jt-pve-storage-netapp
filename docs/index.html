@@ -35,6 +35,9 @@
 <!-- ======== Sidebar ======== -->
 <div class="sidebar-overlay" onclick="toggleSidebar()"></div>
 <nav class="sidebar" id="sidebar">
+    <div class="sidebar__search">
+        <input type="text" class="sidebar__search-input" id="sidebarSearch" placeholder="Search..." oninput="filterSidebar(this.value)">
+    </div>
     <div class="sidebar__section">
         <div class="sidebar__heading">
             <span class="lang-en">Getting Started</span>
@@ -1647,6 +1650,22 @@
 
 <script>
 (function() {
+    // Sidebar search filter
+    window.filterSidebar = function(query) {
+        var q = query.toLowerCase().trim();
+        var links = document.querySelectorAll('.sidebar__link');
+        var sections = document.querySelectorAll('.sidebar__section');
+        links.forEach(function(link) {
+            var text = link.textContent.toLowerCase();
+            link.style.display = (q === '' || text.indexOf(q) !== -1) ? '' : 'none';
+        });
+        sections.forEach(function(sec) {
+            var visibleLinks = sec.querySelectorAll('.sidebar__link:not([style*="display: none"])');
+            var heading = sec.querySelector('.sidebar__heading');
+            if (heading) heading.style.display = (q === '' || visibleLinks.length > 0) ? '' : 'none';
+        });
+    };
+
     // Language toggle
     window.toggleLang = function() {
         var current = document.documentElement.getAttribute('data-lang');

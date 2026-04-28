@@ -214,7 +214,7 @@ img { max-width: 100%; height: auto; }
     font-weight: 700;
     text-transform: uppercase;
     letter-spacing: 0.08em;
-    color: rgba(255,255,255,0.35);
+    color: rgba(255,255,255,0.5);
     padding: 12px 8px 6px;
     display: flex;
     align-items: center;
@@ -235,7 +235,7 @@ img { max-width: 100%; height: auto; }
     display: block;
     padding: 7px 12px;
     font-size: 0.875rem;
-    color: rgba(255,255,255,0.55);
+    color: rgba(255,255,255,0.75);
     border-radius: 6px;
     transition: all 0.15s;
     line-height: 1.5;
@@ -243,11 +243,11 @@ img { max-width: 100%; height: auto; }
 }
 .sidebar__link:hover {
     color: #fff;
-    background: rgba(255,255,255,0.08);
+    background: rgba(255,255,255,0.1);
 }
 .sidebar__link.active {
-    color: var(--indigo-light);
-    background: rgba(79, 70, 229, 0.15);
+    color: #fff;
+    background: rgba(79, 70, 229, 0.25);
     font-weight: 600;
     border-left-color: var(--indigo-light);
 }
@@ -261,11 +261,21 @@ img { max-width: 100%; height: auto; }
 
 /* ---- Hero ---- */
 .hero {
-    background: var(--navy);
+    background: linear-gradient(180deg, var(--navy) 0%, #0d1f3c 100%);
     position: relative;
     overflow: hidden;
     padding: 90px 40px 80px;
     color: #fff;
+}
+.hero::after {
+    content: "";
+    position: absolute;
+    bottom: 0;
+    left: 0;
+    right: 0;
+    height: 60px;
+    background: linear-gradient(180deg, transparent, var(--bg));
+    pointer-events: none;
 }
 
 .hero__grid-bg {

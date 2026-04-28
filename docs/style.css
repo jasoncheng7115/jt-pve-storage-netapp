@@ -165,9 +165,9 @@ img { max-width: 100%; height: auto; display: block; }
 
 .sidebar__link {
     display: block; padding: 6px 10px;
-    font-size: 0.835rem; color: var(--text-secondary);
+    font-size: 0.82rem; color: var(--text-secondary);
     border-radius: 5px; transition: all 0.12s;
-    line-height: 1.45;
+    line-height: 1.45; margin-left: 10px;
 }
 .sidebar__link:hover { color: var(--text); background: var(--surface-2); }
 .sidebar__link.active {

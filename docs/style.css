@@ -661,3 +661,12 @@ details .detail-content {
     background: rgba(0,0,0,0.5); z-index: 899;
 }
 .sidebar-overlay.show { display: block; }
+
+/* -- Search highlight -- */
+mark.search-hl {
+    background: #fde68a;
+    color: inherit;
+    padding: 1px 2px;
+    border-radius: 2px;
+    box-shadow: 0 0 0 1px rgba(245,158,11,0.3);
+}

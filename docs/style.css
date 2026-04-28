@@ -169,7 +169,7 @@ img { max-width: 100%; height: auto; }
     left: 0;
     bottom: 0;
     width: var(--sidebar-width);
-    background: var(--bg-card);
+    background: linear-gradient(180deg, #ffffff 0%, #f8fafc 40%, #f1f5f9 100%);
     border-right: 1px solid var(--border);
     overflow-y: auto;
     padding: 20px 0;
@@ -326,14 +326,64 @@ img { max-width: 100%; height: auto; }
 
 /* ---- Content Sections ---- */
 .content-wrap {
-    max-width: 960px;
-    padding: 0 40px;
-    margin: 0 auto;
+    max-width: none;
+    padding: 0;
+    margin: 0;
 }
 
 .doc-section {
-    padding: 48px 0;
-    border-bottom: 1px solid var(--border-light);
+    padding: 56px 40px;
+    border-bottom: none;
+    border-top: 1px solid transparent;
+    border-image: linear-gradient(90deg, transparent 0%, var(--border) 20%, var(--border) 80%, transparent 100%) 1;
+}
+.doc-section > * {
+    max-width: 960px;
+    margin-left: auto;
+    margin-right: auto;
+}
+.doc-section:first-child {
+    border-top: none;
+}
+.doc-section:nth-child(odd) {
+    background: #ffffff;
+}
+.doc-section:nth-child(even) {
+    background: var(--bg);
+}
+/* Special dark section for architecture */
+.doc-section--dark {
+    background: var(--navy) !important;
+    color: #e2e8f0;
+    border-image: linear-gradient(90deg, transparent 0%, rgba(255,255,255,0.08) 20%, rgba(255,255,255,0.08) 80%, transparent 100%) 1;
+}
+.doc-section--dark .section-title { color: #ffffff; }
+.doc-section--dark .section-subtitle { color: #94a3b8; }
+.doc-section--dark .subsection-title { color: #e2e8f0; }
+.doc-section--dark a { color: var(--indigo-light); }
+.doc-section--dark code {
+    background: rgba(255,255,255,0.1);
+    color: #c4b5fd;
+}
+.doc-section--dark .table-wrapper table {
+    border-color: rgba(255,255,255,0.1);
+}
+.doc-section--dark .table-wrapper th {
+    background: rgba(255,255,255,0.08);
+    color: #e2e8f0;
+    border-color: rgba(255,255,255,0.1);
+}
+.doc-section--dark .table-wrapper td {
+    border-color: rgba(255,255,255,0.08);
+    color: #cbd5e1;
+}
+.doc-section--dark .table-wrapper tr:hover td {
+    background: rgba(255,255,255,0.04);
+}
+
+/* Accent stripe at section top */
+.doc-section--accent {
+    border-top: 3px solid var(--indigo);
 }
 .doc-section:last-child { border-bottom: none; }
 
@@ -411,12 +461,20 @@ img { max-width: 100%; height: auto; }
 .card {
     background: var(--bg-card);
     border: 1px solid var(--border);
+    border-left: 3px solid var(--indigo);
     border-radius: var(--radius-lg);
     padding: 24px;
     transition: all 0.2s;
 }
+.card:nth-child(3n+2) {
+    border-left-color: #0ea5e9;
+}
+.card:nth-child(3n+3) {
+    border-left-color: #8b5cf6;
+}
 .card:hover {
     border-color: var(--indigo);
+    border-left-color: var(--indigo);
     box-shadow: var(--shadow-md);
     transform: translateY(-2px);
 }
@@ -432,6 +490,9 @@ img { max-width: 100%; height: auto; }
     margin-bottom: 14px;
     color: var(--indigo);
     font-size: 1.1rem;
+}
+.card__icon svg {
+    flex-shrink: 0;
 }
 
 .card__title {
@@ -530,16 +591,19 @@ p code, li code {
 
 /* ---- ASCII Diagram ---- */
 .ascii-diagram {
-    background: var(--navy);
+    background: #0a1628;
     color: #a5b4fc;
     padding: 24px 28px;
     border-radius: var(--radius-lg);
+    border: 1px solid rgba(165, 180, 252, 0.15);
     overflow-x: auto;
-    font-family: var(--font-mono);
-    font-size: 0.82rem;
-    line-height: 1.5;
+    font-family: "SF Mono", "Fira Code", "Cascadia Code", "Courier New", Consolas, monospace;
+    font-size: 0.8rem;
+    line-height: 1.45;
     margin: 16px 0;
     white-space: pre;
+    tab-size: 4;
+    letter-spacing: 0;
 }
 
 /* ---- Details / Collapsible ---- */
@@ -694,9 +758,9 @@ details .detail-content {
 .footer {
     background: var(--navy);
     color: rgba(255,255,255,0.6);
-    padding: 40px 40px;
-    font-size: 0.85rem;
-    border-top: 1px solid rgba(255,255,255,0.05);
+    padding: 32px 40px;
+    font-size: 0.82rem;
+    border-top: 1px solid rgba(255,255,255,0.08);
 }
 
 .footer__inner {
@@ -707,6 +771,18 @@ details .detail-content {
     align-items: center;
     flex-wrap: wrap;
     gap: 16px;
+}
+
+.footer__center {
+    color: rgba(255,255,255,0.45);
+    font-size: 0.78rem;
+}
+
+.footer__center a {
+    color: rgba(255,255,255,0.55);
+}
+.footer__center a:hover {
+    color: rgba(255,255,255,0.85);
 }
 
 .footer a {
@@ -766,8 +842,8 @@ details .detail-content {
     .hero__title {
         font-size: 1.7rem;
     }
-    .content-wrap {
-        padding: 0 24px;
+    .doc-section {
+        padding: 56px 24px;
     }
 }
 
@@ -793,8 +869,8 @@ details .detail-content {
     .github-link span {
         display: none;
     }
-    .content-wrap {
-        padding: 0 16px;
+    .doc-section {
+        padding: 32px 16px;
     }
     .footer {
         padding: 32px 16px;

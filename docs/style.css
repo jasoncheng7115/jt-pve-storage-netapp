@@ -475,9 +475,11 @@ p code, li code {
     border-radius: var(--radius-lg);
     border: 1px solid rgba(255,255,255,0.04);
     overflow-x: auto;
-    font-family: var(--mono);
-    font-size: 0.78rem; line-height: 1.4;
+    font-family: "Courier New", Courier, monospace;
+    font-size: 13px; line-height: 1.35;
     margin: 14px 0; white-space: pre;
+    -webkit-font-smoothing: none;
+    -moz-osx-font-smoothing: unset;
 }
 
 /* ============================================================

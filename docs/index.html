@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>NetApp ONTAP SAN Storage Plugin for Proxmox VE</title>
+<title>jt-pve-storage-netapp -- NetApp ONTAP SAN Storage Plugin for Proxmox VE</title>
 <meta name="description" content="Technical documentation for jt-pve-storage-netapp: NetApp ONTAP SAN/iSCSI/FC storage plugin for Proxmox VE.">
 <link rel="stylesheet" href="style.css">
 </head>
@@ -14,8 +14,7 @@
     <div class="top-nav__brand">
         <div class="top-nav__brand-icon">NT</div>
         <span>
-            <span class="lang-en">NetApp ONTAP Plugin Docs</span>
-            <span class="lang-zh">NetApp ONTAP Plugin 文件</span>
+            <span>jt-pve-storage-netapp</span>
         </span>
     </div>
     <div class="top-nav__actions">
@@ -117,12 +116,14 @@
 <section class="hero" id="hero">
     <div class="hero__grid-bg"></div>
     <div class="hero__glow"></div>
+    <div class="hero__glow-left"></div>
     <div class="hero__content">
         <div class="hero__badge">v0.2.9 -- MIT License</div>
-        <h1 class="hero__title">
-            <span class="lang-en">NetApp ONTAP SAN/iSCSI/FC<br>Storage Plugin for Proxmox VE</span>
-            <span class="lang-zh">NetApp ONTAP SAN/iSCSI/FC<br>Proxmox VE 儲存 Plugin</span>
-        </h1>
+        <h1 class="hero__title">jt-pve-storage-netapp</h1>
+        <p class="hero__project-desc">
+            <span class="lang-en">NetApp ONTAP SAN/iSCSI/FC Storage Plugin for Proxmox VE</span>
+            <span class="lang-zh">NetApp ONTAP SAN/iSCSI/FC Proxmox VE 儲存外掛程式</span>
+        </p>
         <p class="hero__subtitle">
             <span class="lang-en">Enterprise SAN storage integration for Proxmox VE using NetApp ONTAP REST API. Supports iSCSI and Fibre Channel with multipath, snapshots, FlexClone, live migration, and automatic device lifecycle management.</span>
             <span class="lang-zh">透過 NetApp ONTAP REST API 將企業級 SAN 儲存整合至 Proxmox VE。支援 iSCSI 及 Fibre Channel，具備 multipath、快照、FlexClone、即時遷移，以及自動裝置生命週期管理。</span>
@@ -761,6 +762,58 @@
     </div>
 
     <h3 class="subsection-title">
+        <span class="lang-en">PVE Standard Storage Options</span>
+        <span class="lang-zh">PVE 標準儲存選項</span>
+    </h3>
+    <p>
+        <span class="lang-en">These are standard Proxmox VE storage options that apply to all storage types, including this plugin.</span>
+        <span class="lang-zh">這些是 Proxmox VE 標準儲存選項，適用於所有儲存類型，包含本外掛程式。</span>
+    </p>
+    <div class="table-wrap">
+        <table>
+            <thead><tr>
+                <th>
+                    <span class="lang-en">Option</span>
+                    <span class="lang-zh">選項</span>
+                </th>
+                <th>
+                    <span class="lang-en">Default</span>
+                    <span class="lang-zh">預設值</span>
+                </th>
+                <th>
+                    <span class="lang-en">Description</span>
+                    <span class="lang-zh">說明</span>
+                </th>
+            </tr></thead>
+            <tbody>
+                <tr><td><code>content</code></td><td><code>images</code></td><td>
+                    <span class="lang-en">Content types this storage can hold. Use <code>images</code> for VM disks only, or <code>images,rootdir</code> to also support LXC containers. Other valid values: <code>iso</code>, <code>vztmpl</code>, <code>backup</code> (not supported by this plugin).</span>
+                    <span class="lang-zh">此儲存可存放的內容類型。使用 <code>images</code> 僅支援 VM 磁碟，或使用 <code>images,rootdir</code> 同時支援 LXC 容器。其他值：<code>iso</code>、<code>vztmpl</code>、<code>backup</code>（本外掛不支援）。</span>
+                </td></tr>
+                <tr><td><code>shared</code></td><td><code>0</code></td><td>
+                    <span class="lang-en">Mark storage as shared across cluster nodes. <strong>Must set to <code>1</code></strong> for this plugin -- required for live migration. Without this, PVE will try to copy disk data during migration instead of using the shared SAN path.</span>
+                    <span class="lang-zh">標記儲存為叢集節點間共享。本外掛<strong>必須設為 <code>1</code></strong> -- 即時遷移所需。若未設定，PVE 會在遷移時嘗試複製磁碟資料，而非使用共享 SAN 路徑。</span>
+                </td></tr>
+                <tr><td><code>nodes</code></td><td>
+                    <span class="lang-en">(all)</span>
+                    <span class="lang-zh">（全部）</span>
+                </td><td>
+                    <span class="lang-en">Restrict storage to specific nodes. Comma-separated list of node names. Example: <code>--nodes pve1,pve2,pve3</code>. Omit to allow all nodes.</span>
+                    <span class="lang-zh">限制儲存僅供特定節點使用。以逗號分隔的節點名稱清單。範例：<code>--nodes pve1,pve2,pve3</code>。省略表示允許所有節點。</span>
+                </td></tr>
+                <tr><td><code>disable</code></td><td><code>0</code></td><td>
+                    <span class="lang-en">Disable this storage. Set to <code>1</code> to temporarily deactivate without removing the configuration.</span>
+                    <span class="lang-zh">停用此儲存。設為 <code>1</code> 可暫時停用而不刪除設定。</span>
+                </td></tr>
+            </tbody>
+        </table>
+    </div>
+    <div class="alert alert--info">
+        <span class="lang-en"><strong>Tip:</strong> For LXC container support, you must include <code>rootdir</code> in the content type: <code>--content images,rootdir</code>. Without it, LXC creation on this storage will fail.</span>
+        <span class="lang-zh"><strong>提示：</strong>若要支援 LXC 容器，必須在 content 類型中加入 <code>rootdir</code>：<code>--content images,rootdir</code>。未設定時，在此儲存上建立 LXC 會失敗。</span>
+    </div>
+
+    <h3 class="subsection-title">
         <span class="lang-en">Example storage.cfg (iSCSI)</span>
         <span class="lang-zh">範例 storage.cfg (iSCSI)</span>
     </h3>
@@ -773,7 +826,7 @@
     ontap-protocol iscsi
     ontap-thin 1
     ontap-igroup-mode per-node
-    content images
+    content images,rootdir
     shared 1</div>
 
     <h3 class="subsection-title">
@@ -789,7 +842,7 @@
     ontap-protocol fc
     ontap-thin 1
     ontap-igroup-mode per-node
-    content images
+    content images,rootdir
     shared 1</div>
 
     <div class="alert alert--info">

@@ -1647,39 +1647,81 @@
 <script>
 (function() {
     // Sidebar search filter
+    // Clear all highlights
+    function clearHighlights() {
+        document.querySelectorAll('mark.search-hl').forEach(function(m) {
+            var parent = m.parentNode;
+            parent.replaceChild(document.createTextNode(m.textContent), m);
+            parent.normalize();
+        });
+    }
+
+    // Highlight text in a node tree (skip script, style, code, pre, mark)
+    function highlightIn(el, q) {
+        var skip = {SCRIPT:1, STYLE:1, MARK:1, PRE:1, CODE:1, TEXTAREA:1, INPUT:1};
+        var walker = document.createTreeWalker(el, NodeFilter.SHOW_TEXT, null);
+        var hits = [];
+        while (walker.nextNode()) {
+            var node = walker.currentNode;
+            if (skip[node.parentNode.tagName]) continue;
+            var idx = node.textContent.toLowerCase().indexOf(q);
+            if (idx !== -1) hits.push({node: node, idx: idx});
+        }
+        // Process in reverse so earlier indices stay valid
+        for (var i = hits.length - 1; i >= 0; i--) {
+            var h = hits[i];
+            var before = h.node.splitText(h.idx);
+            var match = before.splitText(q.length);
+            var mark = document.createElement('mark');
+            mark.className = 'search-hl';
+            mark.textContent = before.textContent;
+            before.parentNode.replaceChild(mark, before);
+        }
+    }
+
+    var searchTimer = null;
     window.filterSidebar = function(query) {
+        clearTimeout(searchTimer);
         var q = query.toLowerCase().trim();
         var links = document.querySelectorAll('.sidebar__link');
         var sections = document.querySelectorAll('.sidebar__section');
+
+        // Clear previous highlights
+        clearHighlights();
+
         links.forEach(function(link) {
-            if (q === '') {
+            if (q === '' || q.length < 2) {
                 link.style.display = '';
-                link.removeAttribute('data-matches');
                 return;
             }
-            // Search sidebar link text
             var linkText = link.textContent.toLowerCase();
             var match = linkText.indexOf(q) !== -1;
-            // Also search the corresponding page section content
             if (!match) {
                 var href = link.getAttribute('href');
                 if (href && href.startsWith('#')) {
                     var target = document.getElementById(href.substring(1));
-                    if (target) {
-                        var content = target.textContent.toLowerCase();
-                        match = content.indexOf(q) !== -1;
-                    }
+                    if (target) match = target.textContent.toLowerCase().indexOf(q) !== -1;
                 }
             }
             link.style.display = match ? '' : 'none';
-            if (match) link.setAttribute('data-matches', '1');
-            else link.removeAttribute('data-matches');
         });
         sections.forEach(function(sec) {
             var visibleLinks = sec.querySelectorAll('.sidebar__link:not([style*="display: none"])');
             var heading = sec.querySelector('.sidebar__heading');
-            if (heading) heading.style.display = (q === '' || visibleLinks.length > 0) ? '' : 'none';
+            if (heading) heading.style.display = (q === '' || q.length < 2 || visibleLinks.length > 0) ? '' : 'none';
         });
+
+        // Debounce highlight (heavier operation)
+        if (q.length >= 2) {
+            searchTimer = setTimeout(function() {
+                var lang = document.documentElement.getAttribute('data-lang') || 'en';
+                document.querySelectorAll('.doc-section').forEach(function(sec) {
+                    if (sec.textContent.toLowerCase().indexOf(q) !== -1) {
+                        highlightIn(sec, q);
+                    }
+                });
+            }, 300);
+        }
     };
 
     // Language toggle

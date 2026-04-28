@@ -1,0 +1,13 @@
+*.deb
+*.buildinfo
+*.changes
+debian/.debhelper/
+debian/jt-pve-storage-netapp/
+debian/debhelper-build-stamp
+debian/files
+debian/*.substvars
+.claude/
+DEVELOPMENT_LOG.md
+SESSION_NOTES.md
+tests/
+temp/

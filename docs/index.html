@@ -1,0 +1,1661 @@
+<!DOCTYPE html>
+<html lang="en" data-lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>NetApp ONTAP SAN Storage Plugin for Proxmox VE</title>
+<meta name="description" content="Technical documentation for jt-pve-storage-netapp: NetApp ONTAP SAN/iSCSI/FC storage plugin for Proxmox VE.">
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<!-- ======== Top Nav ======== -->
+<header class="top-nav">
+    <div class="top-nav__brand">
+        <div class="top-nav__brand-icon">NT</div>
+        <span>
+            <span class="lang-en">NetApp ONTAP Plugin Docs</span>
+            <span class="lang-zh">NetApp ONTAP Plugin 文件</span>
+        </span>
+    </div>
+    <div class="top-nav__actions">
+        <button class="lang-toggle" onclick="toggleLang()" title="Switch Language">
+            <span class="lang-en">zh-TW</span>
+            <span class="lang-zh">EN</span>
+        </button>
+        <a href="https://github.com/jasoncheng7115/jt-pve-storage-netapp" class="github-link" target="_blank" rel="noopener">
+            <svg width="18" height="18" viewBox="0 0 16 16" fill="currentColor"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.013 8.013 0 0016 8c0-4.42-3.58-8-8-8z"/></svg>
+            <span>GitHub</span>
+        </a>
+        <button class="hamburger" onclick="toggleSidebar()" aria-label="Menu">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 12h18M3 6h18M3 18h18"/></svg>
+        </button>
+    </div>
+</header>
+
+<!-- ======== Sidebar ======== -->
+<div class="sidebar-overlay" onclick="toggleSidebar()"></div>
+<nav class="sidebar" id="sidebar">
+    <div class="sidebar__section">
+        <div class="sidebar__heading">
+            <span class="lang-en">Getting Started</span>
+            <span class="lang-zh">快速開始</span>
+        </div>
+        <a href="#hero" class="sidebar__link">
+            <span class="lang-en">Overview</span>
+            <span class="lang-zh">概覽</span>
+        </a>
+        <a href="#disclaimer" class="sidebar__link">
+            <span class="lang-en">Disclaimer</span>
+            <span class="lang-zh">免責聲明</span>
+        </a>
+        <a href="#features" class="sidebar__link">
+            <span class="lang-en">Features</span>
+            <span class="lang-zh">功能特性</span>
+        </a>
+        <a href="#requirements" class="sidebar__link">
+            <span class="lang-en">Requirements</span>
+            <span class="lang-zh">系統需求</span>
+        </a>
+    </div>
+    <div class="sidebar__section">
+        <div class="sidebar__heading">
+            <span class="lang-en">Setup</span>
+            <span class="lang-zh">安裝設定</span>
+        </div>
+        <a href="#installation" class="sidebar__link">
+            <span class="lang-en">Installation</span>
+            <span class="lang-zh">安裝</span>
+        </a>
+        <a href="#quickstart" class="sidebar__link">
+            <span class="lang-en">Quick Start</span>
+            <span class="lang-zh">快速入門</span>
+        </a>
+        <a href="#configuration" class="sidebar__link">
+            <span class="lang-en">Configuration</span>
+            <span class="lang-zh">設定選項</span>
+        </a>
+    </div>
+    <div class="sidebar__section">
+        <div class="sidebar__heading">
+            <span class="lang-en">Architecture</span>
+            <span class="lang-zh">架構</span>
+        </div>
+        <a href="#architecture" class="sidebar__link">
+            <span class="lang-en">Architecture</span>
+            <span class="lang-zh">系統架構</span>
+        </a>
+        <a href="#multipath-safety" class="sidebar__link">
+            <span class="lang-en">Multipath Safety</span>
+            <span class="lang-zh">Multipath 安全規則</span>
+        </a>
+        <a href="#supported-features" class="sidebar__link">
+            <span class="lang-en">Supported Features</span>
+            <span class="lang-zh">功能支援表</span>
+        </a>
+    </div>
+    <div class="sidebar__section">
+        <div class="sidebar__heading">
+            <span class="lang-en">Reference</span>
+            <span class="lang-zh">參考資料</span>
+        </div>
+        <a href="#troubleshooting" class="sidebar__link">
+            <span class="lang-en">Troubleshooting</span>
+            <span class="lang-zh">疑難排解</span>
+        </a>
+        <a href="#changelog" class="sidebar__link">
+            <span class="lang-en">Changelog</span>
+            <span class="lang-zh">變更紀錄</span>
+        </a>
+    </div>
+</nav>
+
+<!-- ======== Main Content ======== -->
+<main class="main-content">
+
+<!-- ---- Hero ---- -->
+<section class="hero" id="hero">
+    <div class="hero__grid-bg"></div>
+    <div class="hero__glow"></div>
+    <div class="hero__content">
+        <div class="hero__badge">v0.2.9 -- MIT License</div>
+        <h1 class="hero__title">
+            <span class="lang-en">NetApp ONTAP SAN/iSCSI/FC<br>Storage Plugin for Proxmox VE</span>
+            <span class="lang-zh">NetApp ONTAP SAN/iSCSI/FC<br>Proxmox VE 儲存 Plugin</span>
+        </h1>
+        <p class="hero__subtitle">
+            <span class="lang-en">Enterprise SAN storage integration for Proxmox VE using NetApp ONTAP REST API. Supports iSCSI and Fibre Channel with multipath, snapshots, FlexClone, live migration, and automatic device lifecycle management.</span>
+            <span class="lang-zh">透過 NetApp ONTAP REST API 將企業級 SAN 儲存整合至 Proxmox VE。支援 iSCSI 及 Fibre Channel，具備 multipath、快照、FlexClone、即時遷移，以及自動裝置生命週期管理。</span>
+        </p>
+        <div class="hero__actions">
+            <a href="#installation" class="btn btn--primary">
+                <span class="lang-en">Install Guide</span>
+                <span class="lang-zh">安裝指南</span>
+            </a>
+            <a href="https://github.com/jasoncheng7115/jt-pve-storage-netapp" class="btn btn--outline" target="_blank" rel="noopener">
+                <svg width="16" height="16" viewBox="0 0 16 16" fill="currentColor"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.013 8.013 0 0016 8c0-4.42-3.58-8-8-8z"/></svg>
+                GitHub
+            </a>
+        </div>
+    </div>
+</section>
+
+<div class="content-wrap">
+
+<!-- ---- Disclaimer ---- -->
+<section class="doc-section" id="disclaimer">
+    <h2 class="section-title">
+        <span class="lang-en">Disclaimer</span>
+        <span class="lang-zh">免責聲明</span>
+    </h2>
+    <div class="alert alert--danger">
+        <strong>
+            <span class="lang-en">WARNING: This is a newly developed project. Use at your own risk.</span>
+            <span class="lang-zh">警告：此為新開發的專案，使用風險自負。</span>
+        </strong>
+        <ul>
+            <li>
+                <span class="lang-en">This plugin is provided "AS IS" without warranty of any kind.</span>
+                <span class="lang-zh">本 plugin 以「現況」提供，不附帶任何形式的保證。</span>
+            </li>
+            <li>
+                <span class="lang-en">iSCSI protocol has been tested but not extensively in production environments.</span>
+                <span class="lang-zh">iSCSI 協定已經過測試，但尚未在正式環境中大規模驗證。</span>
+            </li>
+            <li>
+                <span class="lang-en">FC (Fibre Channel) protocol has NOT been fully verified.</span>
+                <span class="lang-zh">FC (Fibre Channel) 協定尚未完全驗證。</span>
+            </li>
+            <li>
+                <span class="lang-en">Always test thoroughly in a non-production environment before deployment.</span>
+                <span class="lang-zh">部署前請務必在非正式環境中徹底測試。</span>
+            </li>
+            <li>
+                <span class="lang-en">The authors are not responsible for any data loss or system issues.</span>
+                <span class="lang-zh">作者不對任何資料遺失或系統問題負責。</span>
+            </li>
+            <li>
+                <span class="lang-en">Back up your data regularly and have a recovery plan in place.</span>
+                <span class="lang-zh">請定期備份資料，並準備好復原計畫。</span>
+            </li>
+        </ul>
+    </div>
+</section>
+
+<!-- ---- Features ---- -->
+<section class="doc-section" id="features">
+    <h2 class="section-title">
+        <span class="lang-en">Features</span>
+        <span class="lang-zh">功能特性</span>
+    </h2>
+    <p class="section-subtitle">
+        <span class="lang-en">Complete SAN storage integration leveraging NetApp ONTAP enterprise capabilities.</span>
+        <span class="lang-zh">完整的 SAN 儲存整合，充分運用 NetApp ONTAP 企業級功能。</span>
+    </p>
+    <div class="card-grid">
+        <div class="card">
+            <div class="card__icon">1:1</div>
+            <div class="card__title">
+                <span class="lang-en">1 VM Disk = 1 LUN = 1 FlexVol</span>
+                <span class="lang-zh">1 VM Disk = 1 LUN = 1 FlexVol</span>
+            </div>
+            <div class="card__desc">
+                <span class="lang-en">Clean snapshot semantics matching the PVE model. Each disk is an independent ONTAP volume.</span>
+                <span class="lang-zh">乾淨的快照語意，完全匹配 PVE 模型。每個磁碟都是獨立的 ONTAP volume。</span>
+            </div>
+        </div>
+        <div class="card">
+            <div class="card__icon">S</div>
+            <div class="card__title">
+                <span class="lang-en">Snapshot Create/Delete/Rollback</span>
+                <span class="lang-zh">快照建立/刪除/回滾</span>
+            </div>
+            <div class="card__desc">
+                <span class="lang-en">Via ONTAP Volume Snapshots. Instant, space-efficient, with host-side buffer flush for consistency.</span>
+                <span class="lang-zh">透過 ONTAP Volume Snapshots 實現。即時、空間效率佳，並以 host 端 buffer flush 確保一致性。</span>
+            </div>
+        </div>
+        <div class="card">
+            <div class="card__icon">FC</div>
+            <div class="card__title">
+                <span class="lang-en">Template &amp; Linked Clone</span>
+                <span class="lang-zh">範本與 Linked Clone</span>
+            </div>
+            <div class="card__desc">
+                <span class="lang-en">Instant clones via NetApp FlexClone. Space-efficient -- no data copy required.</span>
+                <span class="lang-zh">透過 NetApp FlexClone 即時複製。節省空間 -- 不需要複製資料。</span>
+            </div>
+        </div>
+        <div class="card">
+            <div class="card__icon">CP</div>
+            <div class="card__title">
+                <span class="lang-en">Full Clone from Snapshot</span>
+                <span class="lang-zh">從快照完整複製</span>
+            </div>
+            <div class="card__desc">
+                <span class="lang-en">Clone any VM from a specific snapshot to a fully independent VM.</span>
+                <span class="lang-zh">從特定快照複製任何 VM 為完全獨立的 VM。</span>
+            </div>
+        </div>
+        <div class="card">
+            <div class="card__icon">API</div>
+            <div class="card__title">
+                <span class="lang-en">Real-time Capacity Reporting</span>
+                <span class="lang-zh">即時容量報告</span>
+            </div>
+            <div class="card__desc">
+                <span class="lang-en">Storage usage reported directly from ONTAP REST API. Aggregate or volume-based.</span>
+                <span class="lang-zh">儲存使用量直接從 ONTAP REST API 回報。可基於 aggregate 或 volume。</span>
+            </div>
+        </div>
+        <div class="card">
+            <div class="card__icon">MP</div>
+            <div class="card__title">
+                <span class="lang-en">Multipath I/O for HA</span>
+                <span class="lang-zh">Multipath I/O 高可用性</span>
+            </div>
+            <div class="card__desc">
+                <span class="lang-en">Automatic multipath configuration with device discovery and failover.</span>
+                <span class="lang-zh">自動 multipath 設定，含裝置探索與容錯移轉。</span>
+            </div>
+        </div>
+        <div class="card">
+            <div class="card__icon">LM</div>
+            <div class="card__title">
+                <span class="lang-en">Cluster-aware Live Migration</span>
+                <span class="lang-zh">叢集感知即時遷移</span>
+            </div>
+            <div class="card__desc">
+                <span class="lang-en">LUNs mapped to all node igroups for seamless live migration between PVE nodes.</span>
+                <span class="lang-zh">LUN 對應至所有節點 igroup，實現 PVE 節點間的無縫即時遷移。</span>
+            </div>
+        </div>
+        <div class="card">
+            <div class="card__icon">TP</div>
+            <div class="card__title">
+                <span class="lang-en">Thin Provisioning</span>
+                <span class="lang-zh">精簡配置 (Thin Provisioning)</span>
+            </div>
+            <div class="card__desc">
+                <span class="lang-en">Efficient storage utilization. Aggregate overcommit warnings at 85% usage.</span>
+                <span class="lang-zh">高效利用儲存空間。Aggregate 使用率超過 85% 時發出 overcommit 警告。</span>
+            </div>
+        </div>
+        <div class="card">
+            <div class="card__icon">SAN</div>
+            <div class="card__title">
+                <span class="lang-en">iSCSI and FC SAN Support</span>
+                <span class="lang-zh">iSCSI 及 FC SAN 支援</span>
+            </div>
+            <div class="card__desc">
+                <span class="lang-en">Choose transport protocol per storage. Both share the same multipath and WWID identification.</span>
+                <span class="lang-zh">可依儲存選擇傳輸協定。兩者共用相同的 multipath 與 WWID 識別。</span>
+            </div>
+        </div>
+        <div class="card">
+            <div class="card__icon">LXC</div>
+            <div class="card__title">
+                <span class="lang-en">LXC Container Support</span>
+                <span class="lang-zh">LXC 容器支援</span>
+            </div>
+            <div class="card__desc">
+                <span class="lang-en">Container rootfs on NetApp LUN. Configure with <code>--content images,rootdir</code>.</span>
+                <span class="lang-zh">容器 rootfs 可放在 NetApp LUN 上。以 <code>--content images,rootdir</code> 設定。</span>
+            </div>
+        </div>
+        <div class="card">
+            <div class="card__icon">EFI</div>
+            <div class="card__title">
+                <span class="lang-en">EFI, Cloud-init, TPM, vmstate</span>
+                <span class="lang-zh">EFI、Cloud-init、TPM、vmstate</span>
+            </div>
+            <div class="card__desc">
+                <span class="lang-en">Full support for EFI disk, Cloud-init ISO, TPM 2.0 state, and VM RAM snapshot (vmstate).</span>
+                <span class="lang-zh">完整支援 EFI 磁碟、Cloud-init ISO、TPM 2.0 state、以及 VM 記憶體快照 (vmstate)。</span>
+            </div>
+        </div>
+    </div>
+</section>
+
+<!-- ---- Requirements ---- -->
+<section class="doc-section" id="requirements">
+    <h2 class="section-title">
+        <span class="lang-en">Requirements</span>
+        <span class="lang-zh">系統需求</span>
+    </h2>
+
+    <h3 class="subsection-title">Proxmox VE</h3>
+    <div class="table-wrap">
+        <table>
+            <thead><tr><th>PVE Version</th><th>Storage API</th><th>
+                <span class="lang-en">Compatibility</span>
+                <span class="lang-zh">相容性</span>
+            </th></tr></thead>
+            <tbody>
+                <tr><td>PVE 9.1+</td><td>13</td><td><span class="status-badge status-badge--supported">
+                    <span class="lang-en">Supported</span>
+                    <span class="lang-zh">支援</span>
+                </span></td></tr>
+            </tbody>
+        </table>
+    </div>
+
+    <h3 class="subsection-title">NetApp ONTAP</h3>
+    <ul>
+        <li>
+            <span class="lang-en">ONTAP 9.8 or later (REST API required)</span>
+            <span class="lang-zh">ONTAP 9.8 或更新版本（需 REST API）</span>
+        </li>
+        <li>
+            <span class="lang-en">iSCSI or FC license enabled</span>
+            <span class="lang-zh">已啟用 iSCSI 或 FC 授權</span>
+        </li>
+        <li>
+            <span class="lang-en">SVM with iSCSI/FC service enabled and at least one data LIF configured</span>
+            <span class="lang-zh">SVM 已啟用 iSCSI/FC 服務，且至少設定一個 data LIF</span>
+        </li>
+        <li>
+            <span class="lang-en">Aggregate with available space</span>
+            <span class="lang-zh">Aggregate 有可用空間</span>
+        </li>
+        <li>
+            <span class="lang-en">User account with REST API permissions for volumes, LUNs, igroups, snapshots, aggregates, and network interfaces</span>
+            <span class="lang-zh">使用者帳號需有 REST API 權限，可管理 volumes、LUNs、igroups、snapshots、aggregates 及 network interfaces</span>
+        </li>
+    </ul>
+
+    <h3 class="subsection-title">
+        <span class="lang-en">PVE Node Dependencies</span>
+        <span class="lang-zh">PVE 節點相依套件</span>
+    </h3>
+    <div class="table-wrap">
+        <table>
+            <thead><tr>
+                <th>
+                    <span class="lang-en">Package</span>
+                    <span class="lang-zh">套件</span>
+                </th>
+                <th>
+                    <span class="lang-en">Purpose</span>
+                    <span class="lang-zh">用途</span>
+                </th>
+                <th>
+                    <span class="lang-en">Required</span>
+                    <span class="lang-zh">必要</span>
+                </th>
+            </tr></thead>
+            <tbody>
+                <tr><td><code>open-iscsi</code></td><td>
+                    <span class="lang-en">iSCSI initiator (iscsiadm)</span>
+                    <span class="lang-zh">iSCSI initiator (iscsiadm)</span>
+                </td><td>
+                    <span class="lang-en">Yes (for iSCSI)</span>
+                    <span class="lang-zh">是（iSCSI 模式）</span>
+                </td></tr>
+                <tr><td><code>multipath-tools</code></td><td>
+                    <span class="lang-en">Multipath I/O daemon (multipathd)</span>
+                    <span class="lang-zh">Multipath I/O 背景服務 (multipathd)</span>
+                </td><td>
+                    <span class="lang-en">Yes</span>
+                    <span class="lang-zh">是</span>
+                </td></tr>
+                <tr><td><code>sg3-utils</code></td><td>
+                    <span class="lang-en">SCSI utilities (sg_inq)</span>
+                    <span class="lang-zh">SCSI 工具 (sg_inq)</span>
+                </td><td>
+                    <span class="lang-en">Yes</span>
+                    <span class="lang-zh">是</span>
+                </td></tr>
+                <tr><td><code>psmisc</code></td><td>
+                    <span class="lang-en">Process utilities (fuser) for device-in-use detection</span>
+                    <span class="lang-zh">行程工具 (fuser)，偵測裝置使用中</span>
+                </td><td>
+                    <span class="lang-en">Yes</span>
+                    <span class="lang-zh">是</span>
+                </td></tr>
+                <tr><td><code>libwww-perl</code></td><td>
+                    <span class="lang-en">HTTP client for REST API</span>
+                    <span class="lang-zh">HTTP 客戶端，供 REST API 使用</span>
+                </td><td>
+                    <span class="lang-en">Yes</span>
+                    <span class="lang-zh">是</span>
+                </td></tr>
+                <tr><td><code>libjson-perl</code></td><td>
+                    <span class="lang-en">JSON encoding/decoding</span>
+                    <span class="lang-zh">JSON 編碼/解碼</span>
+                </td><td>
+                    <span class="lang-en">Yes</span>
+                    <span class="lang-zh">是</span>
+                </td></tr>
+                <tr><td><code>liburi-perl</code></td><td>
+                    <span class="lang-en">URI handling</span>
+                    <span class="lang-zh">URI 處理</span>
+                </td><td>
+                    <span class="lang-en">Yes</span>
+                    <span class="lang-zh">是</span>
+                </td></tr>
+                <tr><td><code>lsscsi</code></td><td>
+                    <span class="lang-en">List SCSI devices (troubleshooting)</span>
+                    <span class="lang-zh">列出 SCSI 裝置（疑難排解用）</span>
+                </td><td>
+                    <span class="lang-en">Recommended</span>
+                    <span class="lang-zh">建議</span>
+                </td></tr>
+            </tbody>
+        </table>
+    </div>
+</section>
+
+<!-- ---- Installation ---- -->
+<section class="doc-section" id="installation">
+    <h2 class="section-title">
+        <span class="lang-en">Installation</span>
+        <span class="lang-zh">安裝</span>
+    </h2>
+
+    <h3 class="subsection-title">
+        <span class="lang-en">First-Time Installation</span>
+        <span class="lang-zh">首次安裝</span>
+    </h3>
+    <div class="alert alert--info">
+        <span class="lang-en"><strong>Important:</strong> Install dependencies BEFORE installing the plugin package to avoid dependency resolution issues.</span>
+        <span class="lang-zh"><strong>重要：</strong>請在安裝 plugin 套件前先安裝相依套件，以避免相依性解析問題。</span>
+    </div>
+
+    <div class="step">
+        <div class="step__number">1</div>
+        <div class="step__content">
+            <div class="step__title">
+                <span class="lang-en">Update apt cache</span>
+                <span class="lang-zh">更新 apt 快取</span>
+            </div>
+            <pre><span class="cmd">apt</span> update</pre>
+        </div>
+    </div>
+    <div class="step">
+        <div class="step__number">2</div>
+        <div class="step__content">
+            <div class="step__title">
+                <span class="lang-en">Install ALL dependencies</span>
+                <span class="lang-zh">安裝所有相依套件</span>
+            </div>
+            <pre><span class="cmd">apt</span> install <span class="flag">-y</span> open-iscsi multipath-tools sg3-utils psmisc \
+    libwww-perl libjson-perl liburi-perl lsscsi</pre>
+        </div>
+    </div>
+    <div class="step">
+        <div class="step__number">3</div>
+        <div class="step__content">
+            <div class="step__title">
+                <span class="lang-en">Enable required services</span>
+                <span class="lang-zh">啟用必要服務</span>
+            </div>
+            <pre><span class="cmd">systemctl</span> enable <span class="flag">--now</span> iscsid
+<span class="cmd">systemctl</span> enable <span class="flag">--now</span> multipathd</pre>
+        </div>
+    </div>
+    <div class="step">
+        <div class="step__number">4</div>
+        <div class="step__content">
+            <div class="step__title">
+                <span class="lang-en">Install the plugin package</span>
+                <span class="lang-zh">安裝 plugin 套件</span>
+            </div>
+            <pre><span class="cmd">dpkg</span> <span class="flag">-i</span> jt-pve-storage-netapp_0.2.9-1_all.deb</pre>
+            <p>
+                <span class="lang-en">The plugin automatically configures multipath and reloads PVE services (pvedaemon, pvestatd, pveproxy).</span>
+                <span class="lang-zh">Plugin 會自動設定 multipath 並重新載入 PVE 服務（pvedaemon、pvestatd、pveproxy）。</span>
+            </p>
+        </div>
+    </div>
+
+    <h3 class="subsection-title">
+        <span class="lang-en">Fix Broken State</span>
+        <span class="lang-zh">修復安裝失敗狀態</span>
+    </h3>
+    <p>
+        <span class="lang-en">If you ran <code>dpkg -i</code> before installing dependencies and got errors:</span>
+        <span class="lang-zh">如果在安裝相依套件前就執行 <code>dpkg -i</code> 而出現錯誤：</span>
+    </p>
+    <pre><span class="cmd">apt</span> update
+<span class="cmd">apt</span> <span class="flag">--fix-broken</span> install <span class="flag">-y</span>
+<span class="cmd">dpkg</span> <span class="flag">-l</span> | <span class="cmd">grep</span> jt-pve-storage-netapp</pre>
+
+    <h3 class="subsection-title">
+        <span class="lang-en">Cluster Installation</span>
+        <span class="lang-zh">叢集安裝</span>
+    </h3>
+    <div class="alert alert--danger">
+        <span class="lang-en"><strong>CRITICAL:</strong> In a Proxmox VE cluster, this plugin MUST be installed on ALL nodes. Nodes without the plugin will show <code>Parameter verification failed. (400)</code>.</span>
+        <span class="lang-zh"><strong>重要：</strong>在 Proxmox VE 叢集中，此 plugin 必須在所有節點上安裝。未安裝的節點會顯示 <code>Parameter verification failed. (400)</code>。</span>
+    </div>
+    <p>
+        <span class="lang-en">Repeat the 4 steps above on EACH node. Install the plugin on ALL nodes first, then add the storage configuration (only once, on any node).</span>
+        <span class="lang-zh">在每個節點上重複上述 4 個步驟。先在所有節點安裝 plugin，再新增儲存設定（只需在任一節點操作一次）。</span>
+    </p>
+
+    <h3 class="subsection-title">
+        <span class="lang-en">Upgrade SOP</span>
+        <span class="lang-zh">升級標準作業程序</span>
+    </h3>
+    <p>
+        <span class="lang-en">When upgrading, follow these steps on every cluster node in sequence (one node at a time):</span>
+        <span class="lang-zh">升級時，請依序在每個叢集節點上執行以下步驟（一次一個節點）：</span>
+    </p>
+    <div class="step">
+        <div class="step__number">1</div>
+        <div class="step__content">
+            <div class="step__title">
+                <span class="lang-en">Pre-upgrade backup</span>
+                <span class="lang-zh">升級前備份</span>
+            </div>
+            <pre><span class="comment"># Backup multipath.conf</span>
+<span class="cmd">cp</span> /etc/multipath.conf /etc/multipath.conf.bak.$(<span class="cmd">date</span> +%Y%m%d-%H%M%S)
+<span class="comment"># Note current version</span>
+<span class="cmd">dpkg</span> <span class="flag">-l</span> jt-pve-storage-netapp | <span class="cmd">tail</span> <span class="flag">-1</span></pre>
+        </div>
+    </div>
+    <div class="step">
+        <div class="step__number">2</div>
+        <div class="step__content">
+            <div class="step__title">
+                <span class="lang-en">Stop or migrate VMs (recommended)</span>
+                <span class="lang-zh">停止或遷移 VM（建議）</span>
+            </div>
+            <p>
+                <span class="lang-en">For safest upgrade, migrate or stop VMs that have disks on this storage. Live VMs will continue to work during upgrade, but a clean state simplifies recovery if anything goes wrong.</span>
+                <span class="lang-zh">最安全的做法是先將使用此儲存的 VM 遷移或停止。升級期間執行中的 VM 仍可繼續運作，但乾淨的狀態有助於出問題時的復原。</span>
+            </p>
+        </div>
+    </div>
+    <div class="step">
+        <div class="step__number">3</div>
+        <div class="step__content">
+            <div class="step__title">
+                <span class="lang-en">Install new package</span>
+                <span class="lang-zh">安裝新套件</span>
+            </div>
+            <pre><span class="cmd">dpkg</span> <span class="flag">-i</span> jt-pve-storage-netapp_0.2.9-1_all.deb</pre>
+        </div>
+    </div>
+    <div class="step">
+        <div class="step__number">4</div>
+        <div class="step__content">
+            <div class="step__title">
+                <span class="lang-en">Review postinst warnings and verify</span>
+                <span class="lang-zh">檢視 postinst 警告並驗證</span>
+            </div>
+            <pre><span class="comment"># If warned about dangerous multipath settings, edit:</span>
+<span class="cmd">nano</span> /etc/multipath.conf
+<span class="comment"># Apply: no_path_retry queue -> 30, remove queue_if_no_path, dev_loss_tmo infinity -> 60</span>
+<span class="cmd">systemctl</span> restart multipathd  <span class="comment"># restart, NOT reload</span>
+
+<span class="comment"># Verify</span>
+<span class="cmd">dpkg</span> <span class="flag">-l</span> jt-pve-storage-netapp | <span class="cmd">grep</span> ii
+<span class="cmd">pvesm</span> status | <span class="cmd">grep</span> netapp
+<span class="cmd">multipath</span> <span class="flag">-ll</span></pre>
+        </div>
+    </div>
+    <div class="step">
+        <div class="step__number">5</div>
+        <div class="step__content">
+            <div class="step__title">
+                <span class="lang-en">Repeat on next node</span>
+                <span class="lang-zh">在下一個節點重複</span>
+            </div>
+            <p>
+                <span class="lang-en">Move to the next cluster node and repeat from Step 1. Do not upgrade multiple nodes simultaneously.</span>
+                <span class="lang-zh">移至下一個叢集節點，從步驟 1 重複。請勿同時升級多個節點。</span>
+            </p>
+        </div>
+    </div>
+</section>
+
+<!-- ---- Quick Start ---- -->
+<section class="doc-section" id="quickstart">
+    <h2 class="section-title">
+        <span class="lang-en">Quick Start</span>
+        <span class="lang-zh">快速入門</span>
+    </h2>
+
+    <h3 class="subsection-title">
+        <span class="lang-en">Add Storage (iSCSI)</span>
+        <span class="lang-zh">新增儲存（iSCSI）</span>
+    </h3>
+    <pre><span class="cmd">pvesm</span> add netappontap netapp1 \
+    <span class="flag">--ontap-portal</span> <span class="string">192.168.1.100</span> \
+    <span class="flag">--ontap-svm</span> <span class="string">svm0</span> \
+    <span class="flag">--ontap-aggregate</span> <span class="string">aggr1</span> \
+    <span class="flag">--ontap-username</span> <span class="string">pveadmin</span> \
+    <span class="flag">--ontap-password</span> <span class="string">'YourSecurePassword'</span> \
+    <span class="flag">--content</span> images,rootdir \
+    <span class="flag">--shared</span> 1</pre>
+
+    <h3 class="subsection-title">
+        <span class="lang-en">Add Storage (FC / Fibre Channel)</span>
+        <span class="lang-zh">新增儲存（FC / Fibre Channel）</span>
+    </h3>
+    <pre><span class="cmd">pvesm</span> add netappontap netapp-fc \
+    <span class="flag">--ontap-portal</span> <span class="string">192.168.1.100</span> \
+    <span class="flag">--ontap-svm</span> <span class="string">svm0</span> \
+    <span class="flag">--ontap-aggregate</span> <span class="string">aggr1</span> \
+    <span class="flag">--ontap-username</span> <span class="string">pveadmin</span> \
+    <span class="flag">--ontap-password</span> <span class="string">'YourSecurePassword'</span> \
+    <span class="flag">--ontap-protocol</span> fc \
+    <span class="flag">--content</span> images \
+    <span class="flag">--shared</span> 1</pre>
+
+    <h3 class="subsection-title">
+        <span class="lang-en">Verify</span>
+        <span class="lang-zh">驗證</span>
+    </h3>
+    <pre><span class="cmd">pvesm</span> status
+<span class="output"># Name        Type           Status  Total   Used  Available
+# netapp1     netappontap    active  ...     ...   ...</span></pre>
+
+    <div class="alert alert--info">
+        <span class="lang-en"><strong>Note:</strong> This is a custom/third-party storage plugin. It is NOT listed in the Web UI "Add Storage" dropdown -- storage must be added via CLI (<code>pvesm add</code>). After adding, the storage will appear in the Web UI storage list and support all VM operations normally.</span>
+        <span class="lang-zh"><strong>注意：</strong>這是第三方自訂儲存 plugin，不會出現在 Web UI 的「新增儲存」下拉選單中 -- 必須透過 CLI (<code>pvesm add</code>) 新增。新增後，儲存會出現在 Web UI 的儲存清單中，並正常支援所有 VM 操作。</span>
+    </div>
+</section>
+
+<!-- ---- Configuration ---- -->
+<section class="doc-section" id="configuration">
+    <h2 class="section-title">
+        <span class="lang-en">Configuration Reference</span>
+        <span class="lang-zh">設定選項參考</span>
+    </h2>
+
+    <h3 class="subsection-title">
+        <span class="lang-en">Required Options</span>
+        <span class="lang-zh">必要選項</span>
+    </h3>
+    <div class="table-wrap">
+        <table>
+            <thead><tr>
+                <th>
+                    <span class="lang-en">Option</span>
+                    <span class="lang-zh">選項</span>
+                </th>
+                <th>
+                    <span class="lang-en">Description</span>
+                    <span class="lang-zh">說明</span>
+                </th>
+                <th>
+                    <span class="lang-en">Example</span>
+                    <span class="lang-zh">範例</span>
+                </th>
+            </tr></thead>
+            <tbody>
+                <tr><td><code>ontap-portal</code></td><td>
+                    <span class="lang-en">ONTAP management IP or hostname</span>
+                    <span class="lang-zh">ONTAP 管理 IP 或主機名稱</span>
+                </td><td><code>192.168.1.100</code></td></tr>
+                <tr><td><code>ontap-svm</code></td><td>
+                    <span class="lang-en">Storage Virtual Machine (SVM/Vserver) name</span>
+                    <span class="lang-zh">Storage Virtual Machine (SVM/Vserver) 名稱</span>
+                </td><td><code>svm0</code></td></tr>
+                <tr><td><code>ontap-aggregate</code></td><td>
+                    <span class="lang-en">Aggregate for volume creation</span>
+                    <span class="lang-zh">建立 volume 用的 aggregate</span>
+                </td><td><code>aggr1</code></td></tr>
+                <tr><td><code>ontap-username</code></td><td>
+                    <span class="lang-en">ONTAP API username</span>
+                    <span class="lang-zh">ONTAP API 使用者名稱</span>
+                </td><td><code>pveadmin</code></td></tr>
+                <tr><td><code>ontap-password</code></td><td>
+                    <span class="lang-en">ONTAP API password</span>
+                    <span class="lang-zh">ONTAP API 密碼</span>
+                </td><td><code>YourSecurePassword</code></td></tr>
+            </tbody>
+        </table>
+    </div>
+
+    <h3 class="subsection-title">
+        <span class="lang-en">Optional Options</span>
+        <span class="lang-zh">可選選項</span>
+    </h3>
+    <div class="table-wrap">
+        <table>
+            <thead><tr>
+                <th>
+                    <span class="lang-en">Option</span>
+                    <span class="lang-zh">選項</span>
+                </th>
+                <th>
+                    <span class="lang-en">Default</span>
+                    <span class="lang-zh">預設值</span>
+                </th>
+                <th>
+                    <span class="lang-en">Description</span>
+                    <span class="lang-zh">說明</span>
+                </th>
+            </tr></thead>
+            <tbody>
+                <tr><td><code>ontap-protocol</code></td><td><code>iscsi</code></td><td>
+                    <span class="lang-en">SAN protocol: <code>iscsi</code> or <code>fc</code> (Fibre Channel)</span>
+                    <span class="lang-zh">SAN 協定：<code>iscsi</code> 或 <code>fc</code> (Fibre Channel)</span>
+                </td></tr>
+                <tr><td><code>ontap-ssl-verify</code></td><td><code>1</code></td><td>
+                    <span class="lang-en">Verify SSL certificates (0 = disable for self-signed)</span>
+                    <span class="lang-zh">驗證 SSL 憑證（0 = 停用，適用自簽憑證）</span>
+                </td></tr>
+                <tr><td><code>ontap-thin</code></td><td><code>1</code></td><td>
+                    <span class="lang-en">Use thin provisioning (0 = thick provisioning)</span>
+                    <span class="lang-zh">使用精簡配置（0 = 完整配置）</span>
+                </td></tr>
+                <tr><td><code>ontap-igroup-mode</code></td><td><code>per-node</code></td><td>
+                    <span class="lang-en">igroup mode: <code>per-node</code> (recommended) or <code>shared</code></span>
+                    <span class="lang-zh">igroup 模式：<code>per-node</code>（建議）或 <code>shared</code></span>
+                </td></tr>
+                <tr><td><code>ontap-cluster-name</code></td><td><code>pve</code></td><td>
+                    <span class="lang-en">Cluster name for igroup naming. Use different values for multiple storages on the same SVM.</span>
+                    <span class="lang-zh">igroup 命名用的叢集名稱。同一 SVM 上有多個儲存時請使用不同值。</span>
+                </td></tr>
+                <tr><td><code>ontap-device-timeout</code></td><td><code>60</code></td><td>
+                    <span class="lang-en">Device discovery timeout in seconds</span>
+                    <span class="lang-zh">裝置探索逾時秒數</span>
+                </td></tr>
+            </tbody>
+        </table>
+    </div>
+
+    <h3 class="subsection-title">
+        <span class="lang-en">Example storage.cfg (iSCSI)</span>
+        <span class="lang-zh">範例 storage.cfg (iSCSI)</span>
+    </h3>
+    <div class="config-block">netappontap: netapp1
+    ontap-portal 192.168.1.100
+    ontap-svm svm0
+    ontap-aggregate aggr1
+    ontap-username pveadmin
+    ontap-password YourSecurePassword
+    ontap-protocol iscsi
+    ontap-thin 1
+    ontap-igroup-mode per-node
+    content images
+    shared 1</div>
+
+    <h3 class="subsection-title">
+        <span class="lang-en">Example storage.cfg (FC SAN)</span>
+        <span class="lang-zh">範例 storage.cfg (FC SAN)</span>
+    </h3>
+    <div class="config-block">netappontap: netapp-fc
+    ontap-portal 192.168.1.100
+    ontap-svm svm0
+    ontap-aggregate aggr1
+    ontap-username pveadmin
+    ontap-password YourSecurePassword
+    ontap-protocol fc
+    ontap-thin 1
+    ontap-igroup-mode per-node
+    content images
+    shared 1</div>
+
+    <div class="alert alert--info">
+        <span class="lang-en"><strong>Note:</strong> For FC, <code>ontap-portal</code> is still required for ONTAP REST API access. The FC data path uses the FC fabric, not the management IP.</span>
+        <span class="lang-zh"><strong>注意：</strong>FC 模式下仍需 <code>ontap-portal</code> 用於 ONTAP REST API 存取。FC 資料路徑使用 FC fabric，不是管理 IP。</span>
+    </div>
+</section>
+
+<!-- ---- Architecture ---- -->
+<section class="doc-section" id="architecture">
+    <h2 class="section-title">
+        <span class="lang-en">Architecture</span>
+        <span class="lang-zh">系統架構</span>
+    </h2>
+
+    <h3 class="subsection-title">
+        <span class="lang-en">1:1:1 Architecture Model</span>
+        <span class="lang-zh">1:1:1 架構模型</span>
+    </h3>
+    <p>
+        <span class="lang-en">Each VM disk maps to exactly one ONTAP FlexVol containing exactly one LUN, providing clean snapshot semantics.</span>
+        <span class="lang-zh">每個 VM 磁碟對應到一個 ONTAP FlexVol，內含一個 LUN，提供乾淨的快照語意。</span>
+    </p>
+    <div class="ascii-diagram">Proxmox VE Cluster                    NetApp ONTAP
++------------------+                  +-------------------+
+|   PVE Node 1     |                  |   SVM: svm0       |
+|   +----------+   |    iSCSI/FC      |   +-------------+ |
+|   | VM 100   |&lt;--+----------------&gt;|   | FlexVol     | |
+|   | scsi0    |   |   multipath      |   | pve_..._100 | |
+|   +----------+   |                  |   | +-------+   | |
++------------------+                  |   | | LUN   |   | |
+        |                             |   | | lun0  |   | |
+        | live migration              |   | +-------+   | |
+        v                             |   +-------------+ |
++------------------+                  |                   |
+|   PVE Node 2     |                  |   igroups:        |
+|   +----------+   |    iSCSI/FC      |   - pve_pve_pve1  |
+|   | VM 100   |&lt;--+----------------&gt;|   - pve_pve_pve2  |
+|   | scsi0    |   |   multipath      |                   |
+|   +----------+   |                  +-------------------+
++------------------+</div>
+
+    <h3 class="subsection-title">
+        <span class="lang-en">Object Mapping</span>
+        <span class="lang-zh">物件對應</span>
+    </h3>
+    <div class="table-wrap">
+        <table>
+            <thead><tr>
+                <th>
+                    <span class="lang-en">PVE Object</span>
+                    <span class="lang-zh">PVE 物件</span>
+                </th>
+                <th>
+                    <span class="lang-en">ONTAP Object</span>
+                    <span class="lang-zh">ONTAP 物件</span>
+                </th>
+                <th>
+                    <span class="lang-en">Naming Pattern</span>
+                    <span class="lang-zh">命名規則</span>
+                </th>
+            </tr></thead>
+            <tbody>
+                <tr><td>Storage</td><td>--</td><td>
+                    <span class="lang-en">User defined (e.g., <code>netapp1</code>)</span>
+                    <span class="lang-zh">使用者定義（例如 <code>netapp1</code>）</span>
+                </td></tr>
+                <tr><td>VM Disk</td><td>FlexVol</td><td><code>pve_{storage}_{vmid}_disk{id}</code></td></tr>
+                <tr><td>VM Disk</td><td>LUN</td><td><code>/vol/{flexvol}/lun0</code></td></tr>
+                <tr><td>Snapshot</td><td>Volume Snapshot</td><td><code>pve_snap_{snapname}</code></td></tr>
+                <tr><td>PVE Node</td><td>igroup</td><td><code>pve_{cluster}_{node}</code></td></tr>
+                <tr><td>Cloud-init</td><td>FlexVol</td><td><code>pve_{storage}_{vmid}_cloudinit</code></td></tr>
+                <tr><td>VM State</td><td>FlexVol</td><td><code>pve_{storage}_{vmid}_state_{snap}</code></td></tr>
+            </tbody>
+        </table>
+    </div>
+
+    <h3 class="subsection-title">
+        <span class="lang-en">Module Architecture</span>
+        <span class="lang-zh">模組架構</span>
+    </h3>
+    <div class="module-list">
+        <div class="module-item">
+            <div class="module-item__name">NetAppONTAPPlugin.pm</div>
+            <div class="module-item__desc">
+                <span class="lang-en">Main plugin -- PVE Storage Plugin API implementation. Volumes, snapshots, clones.</span>
+                <span class="lang-zh">主 plugin -- PVE Storage Plugin API 實作。Volumes、快照、複製。</span>
+            </div>
+        </div>
+        <div class="module-item">
+            <div class="module-item__name">API.pm</div>
+            <div class="module-item__desc">
+                <span class="lang-en">ONTAP REST API client. Volumes, LUNs, igroups, snapshots, capacity.</span>
+                <span class="lang-zh">ONTAP REST API 客戶端。Volumes、LUNs、igroups、快照、容量。</span>
+            </div>
+        </div>
+        <div class="module-item">
+            <div class="module-item__name">ISCSI.pm</div>
+            <div class="module-item__desc">
+                <span class="lang-en">iSCSI management. Target discovery, login, session handling, device wait.</span>
+                <span class="lang-zh">iSCSI 管理。Target 探索、登入、session 處理、裝置等待。</span>
+            </div>
+        </div>
+        <div class="module-item">
+            <div class="module-item__name">Multipath.pm</div>
+            <div class="module-item__desc">
+                <span class="lang-en">Multipath and SCSI device management. Device discovery, cleanup, anti-hang protection.</span>
+                <span class="lang-zh">Multipath 與 SCSI 裝置管理。裝置探索、清理、防卡死保護。</span>
+            </div>
+        </div>
+        <div class="module-item">
+            <div class="module-item__name">FC.pm</div>
+            <div class="module-item__desc">
+                <span class="lang-en">Fibre Channel HBA management. WWPN discovery, LIP rescan.</span>
+                <span class="lang-zh">Fibre Channel HBA 管理。WWPN 探索、LIP rescan。</span>
+            </div>
+        </div>
+        <div class="module-item">
+            <div class="module-item__name">Naming.pm</div>
+            <div class="module-item__desc">
+                <span class="lang-en">PVE to ONTAP naming conventions. Volume names, LUN paths, igroup names.</span>
+                <span class="lang-zh">PVE 至 ONTAP 命名規則。Volume 名稱、LUN 路徑、igroup 名稱。</span>
+            </div>
+        </div>
+    </div>
+</section>
+
+<!-- ---- Multipath Safety ---- -->
+<section class="doc-section" id="multipath-safety">
+    <h2 class="section-title">
+        <span class="lang-en">Multipath Safety Rules</span>
+        <span class="lang-zh">Multipath 安全規則</span>
+    </h2>
+    <div class="alert alert--danger">
+        <strong>
+            <span class="lang-en">READ THIS BEFORE INSTALLING. These rules prevent PVE node hangs and accidental disconnection of other storage.</span>
+            <span class="lang-zh">安裝前請務必閱讀。這些規則防止 PVE 節點當機及意外斷開其他儲存。</span>
+        </strong>
+    </div>
+
+    <h3 class="subsection-title">
+        <span class="lang-en">Rule 1: NEVER use multipath -F (capital F)</span>
+        <span class="lang-zh">規則 1：絕對不要使用 multipath -F（大寫 F）</span>
+    </h3>
+    <p>
+        <span class="lang-en"><code>multipath -F</code> flushes ALL unused multipath maps system-wide. If you have other storage (manual iSCSI LVM, other vendors, etc.) and there is no active I/O on it at the moment, it will be disconnected. Always use targeted flushing:</span>
+        <span class="lang-zh"><code>multipath -F</code> 會清除系統上所有未使用的 multipath map。如果您有其他儲存（手動 iSCSI LVM、其他廠商等）且當時沒有 active I/O，該儲存會被斷開。請使用指定目標的清除：</span>
+    </p>
+    <pre><span class="comment"># Identify stale WWIDs (look for "failed faulty" in all paths)</span>
+<span class="cmd">multipath</span> <span class="flag">-ll</span>
+
+<span class="comment"># Flush ONE specific stale WWID (lowercase f)</span>
+<span class="cmd">multipath</span> <span class="flag">-f</span> 3600a09807770457a795d5a7653705853</pre>
+
+    <h3 class="subsection-title">
+        <span class="lang-en">Rule 2: After editing multipath.conf, use restart not reload</span>
+        <span class="lang-zh">規則 2：編輯 multipath.conf 後，使用 restart 而非 reload</span>
+    </h3>
+    <pre><span class="comment"># CORRECT - applies new settings AND flushes stale state</span>
+<span class="cmd">systemctl</span> restart multipathd
+
+<span class="comment"># WRONG - only re-reads config, leaves stale maps in place</span>
+<span class="cmd">systemctl</span> reload multipathd</pre>
+
+    <h3 class="subsection-title">
+        <span class="lang-en">Rule 3: Check your multipath.conf settings</span>
+        <span class="lang-zh">規則 3：檢查您的 multipath.conf 設定</span>
+    </h3>
+    <p>
+        <span class="lang-en">If your config contains any of these, the entire PVE node can hang when a LUN is deleted or becomes unavailable:</span>
+        <span class="lang-zh">如果您的設定包含以下任何一項，當 LUN 被刪除或變得不可用時，整個 PVE 節點可能會當機：</span>
+    </p>
+    <div class="table-wrap">
+        <table>
+            <thead><tr>
+                <th>
+                    <span class="lang-en">Setting</span>
+                    <span class="lang-zh">設定</span>
+                </th>
+                <th>
+                    <span class="lang-en">Risk</span>
+                    <span class="lang-zh">風險</span>
+                </th>
+                <th>
+                    <span class="lang-en">Fix</span>
+                    <span class="lang-zh">修正</span>
+                </th>
+            </tr></thead>
+            <tbody>
+                <tr>
+                    <td><code>no_path_retry queue</code></td>
+                    <td>
+                        <span class="lang-en">I/O queues forever</span>
+                        <span class="lang-zh">I/O 永久排隊</span>
+                    </td>
+                    <td>
+                        <span class="lang-en">Change to <code>no_path_retry 30</code></span>
+                        <span class="lang-zh">改為 <code>no_path_retry 30</code></span>
+                    </td>
+                </tr>
+                <tr>
+                    <td><code>queue_if_no_path</code></td>
+                    <td>
+                        <span class="lang-en">Same as above</span>
+                        <span class="lang-zh">同上</span>
+                    </td>
+                    <td>
+                        <span class="lang-en">Remove from <code>features</code> line</span>
+                        <span class="lang-zh">從 <code>features</code> 行移除</span>
+                    </td>
+                </tr>
+                <tr>
+                    <td><code>dev_loss_tmo infinity</code></td>
+                    <td>
+                        <span class="lang-en">Stale devices never removed</span>
+                        <span class="lang-zh">殘留裝置永遠不會被移除</span>
+                    </td>
+                    <td>
+                        <span class="lang-en">Change to <code>dev_loss_tmo 60</code></span>
+                        <span class="lang-zh">改為 <code>dev_loss_tmo 60</code></span>
+                    </td>
+                </tr>
+            </tbody>
+        </table>
+    </div>
+
+    <h3 class="subsection-title">
+        <span class="lang-en">Rule 4: v0.2.2+ handles cleanup automatically</span>
+        <span class="lang-zh">規則 4：v0.2.2+ 自動處理殘留清理</span>
+    </h3>
+    <p>
+        <span class="lang-en">You do not need to manually clean stale devices after upgrading to v0.2.2+. The plugin automatically detects and removes its own orphan devices in the background during normal storage status polling. It only touches WWIDs it created and never affects other storage.</span>
+        <span class="lang-zh">升級至 v0.2.2+ 後不需要手動清理殘留裝置。Plugin 會在正常儲存狀態輪詢時，於背景自動偵測並移除自己產生的殘留裝置。只會處理自己建立的 WWID，不會影響其他儲存。</span>
+    </p>
+</section>
+
+<!-- ---- Supported Features ---- -->
+<section class="doc-section" id="supported-features">
+    <h2 class="section-title">
+        <span class="lang-en">Supported Features Matrix</span>
+        <span class="lang-zh">功能支援表</span>
+    </h2>
+    <div class="table-wrap">
+        <table>
+            <thead><tr>
+                <th>
+                    <span class="lang-en">Feature</span>
+                    <span class="lang-zh">功能</span>
+                </th>
+                <th>
+                    <span class="lang-en">Status</span>
+                    <span class="lang-zh">狀態</span>
+                </th>
+                <th>
+                    <span class="lang-en">Notes</span>
+                    <span class="lang-zh">備註</span>
+                </th>
+            </tr></thead>
+            <tbody>
+                <tr><td>
+                    <span class="lang-en">Disk create/delete</span>
+                    <span class="lang-zh">磁碟建立/刪除</span>
+                </td><td><span class="status-badge status-badge--supported">
+                    <span class="lang-en">Supported</span>
+                    <span class="lang-zh">支援</span>
+                </span></td><td>FlexVol + LUN</td></tr>
+                <tr><td>
+                    <span class="lang-en">Disk resize</span>
+                    <span class="lang-zh">磁碟調整大小</span>
+                </td><td><span class="status-badge status-badge--supported">
+                    <span class="lang-en">Supported</span>
+                    <span class="lang-zh">支援</span>
+                </span></td><td>
+                    <span class="lang-en">Online resize supported</span>
+                    <span class="lang-zh">支援線上調整</span>
+                </td></tr>
+                <tr><td>
+                    <span class="lang-en">Snapshots</span>
+                    <span class="lang-zh">快照</span>
+                </td><td><span class="status-badge status-badge--supported">
+                    <span class="lang-en">Supported</span>
+                    <span class="lang-zh">支援</span>
+                </span></td><td>ONTAP Volume Snapshots</td></tr>
+                <tr><td>
+                    <span class="lang-en">Snapshot rollback</span>
+                    <span class="lang-zh">快照回滾</span>
+                </td><td><span class="status-badge status-badge--supported">
+                    <span class="lang-en">Supported</span>
+                    <span class="lang-zh">支援</span>
+                </span></td><td>
+                    <span class="lang-en">VM must be stopped</span>
+                    <span class="lang-zh">VM 必須先停止</span>
+                </td></tr>
+                <tr><td>
+                    <span class="lang-en">Live migration</span>
+                    <span class="lang-zh">即時遷移</span>
+                </td><td><span class="status-badge status-badge--supported">
+                    <span class="lang-en">Supported</span>
+                    <span class="lang-zh">支援</span>
+                </span></td><td>
+                    <span class="lang-en">Via shared iSCSI/FC access</span>
+                    <span class="lang-zh">透過共享 iSCSI/FC 存取</span>
+                </td></tr>
+                <tr><td>
+                    <span class="lang-en">Thin provisioning</span>
+                    <span class="lang-zh">精簡配置</span>
+                </td><td><span class="status-badge status-badge--supported">
+                    <span class="lang-en">Supported</span>
+                    <span class="lang-zh">支援</span>
+                </span></td><td>
+                    <span class="lang-en">Default enabled</span>
+                    <span class="lang-zh">預設啟用</span>
+                </td></tr>
+                <tr><td>Multipath I/O</td><td><span class="status-badge status-badge--supported">
+                    <span class="lang-en">Supported</span>
+                    <span class="lang-zh">支援</span>
+                </span></td><td>
+                    <span class="lang-en">Automatic configuration</span>
+                    <span class="lang-zh">自動設定</span>
+                </td></tr>
+                <tr><td>Template</td><td><span class="status-badge status-badge--supported">
+                    <span class="lang-en">Supported</span>
+                    <span class="lang-zh">支援</span>
+                </span></td><td>
+                    <span class="lang-en">Convert VM to template</span>
+                    <span class="lang-zh">將 VM 轉為範本</span>
+                </td></tr>
+                <tr><td>Linked Clone</td><td><span class="status-badge status-badge--supported">
+                    <span class="lang-en">Supported</span>
+                    <span class="lang-zh">支援</span>
+                </span></td><td>
+                    <span class="lang-en">Via NetApp FlexClone (instant, space-efficient)</span>
+                    <span class="lang-zh">透過 NetApp FlexClone（即時、節省空間）</span>
+                </td></tr>
+                <tr><td>Full Clone</td><td><span class="status-badge status-badge--supported">
+                    <span class="lang-en">Supported</span>
+                    <span class="lang-zh">支援</span>
+                </span></td><td>
+                    <span class="lang-en">Via qemu-img copy</span>
+                    <span class="lang-zh">透過 qemu-img 複製</span>
+                </td></tr>
+                <tr><td>
+                    <span class="lang-en">Full Clone from Snapshot</span>
+                    <span class="lang-zh">從快照完整複製</span>
+                </td><td><span class="status-badge status-badge--supported">
+                    <span class="lang-en">Supported</span>
+                    <span class="lang-zh">支援</span>
+                </span></td><td>
+                    <span class="lang-en">Via temporary FlexClone + qemu-img</span>
+                    <span class="lang-zh">透過暫時 FlexClone + qemu-img</span>
+                </td></tr>
+                <tr><td>Backup (vzdump)</td><td><span class="status-badge status-badge--supported">
+                    <span class="lang-en">Supported</span>
+                    <span class="lang-zh">支援</span>
+                </span></td><td>
+                    <span class="lang-en">Via snapshot</span>
+                    <span class="lang-zh">透過快照</span>
+                </td></tr>
+                <tr><td>RAM Snapshot (vmstate)</td><td><span class="status-badge status-badge--supported">
+                    <span class="lang-en">Supported</span>
+                    <span class="lang-zh">支援</span>
+                </span></td><td>v0.1.7+</td></tr>
+                <tr><td>LXC Container (rootdir)</td><td><span class="status-badge status-badge--supported">
+                    <span class="lang-en">Supported</span>
+                    <span class="lang-zh">支援</span>
+                </span></td><td>v0.2.0+</td></tr>
+                <tr><td>EFI Disk</td><td><span class="status-badge status-badge--supported">
+                    <span class="lang-en">Supported</span>
+                    <span class="lang-zh">支援</span>
+                </span></td><td>v0.2.0+</td></tr>
+                <tr><td>Cloud-init Disk</td><td><span class="status-badge status-badge--supported">
+                    <span class="lang-en">Supported</span>
+                    <span class="lang-zh">支援</span>
+                </span></td><td>v0.2.0+</td></tr>
+                <tr><td>TPM State</td><td><span class="status-badge status-badge--supported">
+                    <span class="lang-en">Supported</span>
+                    <span class="lang-zh">支援</span>
+                </span></td><td>v0.2.0+</td></tr>
+            </tbody>
+        </table>
+    </div>
+</section>
+
+<!-- ---- Troubleshooting ---- -->
+<section class="doc-section" id="troubleshooting">
+    <h2 class="section-title">
+        <span class="lang-en">Troubleshooting</span>
+        <span class="lang-zh">疑難排解</span>
+    </h2>
+    <p class="section-subtitle">
+        <span class="lang-en">Common issues and their solutions. For a comprehensive guide, see <a href="https://github.com/jasoncheng7115/jt-pve-storage-netapp/blob/main/docs/TROUBLESHOOTING.md">docs/TROUBLESHOOTING.md</a> in the repository.</span>
+        <span class="lang-zh">常見問題及解決方案。完整指南請參閱 repository 中的 <a href="https://github.com/jasoncheng7115/jt-pve-storage-netapp/blob/main/docs/TROUBLESHOOTING_zh-TW.md">docs/TROUBLESHOOTING_zh-TW.md</a>。</span>
+    </p>
+
+    <h3 class="subsection-title">
+        <span class="lang-en">Quick Diagnostic Commands</span>
+        <span class="lang-zh">快速診斷指令</span>
+    </h3>
+    <pre><span class="comment"># Check storage status</span>
+<span class="cmd">pvesm</span> status
+
+<span class="comment"># Check PVE daemon logs</span>
+<span class="cmd">journalctl</span> <span class="flag">-xeu</span> pvedaemon <span class="flag">--since</span> <span class="string">"10 minutes ago"</span>
+
+<span class="comment"># Check iSCSI sessions</span>
+<span class="cmd">iscsiadm</span> <span class="flag">-m</span> session
+
+<span class="comment"># Check multipath devices</span>
+<span class="cmd">multipathd</span> show maps
+
+<span class="comment"># Check ONTAP API connectivity</span>
+<span class="cmd">curl</span> <span class="flag">-k -u</span> username:password https://ONTAP_IP/api/cluster</pre>
+
+    <details>
+        <summary>
+            <span class="lang-en">Storage Not Active</span>
+            <span class="lang-zh">儲存未啟用</span>
+        </summary>
+        <div class="detail-content">
+            <p>
+                <span class="lang-en"><strong>Symptoms:</strong> Storage shows "inactive" in <code>pvesm status</code>. Cannot create VMs on storage.</span>
+                <span class="lang-zh"><strong>症狀：</strong>在 <code>pvesm status</code> 中顯示 "inactive"。無法在該儲存上建立 VM。</span>
+            </p>
+            <p><strong>
+                <span class="lang-en">Common Causes:</span>
+                <span class="lang-zh">常見原因：</span>
+            </strong></p>
+            <ul>
+                <li><span class="lang-en">Invalid credentials -- test with: <code>curl -k -u pveadmin:password https://192.168.1.100/api/cluster</code></span><span class="lang-zh">認證無效 -- 測試指令：<code>curl -k -u pveadmin:password https://192.168.1.100/api/cluster</code></span></li>
+                <li><span class="lang-en">Network connectivity -- check: <code>ping &lt;ontap-portal&gt;</code> and <code>nc -zv &lt;ontap-portal&gt; 443</code></span><span class="lang-zh">網路連線問題 -- 檢查：<code>ping &lt;ontap-portal&gt;</code> 及 <code>nc -zv &lt;ontap-portal&gt; 443</code></span></li>
+                <li><span class="lang-en">SSL certificate issues -- temporarily disable: <code>pvesm set &lt;storage-id&gt; --ontap-ssl-verify 0</code></span><span class="lang-zh">SSL 憑證問題 -- 暫時停用：<code>pvesm set &lt;storage-id&gt; --ontap-ssl-verify 0</code></span></li>
+                <li><span class="lang-en">SVM not accessible or iSCSI service not enabled on the SVM</span><span class="lang-zh">SVM 無法存取或 SVM 上的 iSCSI 服務未啟用</span></li>
+            </ul>
+        </div>
+    </details>
+
+    <details>
+        <summary>
+            <span class="lang-en">Device Not Found After Create</span>
+            <span class="lang-zh">建立後找不到裝置</span>
+        </summary>
+        <div class="detail-content">
+            <p>
+                <span class="lang-en"><strong>Symptoms:</strong> Disk created successfully but device not appearing in <code>/dev/</code>.</span>
+                <span class="lang-zh"><strong>症狀：</strong>磁碟建立成功但裝置未出現在 <code>/dev/</code> 中。</span>
+            </p>
+            <p><strong>
+                <span class="lang-en">Solutions:</span>
+                <span class="lang-zh">解決方案：</span>
+            </strong></p>
+            <pre><span class="comment"># Rescan iSCSI sessions</span>
+<span class="cmd">iscsiadm</span> <span class="flag">-m</span> session <span class="flag">--rescan</span>
+
+<span class="comment"># Reload multipath</span>
+<span class="cmd">multipathd</span> reconfigure
+<span class="cmd">multipath</span> <span class="flag">-v2</span></pre>
+        </div>
+    </details>
+
+    <details>
+        <summary>
+            <span class="lang-en">igroup Issues</span>
+            <span class="lang-zh">igroup 問題</span>
+        </summary>
+        <div class="detail-content">
+            <p>
+                <span class="lang-en"><strong>Symptoms:</strong> LUN mapped but node cannot see the device. <code>iscsiadm -m session</code> shows active sessions but <code>lsscsi</code> shows no NETAPP devices.</span>
+                <span class="lang-zh"><strong>症狀：</strong>LUN 已 map 但節點看不到裝置。<code>iscsiadm -m session</code> 顯示 active session 但 <code>lsscsi</code> 沒有 NETAPP 裝置。</span>
+            </p>
+            <p>
+                <span class="lang-en">Verify the node's iSCSI initiator IQN (from <code>/etc/iscsi/initiatorname.iscsi</code>) is listed in the correct igroup on ONTAP. Check with ONTAP CLI: <code>igroup show -vserver &lt;svm&gt;</code>.</span>
+                <span class="lang-zh">確認節點的 iSCSI initiator IQN（來自 <code>/etc/iscsi/initiatorname.iscsi</code>）已列在 ONTAP 上正確的 igroup 中。ONTAP CLI 檢查：<code>igroup show -vserver &lt;svm&gt;</code>。</span>
+            </p>
+        </div>
+    </details>
+
+    <details>
+        <summary>
+            <span class="lang-en">Hung Kernel Tasks (vgs blocked, D-state processes)</span>
+            <span class="lang-zh">Kernel 卡住（vgs 阻塞、D-state 行程）</span>
+        </summary>
+        <div class="detail-content">
+            <p>
+                <span class="lang-en"><strong>Symptoms:</strong> <code>vgs</code> or other commands hang. <code>ps aux</code> shows processes in D state. PVE operations time out.</span>
+                <span class="lang-zh"><strong>症狀：</strong><code>vgs</code> 或其他指令卡住。<code>ps aux</code> 顯示 D state 的行程。PVE 操作逾時。</span>
+            </p>
+            <p>
+                <span class="lang-en"><strong>Root cause:</strong> Usually a stale multipath device with <code>queue_if_no_path</code> or <code>no_path_retry queue</code>. Any process that touches the device enters uninterruptible sleep (D-state).</span>
+                <span class="lang-zh"><strong>根本原因：</strong>通常是設定了 <code>queue_if_no_path</code> 或 <code>no_path_retry queue</code> 的殘留 multipath 裝置。任何碰觸該裝置的行程都會進入不可中斷睡眠（D-state）。</span>
+            </p>
+            <p><strong>
+                <span class="lang-en">Manual cleanup for stale devices with queue_if_no_path:</span>
+                <span class="lang-zh">有 queue_if_no_path 的殘留裝置手動清理：</span>
+            </strong></p>
+            <pre><span class="comment"># 1. Disable queueing</span>
+<span class="cmd">multipathd</span> disablequeueing map &lt;wwid&gt;
+<span class="cmd">dmsetup</span> message &lt;wwid&gt; 0 fail_if_no_path
+
+<span class="comment"># 2. Flush the specific device</span>
+<span class="cmd">multipath</span> <span class="flag">-f</span> &lt;wwid&gt;
+
+<span class="comment"># 3. If step 2 fails, force remove</span>
+<span class="cmd">dmsetup</span> remove <span class="flag">--force --retry</span> &lt;wwid&gt;</pre>
+        </div>
+    </details>
+
+    <details>
+        <summary>
+            <span class="lang-en">Cannot Delete Volume (LVM holders / "device is still in use")</span>
+            <span class="lang-zh">無法刪除 Volume（LVM holders / 「裝置仍在使用中」）</span>
+        </summary>
+        <div class="detail-content">
+            <p>
+                <span class="lang-en"><strong>Symptoms:</strong> <code>Cannot delete volume: device is still in use (has holders)</code>. Common on PVE nodes upgraded from 7 to 8 to 9.</span>
+                <span class="lang-zh"><strong>症狀：</strong><code>Cannot delete volume: device is still in use (has holders)</code>。常見於從 PVE 7 升級至 8 再到 9 的節點。</span>
+            </p>
+            <p>
+                <span class="lang-en"><strong>Root cause:</strong> The host's LVM scanner auto-activated VGs found INSIDE VM disks (guest OS LVM). This happens when <code>/etc/lvm/lvm.conf</code> has no <code>global_filter</code> to exclude plugin multipath devices.</span>
+                <span class="lang-zh"><strong>根本原因：</strong>主機的 LVM 掃描器自動 activate 了 VM 磁碟裡面的 VG（客體 OS 的 LVM）。這在 <code>/etc/lvm/lvm.conf</code> 沒有 <code>global_filter</code> 排除 plugin multipath 裝置時會發生。</span>
+            </p>
+            <p><strong>
+                <span class="lang-en">Fix:</span>
+                <span class="lang-zh">修復：</span>
+            </strong></p>
+            <pre><span class="comment"># Deactivate the guest VG on the host</span>
+<span class="cmd">vgchange</span> <span class="flag">-an</span> &lt;guest-vg-name&gt;
+
+<span class="comment"># Long-term fix: add global_filter to /etc/lvm/lvm.conf</span>
+<span class="comment"># global_filter = [ "r|/dev/mapper/3.*|" ]</span></pre>
+        </div>
+    </details>
+
+    <details>
+        <summary>
+            <span class="lang-en">Common Error Messages</span>
+            <span class="lang-zh">常見錯誤訊息</span>
+        </summary>
+        <div class="detail-content">
+            <div class="table-wrap">
+                <table>
+                    <thead><tr>
+                        <th>
+                            <span class="lang-en">Error</span>
+                            <span class="lang-zh">錯誤</span>
+                        </th>
+                        <th>
+                            <span class="lang-en">Cause / Fix</span>
+                            <span class="lang-zh">原因 / 修復</span>
+                        </th>
+                    </tr></thead>
+                    <tbody>
+                        <tr><td><code>unknown storage type 'netappontap'</code></td><td>
+                            <span class="lang-en">Plugin not loaded. Reinstall and restart pvedaemon.</span>
+                            <span class="lang-zh">Plugin 未載入。重新安裝並重啟 pvedaemon。</span>
+                        </td></tr>
+                        <tr><td><code>Failed to map LUN</code></td><td>
+                            <span class="lang-en">ASA eventual consistency (v0.2.9 fixes with retry). Or igroup permissions issue.</span>
+                            <span class="lang-zh">ASA 最終一致性問題（v0.2.9 已加入重試修復）。或 igroup 權限問題。</span>
+                        </td></tr>
+                        <tr><td><code>Cannot grow device files</code></td><td>
+                            <span class="lang-en">Kernel did not see new LUN size. Fixed in v0.2.3+ (per-device rescan).</span>
+                            <span class="lang-zh">Kernel 未偵測到新的 LUN 大小。v0.2.3+ 已修復（per-device rescan）。</span>
+                        </td></tr>
+                        <tr><td><code>trying to acquire lock... got timeout</code></td><td>
+                            <span class="lang-en">D-state child blocking kernel lock. See "Hung Kernel Tasks" above. Upgrade to v0.2.5+.</span>
+                            <span class="lang-zh">D-state child 佔住 kernel lock。見上方「Kernel 卡住」。請升級至 v0.2.5+。</span>
+                        </td></tr>
+                        <tr><td><code>sysfs write ... timed out</code></td><td>
+                            <span class="lang-en">Writing to non-iSCSI SCSI host. Fixed in v0.2.5+.</span>
+                            <span class="lang-zh">對非 iSCSI SCSI host 寫入。v0.2.5+ 已修復。</span>
+                        </td></tr>
+                    </tbody>
+                </table>
+            </div>
+        </div>
+    </details>
+</section>
+
+<!-- ---- Changelog ---- -->
+<section class="doc-section" id="changelog">
+    <h2 class="section-title">
+        <span class="lang-en">Changelog</span>
+        <span class="lang-zh">變更紀錄</span>
+    </h2>
+    <p class="section-subtitle">
+        <span class="lang-en">Version history. For full details see <a href="https://github.com/jasoncheng7115/jt-pve-storage-netapp/blob/main/CHANGELOG.md">CHANGELOG.md</a>.</span>
+        <span class="lang-zh">版本紀錄。完整內容請參閱 <a href="https://github.com/jasoncheng7115/jt-pve-storage-netapp/blob/main/CHANGELOG_zh-TW.md">CHANGELOG_zh-TW.md</a>。</span>
+    </p>
+
+    <div class="changelog-entry">
+        <div class="changelog-version">v0.2.9 <span class="changelog-tag changelog-tag--fix">Fix</span></div>
+        <div class="changelog-date">2026-04-25</div>
+        <div class="changelog-summary">
+            <span class="lang-en">ASA Eventual Consistency Fix. Fixed <code>lun_map()</code> failing with "LUN not found" on NetApp ASA systems due to ONTAP internal propagation delay after <code>lun_create()</code>. Now retries UUID lookup up to 5 times with 1-second intervals.</span>
+            <span class="lang-zh">ASA 最終一致性修復。修復 <code>lun_map()</code> 在 NetApp ASA 系統上因 <code>lun_create()</code> 後 ONTAP 內部傳播延遲而回報 "LUN not found"。現在會重試 UUID 查詢最多 5 次，每次間隔 1 秒。</span>
+        </div>
+    </div>
+
+    <div class="changelog-entry">
+        <div class="changelog-version">v0.2.8 <span class="changelog-tag changelog-tag--fix">Fix</span></div>
+        <div class="changelog-date">2026-04-11</div>
+        <div class="changelog-summary">
+            <span class="lang-en">Code Review Fix Release. Fixed orphan cleanup unconditionally untracking WWIDs. Fixed <code>alloc_image()</code> TOCTOU race retry (now bounded loop, max 5). Removed all <code>multipath -F</code> recommendations. Fixed bare <code>glob()</code> without alarm timeout.</span>
+            <span class="lang-zh">程式碼審查修復 Release。修復殘留清理無條件 untrack WWID。修復 <code>alloc_image()</code> TOCTOU race retry（改為有界迴圈，最多 5 次）。移除所有 <code>multipath -F</code> 建議。修復 bare <code>glob()</code> 缺少 alarm timeout。</span>
+        </div>
+    </div>
+
+    <div class="changelog-entry">
+        <div class="changelog-version">v0.2.7 <span class="changelog-tag changelog-tag--critical">Critical</span></div>
+        <div class="changelog-date">2026-04-11</div>
+        <div class="changelog-summary">
+            <span class="lang-en">kpartx Partition Holder Fix. Fixed <code>is_device_in_use()</code> blocking ALL volume deletions on systems with kpartx partition scanning. Added <code>kpartx -d</code> cleanup step.</span>
+            <span class="lang-zh">kpartx Partition Holder 修復。修復 <code>is_device_in_use()</code> 在有 kpartx partition 掃描的系統上擋住所有 volume 刪除。新增 <code>kpartx -d</code> 清理步驟。</span>
+        </div>
+    </div>
+
+    <div class="changelog-entry">
+        <div class="changelog-version">v0.2.6 <span class="changelog-tag changelog-tag--fix">Fix</span></div>
+        <div class="changelog-date">2026-04-10</div>
+        <div class="changelog-summary">
+            <span class="lang-en">Postinst Service Reload + Operator UX. Added pvestatd to service reload list. Changed to <code>systemctl reload</code> (SIGHUP) to avoid D-state stop-phase hang. Added <code>lvm.conf</code> global_filter detection. Detailed <code>is_device_in_use</code> error messages with LVM VG names and fix commands.</span>
+            <span class="lang-zh">Postinst 服務 Reload + Operator UX。新增 pvestatd 到服務 reload 清單。改用 <code>systemctl reload</code> (SIGHUP) 避免 D-state stop 階段卡住。新增 <code>lvm.conf</code> global_filter 偵測。詳細的 <code>is_device_in_use</code> 錯誤訊息，含 LVM VG 名稱與修復指令。</span>
+        </div>
+    </div>
+
+    <div class="changelog-entry">
+        <div class="changelog-version">v0.2.5 <span class="changelog-tag changelog-tag--critical">Critical</span></div>
+        <div class="changelog-date">2026-04-10</div>
+        <div class="changelog-summary">
+            <span class="lang-en">Non-iSCSI SCSI Host Scan Fix (production incident on HPE ProLiant). Fixed <code>rescan_scsi_hosts()</code> writing to non-iSCSI hosts (smartpqi, USB, etc.), causing D-state cascades and node hangs. Now sources host list from <code>/sys/class/iscsi_host/</code>.</span>
+            <span class="lang-zh">非 iSCSI SCSI Host 掃描修復（HPE ProLiant 正式環境事件）。修復 <code>rescan_scsi_hosts()</code> 對非 iSCSI host（smartpqi、USB 等）寫入，導致 D-state 連鎖與節點當機。改從 <code>/sys/class/iscsi_host/</code> 取得 host 清單。</span>
+        </div>
+    </div>
+
+    <details>
+        <summary>
+            <span class="lang-en">Older versions (v0.2.4 -- v0.1.0)</span>
+            <span class="lang-zh">更早版本（v0.2.4 -- v0.1.0）</span>
+        </summary>
+        <div class="detail-content">
+            <div class="changelog-entry">
+                <div class="changelog-version">v0.2.4 <span class="changelog-tag changelog-tag--fix">Fix</span></div>
+                <div class="changelog-date">2026-04-09</div>
+                <div class="changelog-summary">
+                    <span class="lang-en">Cleanup Path Hardening + Concurrency + Operator UX. Fixed <code>clone_image()</code> TOCTOU race and missing <code>lun_unmap_all()</code> in cleanup. Added <code>_translate_limit_error()</code> for operator-friendly ONTAP error messages. Removed dead code <code>get_multipath_wwid()</code>. Pre-snapshot buffer flush.</span>
+                    <span class="lang-zh">Cleanup 路徑強化 + 並行 + Operator UX。修復 <code>clone_image()</code> TOCTOU race 及 cleanup 缺少 <code>lun_unmap_all()</code>。新增 <code>_translate_limit_error()</code> 提供 operator 友善的 ONTAP 錯誤訊息。移除無用程式碼 <code>get_multipath_wwid()</code>。Snapshot 前 buffer flush。</span>
+                </div>
+            </div>
+
+            <div class="changelog-entry">
+                <div class="changelog-version">v0.2.3 <span class="changelog-tag changelog-tag--critical">Critical</span></div>
+                <div class="changelog-date">2026-04-09</div>
+                <div class="changelog-summary">
+                    <span class="lang-en">Pre-Upgrade Stale Device Handling. Auto-imports ONTAP WWIDs on every status() poll. Multipath hang prevention (disablequeueing, dmsetup fallback). Symlink resolution fix (DATA LOSS prevention). Per-device rescan for resize and rollback. Extended 60s timeout for volume_delete.</span>
+                    <span class="lang-zh">升級前殘留裝置處理。每次 status() 輪詢自動匯入 ONTAP WWID。Multipath 卡住預防（disablequeueing、dmsetup fallback）。Symlink 解析修復（防止資料遺失）。Resize 及 rollback 改用 per-device rescan。volume_delete 延長至 60 秒 timeout。</span>
+                </div>
+            </div>
+
+            <div class="changelog-entry">
+                <div class="changelog-version">v0.2.2 <span class="changelog-tag changelog-tag--feature">Feature</span></div>
+                <div class="changelog-date">2026-04-08</div>
+                <div class="changelog-summary">
+                    <span class="lang-en">Cluster Orphan Device Cleanup. Automatic WWID tracking and orphan device cleanup. Concurrency fixes (flock, atomic write, double-fork). 63 tests pass.</span>
+                    <span class="lang-zh">叢集殘留裝置清理。自動 WWID 追蹤與殘留裝置清理。並行修復（flock、atomic write、double-fork）。63 項測試通過。</span>
+                </div>
+            </div>
+
+            <div class="changelog-entry">
+                <div class="changelog-version">v0.2.1 <span class="changelog-tag changelog-tag--fix">Fix</span></div>
+                <div class="changelog-date">2026-04-08</div>
+                <div class="changelog-summary">
+                    <span class="lang-en">Production Hardening. TOCTOU race fixes, multipath safety (no_path_retry 30, dev_loss_tmo 60), stale device prevention, migration safety, API resilience (401 retry).</span>
+                    <span class="lang-zh">正式環境強化。TOCTOU race 修復、multipath 安全（no_path_retry 30、dev_loss_tmo 60）、殘留裝置防護、遷移安全、API 韌性（401 重試）。</span>
+                </div>
+            </div>
+
+            <div class="changelog-entry">
+                <div class="changelog-version">v0.2.0 <span class="changelog-tag changelog-tag--feature">Feature</span></div>
+                <div class="changelog-date">2026-04-07</div>
+                <div class="changelog-summary">
+                    <span class="lang-en">Anti-Hang Protection. All sysfs writes/reads with timeout. Fixed iSCSI multipath single-session bug. LXC container, EFI disk, Cloud-init, TPM support.</span>
+                    <span class="lang-zh">防卡死保護。所有 sysfs 寫入/讀取加上 timeout。修復 iSCSI multipath 只建立單一 session。LXC 容器、EFI disk、Cloud-init、TPM 支援。</span>
+                </div>
+            </div>
+
+            <div class="changelog-entry">
+                <div class="changelog-version">v0.1.9 <span class="changelog-tag changelog-tag--fix">Fix</span></div>
+                <div class="changelog-date">2026-02-27</div>
+                <div class="changelog-summary">
+                    <span class="lang-en">Safety Audit. Fixed command injection vulnerability. Fixed IPC::Open3 deadlock and zombie processes. Snapshot rollback buffer flush. Online resize support.</span>
+                    <span class="lang-zh">安全稽核。修復命令注入漏洞。修復 IPC::Open3 deadlock 與 zombie process。Snapshot rollback buffer flush。線上 resize 支援。</span>
+                </div>
+            </div>
+
+            <div class="changelog-entry">
+                <div class="changelog-version">v0.1.8 <span class="changelog-tag changelog-tag--fix">Fix</span></div>
+                <div class="changelog-date">2026-02-12</div>
+                <div class="changelog-summary">
+                    <span class="lang-en">FC SAN bug fixes. Fixed is_fc_available(), added lun_unmap_all(), fixed deactivate_storage parameters.</span>
+                    <span class="lang-zh">FC SAN bug 修復。修復 is_fc_available()，新增 lun_unmap_all()，修復 deactivate_storage 參數。</span>
+                </div>
+            </div>
+
+            <div class="changelog-entry">
+                <div class="changelog-version">v0.1.7 <span class="changelog-tag changelog-tag--feature">Feature</span></div>
+                <div class="changelog-date">2026-01-25</div>
+                <div class="changelog-summary">
+                    <span class="lang-en">RAM Snapshot (vmstate) support. Automatic multipath configuration on install. License changed to MIT.</span>
+                    <span class="lang-zh">RAM 快照（vmstate）支援。安裝時自動設定 multipath。授權變更為 MIT。</span>
+                </div>
+            </div>
+
+            <div class="changelog-entry">
+                <div class="changelog-version">v0.1.6 <span class="changelog-tag changelog-tag--feature">Feature</span></div>
+                <div class="changelog-date">2026-01-24</div>
+                <div class="changelog-summary">
+                    <span class="lang-en">Full Clone support. Full Clone from VM Snapshot via temporary FlexClone. Automatic temp FlexClone cleanup.</span>
+                    <span class="lang-zh">Full Clone 支援。透過暫時 FlexClone 從 VM 快照完整複製。暫時 FlexClone 自動清理。</span>
+                </div>
+            </div>
+
+            <div class="changelog-entry">
+                <div class="changelog-version">v0.1.5 <span class="changelog-tag changelog-tag--feature">Feature</span></div>
+                <div class="changelog-date">2026-01-03</div>
+                <div class="changelog-summary">
+                    <span class="lang-en">Template support. Create base, rename volume. Graceful handling of missing LUNs.</span>
+                    <span class="lang-zh">範本支援。Create base、rename volume。優雅處理遺失的 LUN。</span>
+                </div>
+            </div>
+
+            <div class="changelog-entry">
+                <div class="changelog-version">v0.1.4 <span class="changelog-tag changelog-tag--feature">Feature</span></div>
+                <div class="changelog-date">2026-01-03</div>
+                <div class="changelog-summary">
+                    <span class="lang-en">FC SAN protocol support. New FC.pm module. Batch LUN query. Configurable device timeout.</span>
+                    <span class="lang-zh">FC SAN 協定支援。新增 FC.pm 模組。批次 LUN 查詢。可設定裝置 timeout。</span>
+                </div>
+            </div>
+
+            <div class="changelog-entry">
+                <div class="changelog-version">v0.1.3 <span class="changelog-tag changelog-tag--feature">Feature</span></div>
+                <div class="changelog-date">2026-01-03</div>
+                <div class="changelog-summary">
+                    <span class="lang-en">FlexClone support (Linked Clone). Template deletion protection. Volume autogrow enabled.</span>
+                    <span class="lang-zh">FlexClone 支援（Linked Clone）。範本刪除保護。啟用 volume autogrow。</span>
+                </div>
+            </div>
+
+            <div class="changelog-entry">
+                <div class="changelog-version">v0.1.2</div>
+                <div class="changelog-date">2026-01-02</div>
+                <div class="changelog-summary">
+                    <span class="lang-en">Bug fix and dependency release. Volume autogrow, psmisc dependency.</span>
+                    <span class="lang-zh">Bug 修復與相依套件 release。Volume autogrow、psmisc 相依套件。</span>
+                </div>
+            </div>
+
+            <div class="changelog-entry">
+                <div class="changelog-version">v0.1.1</div>
+                <div class="changelog-date">2026-01-02</div>
+                <div class="changelog-summary">
+                    <span class="lang-en">Safety improvements. Shrink protection, collision detection, API cache TTL, taint mode fix.</span>
+                    <span class="lang-zh">安全性改進。縮小保護、碰撞偵測、API 快取 TTL、taint mode 修復。</span>
+                </div>
+            </div>
+
+            <div class="changelog-entry">
+                <div class="changelog-version">v0.1.0 <span class="changelog-tag changelog-tag--feature">Feature</span></div>
+                <div class="changelog-date">2026-01-02</div>
+                <div class="changelog-summary">
+                    <span class="lang-en">Initial Release. FlexVol/LUN creation, igroup management, iSCSI discovery/login, multipath, snapshots, real-time storage status.</span>
+                    <span class="lang-zh">初始 Release。FlexVol/LUN 建立、igroup 管理、iSCSI 探索/登入、multipath、快照、即時儲存狀態。</span>
+                </div>
+            </div>
+        </div>
+    </details>
+</section>
+
+</div><!-- /content-wrap -->
+
+<!-- ---- Footer ---- -->
+<footer class="footer">
+    <div class="footer__inner">
+        <div>
+            <span class="lang-en">MIT License -- Jason Cheng (Jason Tools) &lt;jason@jason.tools&gt;</span>
+            <span class="lang-zh">MIT 授權 -- Jason Cheng (Jason Tools) &lt;jason@jason.tools&gt;</span>
+        </div>
+        <div>
+            <a href="https://github.com/jasoncheng7115/jt-pve-storage-netapp" target="_blank" rel="noopener">
+                <span class="lang-en">View on GitHub</span>
+                <span class="lang-zh">GitHub 原始碼</span>
+            </a>
+        </div>
+    </div>
+</footer>
+
+</main>
+
+<script>
+(function() {
+    // Language toggle
+    window.toggleLang = function() {
+        var html = document.documentElement;
+        var current = html.getAttribute('data-lang');
+        var next = current === 'en' ? 'zh' : 'en';
+        html.setAttribute('data-lang', next);
+        try { localStorage.setItem('jt-netapp-lang', next); } catch(e) {}
+    };
+
+    // Restore saved language
+    try {
+        var saved = localStorage.getItem('jt-netapp-lang');
+        if (saved === 'en' || saved === 'zh') {
+            document.documentElement.setAttribute('data-lang', saved);
+        }
+    } catch(e) {}
+
+    // Sidebar toggle (mobile)
+    window.toggleSidebar = function() {
+        var sidebar = document.getElementById('sidebar');
+        var overlay = document.querySelector('.sidebar-overlay');
+        sidebar.classList.toggle('open');
+        overlay.classList.toggle('show');
+    };
+
+    // Close sidebar when clicking a link (mobile)
+    var sidebarLinks = document.querySelectorAll('.sidebar__link');
+    sidebarLinks.forEach(function(link) {
+        link.addEventListener('click', function() {
+            if (window.innerWidth <= 1024) {
+                var sidebar = document.getElementById('sidebar');
+                var overlay = document.querySelector('.sidebar-overlay');
+                sidebar.classList.remove('open');
+                overlay.classList.remove('show');
+            }
+        });
+    });
+
+    // Active sidebar link tracking on scroll
+    var sections = document.querySelectorAll('.doc-section, .hero');
+    var navLinks = document.querySelectorAll('.sidebar__link');
+
+    function updateActiveLink() {
+        var scrollPos = window.scrollY + 100;
+        var current = '';
+        sections.forEach(function(section) {
+            if (section.offsetTop <= scrollPos) {
+                current = section.id;
+            }
+        });
+        navLinks.forEach(function(link) {
+            link.classList.remove('active');
+            if (link.getAttribute('href') === '#' + current) {
+                link.classList.add('active');
+            }
+        });
+    }
+
+    var scrollTimer;
+    window.addEventListener('scroll', function() {
+        if (scrollTimer) cancelAnimationFrame(scrollTimer);
+        scrollTimer = requestAnimationFrame(updateActiveLink);
+    });
+    updateActiveLink();
+})();
+</script>
+
+</body>
+</html>

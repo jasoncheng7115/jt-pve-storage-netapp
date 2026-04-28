@@ -261,21 +261,11 @@ img { max-width: 100%; height: auto; }
 
 /* ---- Hero ---- */
 .hero {
-    background: linear-gradient(180deg, var(--navy) 0%, #0d1f3c 100%);
+    background: var(--navy);
     position: relative;
     overflow: hidden;
     padding: 90px 40px 80px;
     color: #fff;
-}
-.hero::after {
-    content: "";
-    position: absolute;
-    bottom: 0;
-    left: 0;
-    right: 0;
-    height: 60px;
-    background: linear-gradient(180deg, transparent, var(--bg));
-    pointer-events: none;
 }
 
 .hero__grid-bg {

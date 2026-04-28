@@ -287,11 +287,16 @@ img { max-width: 100%; height: auto; display: block; }
 .content-wrap { max-width: none; padding: 0; margin: 0; }
 
 .doc-section {
-    padding: 56px var(--section-px);
+    padding: 56px calc((100% - var(--content-w)) / 2);
+    padding-top: 56px;
+    padding-bottom: 56px;
+    min-height: 0;
 }
-.doc-section > * {
-    max-width: var(--content-w);
-    margin-left: auto; margin-right: auto;
+@media (max-width: 1024px) {
+    .doc-section { padding-left: 24px; padding-right: 24px; }
+}
+@media (max-width: 640px) {
+    .doc-section { padding-left: 16px; padding-right: 16px; }
 }
 
 /* Alternating backgrounds with enough contrast to notice */
@@ -638,7 +643,6 @@ details .detail-content {
     .hero { padding: 48px 24px 40px; }
     .hero__title { font-size: clamp(1.6rem, 4vw, 2.2rem); }
     .hero__project-desc { font-size: 1rem; }
-    .doc-section { padding: 40px 24px; }
 }
 
 @media (max-width: 640px) {
@@ -650,7 +654,6 @@ details .detail-content {
     .top-nav { padding: 0 14px; }
     .top-nav__brand span { display: none; }
     .github-link span { display: none; }
-    .doc-section { padding: 28px 16px; }
     .footer { padding: 20px 16px; }
     .footer__inner { flex-direction: column; text-align: center; }
     table { font-size: 0.78rem; }

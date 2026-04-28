@@ -77,7 +77,7 @@ img { max-width: 100%; height: auto; display: block; }
 .top-nav {
     position: fixed; top: 0; left: 0; right: 0;
     height: var(--header-h);
-    background: #060e1a;
+    background: #0d0d12;
     border-bottom: 1px solid rgba(255,255,255,0.06);
     z-index: 1000;
     display: flex; align-items: center; justify-content: space-between;
@@ -173,7 +173,7 @@ img { max-width: 100%; height: auto; display: block; }
    Hero
    ============================================================ */
 .hero {
-    background: var(--navy);
+    background: linear-gradient(160deg, #131029 0%, #1a1040 45%, #0f1d3a 100%);
     position: relative; overflow: hidden;
     padding: 72px var(--section-px) 64px;
     color: #fff;

@@ -1656,8 +1656,28 @@
         var links = document.querySelectorAll('.sidebar__link');
         var sections = document.querySelectorAll('.sidebar__section');
         links.forEach(function(link) {
-            var text = link.textContent.toLowerCase();
-            link.style.display = (q === '' || text.indexOf(q) !== -1) ? '' : 'none';
+            if (q === '') {
+                link.style.display = '';
+                link.removeAttribute('data-matches');
+                return;
+            }
+            // Search sidebar link text
+            var linkText = link.textContent.toLowerCase();
+            var match = linkText.indexOf(q) !== -1;
+            // Also search the corresponding page section content
+            if (!match) {
+                var href = link.getAttribute('href');
+                if (href && href.startsWith('#')) {
+                    var target = document.getElementById(href.substring(1));
+                    if (target) {
+                        var content = target.textContent.toLowerCase();
+                        match = content.indexOf(q) !== -1;
+                    }
+                }
+            }
+            link.style.display = match ? '' : 'none';
+            if (match) link.setAttribute('data-matches', '1');
+            else link.removeAttribute('data-matches');
         });
         sections.forEach(function(sec) {
             var visibleLinks = sec.querySelectorAll('.sidebar__link:not([style*="display: none"])');

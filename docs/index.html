@@ -1596,11 +1596,11 @@
 (function() {
     // Language toggle
     window.toggleLang = function() {
-        var html = document.documentElement;
-        var current = html.getAttribute('data-lang');
+        var current = document.documentElement.getAttribute('data-lang');
         var next = current === 'en' ? 'zh' : 'en';
-        html.setAttribute('data-lang', next);
-        try { localStorage.setItem('jt-netapp-lang', next); } catch(e) {}
+        var url = new URL(window.location);
+        url.searchParams.set('lang', next);
+        window.location.href = url.toString();
     };
 
     // Restore language: URL param > localStorage > default (en)

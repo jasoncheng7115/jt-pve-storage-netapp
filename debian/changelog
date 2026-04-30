@@ -1,3 +1,27 @@
+jt-pve-storage-netapp (0.2.10-1) stable; urgency=medium
+
+  * Disaster Prevention & Monitoring Release
+  * Requirements: Proxmox VE 9.1 or later
+  * New Features:
+    - status() emits syslog ERROR after 3 consecutive failures (~30s)
+      for monitoring system pickup. Recovery message on reconnect.
+    - status() checks aggregate capacity, emits syslog WARNING at 90%
+      and ERROR at 95% with 1-hour cooldown.
+    - status() detects SVMs with fewer than 2 iSCSI LIFs (no path
+      redundancy) and emits syslog WARNING with 24-hour cooldown.
+    - postinst detects in-flight storage operations (qm move-disk,
+      qm clone, qm migrate, qmrestore, vzdump, pvesm alloc/free)
+      and warns with 5-second grace period before reload.
+  * Documentation:
+    - Added "Recovery After Storage Disconnect" SOP
+    - Added "Recovery After Abrupt Power Loss" SOP
+    - Added "Updating ONTAP Password" SOP
+    - Added "ONTAP HA Best Practices" section
+    - Added "Will upgrading affect running VMs?" upgrade safety section
+    - Added "Monitoring & Alerts" syslog reference
+
+ -- Jason Cheng <jason@jason.tools>  Wed, 30 Apr 2026 18:00:00 +0800
+
 jt-pve-storage-netapp (0.2.9-1) stable; urgency=medium
 
   * ASA Eventual Consistency Fix Release

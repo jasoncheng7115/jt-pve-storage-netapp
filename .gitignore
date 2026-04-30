@@ -1,4 +1,4 @@
-*.deb
+/*.deb
 *.buildinfo
 *.changes
 debian/.debhelper/

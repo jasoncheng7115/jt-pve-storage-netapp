@@ -1119,6 +1119,46 @@ pvesm list $STORAGE
 
 每個版本發佈前都必須通過上述所有測試。結果記錄於下方。
 
+### v0.2.10-1 災難預防與監控 Release (2026-04-30)
+
+**範圍：** v0.2.10 新監控功能 (Section 22) + Section 1-5、12、17、19、21 完整 regression。
+
+**測試環境：** 單節點測試 (PVE 9.1, ONTAP simulator)，netapp1 storage，2 個 iSCSI session。
+
+#### Section 22：v0.2.10 災難預防與監控
+
+| # | 測試 | 結果 |
+|---|------|------|
+| 22.1 | 儲存斷線：30 秒+ 觸發 ERROR，60 秒冷卻後重新發送 | PASS |
+| 22.2 | 儲存恢復：INFO 訊息 | PASS（`reachable again after 137s outage`）|
+| 22.3 | LIF 冗餘：< 2 個 LIF 觸發 WARNING（mock API） | PASS |
+| 22.4 | Aggregate 容量：95% 觸發 CRITICAL（mock API） | PASS |
+| 22.5 | 進行中操作偵測：postinst 警告 + 5 秒緩衝 | PASS（偵測到 `qm move-disk` dummy process）|
+| 22.6 | 靜態：syslog 用 sprintf-then-%s 模式 | PASS（4+ 處）|
+| 22.7 | 靜態：activate_storage 紀錄失敗（3 處）| PASS |
+
+#### Regression：核心操作
+
+| # | Section / 測試 | 結果 |
+|---|----------------|------|
+| 1 | 基本連線：storage active，2 iSCSI session | PASS |
+| 2.1-2.5 | VM 磁碟生命週期 | PASS |
+| 3.1-3.7 | VM 操作：快照 + 倒回 + 調整大小 | PASS |
+| 4.1-4.2 | 磁碟遷移：往返 | PASS |
+| 5.1 | Full clone | PASS |
+| 5.2 | Template + linked clone | PASS |
+| 12.1-12.2 | 殘留裝置防護 | PASS |
+| 17.1 | Status 效能：1.08 秒 | PASS |
+
+#### 測試中發現並修正的 bug
+
+| 問題 | 修正 |
+|------|------|
+| `_record_status_failure` 只在 `status()` 中，不在 `activate_storage`。PVE 會 cache inactive storage，可能不會每次 poll 都呼叫 `status()`。實際斷線時 plugin 無法警示。 | 在 `activate_storage` 三處（API 連線、SVM 查詢、aggregate 查詢失敗）加上 `_record_status_failure`。|
+| 原本「連續次數」門檻（3 次=30 秒）沒觸發，因為 PVE 每次斷線只 retry 一次。 | 改用「首次失敗時間戳 + 持續時間」：失敗超過 30 秒就發出 ERROR，60 秒冷卻避免洪水。|
+
+**結論：** 所有 v0.2.10 測試 PASS。所有 regression 測試 PASS。v0.2.10-1 可發佈。
+
 ### v0.2.9-1 ASA 最終一致性修復 Release (2026-04-26)
 
 **範圍：** v0.2.9 新功能 (lun_map retry) + 全面 regression (Section 1-5、12、17、19、20、21)。

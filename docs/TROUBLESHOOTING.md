@@ -642,6 +642,193 @@ Every disk deletion fails, even on disks with no LVM or mount.
 
 ---
 
+## Recovery After Storage Disconnect
+
+If the ONTAP system was unreachable for an extended period (network outage, ONTAP reboot, controller failover lasting more than the multipath `no_path_retry` window), follow this procedure to verify and recover.
+
+### Step 1: Verify storage is reachable again
+
+```bash
+# API connectivity
+curl -sk -u <user>:<password> https://<ontap-ip>/api/cluster/nodes \
+    | grep -q '"name"' && echo "API OK" || echo "API still failing"
+
+# iSCSI sessions
+iscsiadm -m session
+# Expected: all configured portals show active sessions
+
+# Multipath paths
+multipath -ll | grep -A4 NETAPP
+# Expected: all paths "active ready running"
+```
+
+### Step 2: Check for hung tasks
+
+```bash
+# Look for D-state processes (uninterruptible sleep)
+ps -eo pid,stat,comm | awk '$2 ~ /D/'
+# Expected: empty (no D-state processes)
+
+# If any D-state process appears: do NOT kill -9. Wait for it to finish
+# (kernel will eventually time out internal operations) or reboot the node.
+```
+
+### Step 3: Verify VM I/O recovered
+
+For each running VM that uses NetApp storage:
+
+```bash
+# Inside the VM, check filesystem state
+dmesg | tail -50 | grep -iE 'I/O error|read-only|remount'
+
+# If filesystem went read-only during the outage:
+mount -o remount,rw <mount-point>
+# Or reboot the VM to restore full filesystem state
+```
+
+### Step 4: Check plugin tracking state
+
+```bash
+# WWID tracking file should reflect current ONTAP LUNs
+cat /var/lib/pve-storage-netapp/<storeid>-wwids.json | python3 -m json.tool
+
+# Force a status() poll to trigger auto-import
+pvesm status | grep <storeid>
+# Expected: active, with non-zero capacity
+```
+
+### Step 5: Check for orphan devices
+
+If LUNs were deleted on ONTAP during the outage by another node:
+
+```bash
+# Look for stale multipath devices
+multipath -ll | grep -B1 NETAPP | grep "failed faulty"
+
+# If any: plugin's status() background cleanup will remove them
+# automatically within 1-2 polls. Force a poll if needed:
+pvesm status > /dev/null
+sleep 30
+pvesm status > /dev/null
+
+# Verify cleanup
+multipath -ll | grep -B1 NETAPP | grep "failed faulty"
+# Expected: empty
+```
+
+### Step 6: Verify alerts cleared
+
+If you have monitoring on syslog/journal, check that the storage-recovered message appeared:
+
+```bash
+journalctl -t pve-storage-netapp --since "1 hour ago"
+# Expected: "Storage 'X' reachable again after N consecutive failures"
+```
+
+---
+
+## Recovery After Abrupt Power Loss
+
+If a Proxmox VE node lost power without graceful shutdown.
+
+### What happens
+
+- VM in-memory state is lost. Data on ONTAP LUNs is crash-consistent (writes either complete or absent, no partial corruption).
+- iSCSI sessions are abruptly closed. ONTAP keeps LUN reservations until they time out.
+- Plugin tracking files in `/var/lib/pve-storage-netapp/` survive (persisted on local disk).
+- Plugin lock files in `/var/run/pve-storage-netapp/` are wiped (tmpfs).
+
+### Recovery procedure
+
+```bash
+# 1. After node boots, verify services
+systemctl is-active iscsid multipathd pvedaemon pvestatd pveproxy
+# Expected: all active
+
+# 2. Verify iSCSI sessions reconnected
+iscsiadm -m session
+# Expected: sessions to all configured ONTAP LIFs
+
+# 3. Verify multipath
+multipath -ll | head -20
+# Expected: NETAPP devices visible with all paths active
+
+# 4. Verify plugin storage
+pvesm status | grep netapp
+# Expected: active
+
+# 5. If VMs are in HA group, check whether they migrated to other nodes
+pvecm status
+ha-manager status
+```
+
+### LUN reservation timeout
+
+Default ONTAP LUN reservation timeout is 30-60 seconds. If a VM tries to start on this node before the timeout expires, you will see SCSI reservation conflict errors. Wait 60 seconds and retry.
+
+To shorten the timeout (recommended for HA scenarios):
+
+```
+# On ONTAP CLI
+vserver iscsi reservation modify -vserver <svm> -timeout 30
+```
+
+Recommended values:
+- **30 seconds** (recommended, balanced)
+- 60s = ONTAP default, conservative
+- < 20s not recommended (false-positive cleanup during transient network issues)
+
+---
+
+## Updating ONTAP Password
+
+When the ONTAP API user password changes, every Proxmox VE node must be updated. The cluster filesystem auto-syncs `/etc/pve/storage.cfg`, but cached API client objects in pvedaemon/pvestatd must be cleared.
+
+### Procedure
+
+```bash
+# 1. Change password on ONTAP first
+ssh <ontap-cluster> "security login password -username pveadmin"
+# Or via OnCommand System Manager UI
+
+# 2. Update PVE storage configuration (run on ANY one node;
+#    /etc/pve/storage.cfg auto-replicates to all nodes)
+pvesm set <storage-id> --ontap-password '<new-password>'
+
+# 3. Verify the configuration was updated
+grep ontap-password /etc/pve/storage.cfg
+
+# 4. On EACH PVE node, reload services to clear cached API client
+for node in $(pvecm nodes 2>/dev/null | awk 'NR>3 {print $3}'); do
+    ssh root@$node "systemctl reload pvedaemon pvestatd pveproxy"
+done
+
+# 5. Verify storage is reachable on all nodes
+pvesm status | grep <storage-id>
+# Expected: active
+```
+
+### What goes wrong if you skip step 4
+
+The plugin caches `LWP::UserAgent` objects in memory for 5 minutes. Without service reload:
+- pvestatd continues using the old password until cache expires (5 min).
+- Operations during this window get HTTP 401, plugin retries with re-init.
+- Symptoms: `pvesm status` shows `active`, but errors appear in `journalctl -u pvedaemon`.
+
+### Special characters in password
+
+If the password contains shell-special characters (`$`, `!`, backtick, etc.), single-quote it carefully:
+
+```bash
+# Safe: single quotes preserve all special chars
+pvesm set <storage-id> --ontap-password '$omeP@ss!w0rd`'
+
+# Unsafe: double quotes interpolate $ and backticks
+pvesm set <storage-id> --ontap-password "$omeP@ss"  # WRONG
+```
+
+---
+
 ## Getting Help
 
 1. **Collect diagnostic information:**

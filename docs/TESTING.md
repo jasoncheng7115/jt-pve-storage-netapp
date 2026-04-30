@@ -1344,6 +1344,149 @@ echo "glob calls: $GLOB_COUNT, alarm wraps: $ALARM_COUNT"
 
 ---
 
+## 22. Disaster Prevention & Monitoring (v0.2.10)
+
+Tests for the v0.2.10 monitoring/alerting features. All emit syslog messages with tag `pve-storage-netapp`. Read with `journalctl -t pve-storage-netapp`.
+
+### 22.1 Storage disconnect: ERROR alert
+
+Verifies `_record_status_failure` triggers a syslog ERROR after the storage has been failing for 30+ seconds.
+
+```bash
+# Clear state
+rm -f /var/run/pve-storage-netapp/netapp1-failstate
+
+# Block ONTAP API
+iptables -A OUTPUT -p tcp -d <ontap-mgmt-ip> --dport 443 -j DROP
+
+# Trigger 5 status() calls over ~50 seconds
+for i in 1 2 3 4 5; do
+  pvesm status > /dev/null
+  cat /var/run/pve-storage-netapp/netapp1-failstate
+  sleep 10
+done
+
+# Check syslog
+journalctl -t pve-storage-netapp --since "2 minutes ago"
+# Expected: at least one ERROR like:
+#   Storage 'netapp1' unreachable for ~30s (failure count: N).
+
+# Cleanup
+iptables -D OUTPUT -p tcp -d <ontap-mgmt-ip> --dport 443 -j DROP
+```
+
+### 22.2 Storage recovery: INFO message
+
+Verifies that after the alert was emitted, plugin logs an INFO recovery message.
+
+```bash
+# Continue from 22.1 state (alert was emitted)
+# Unblock ONTAP and trigger one more poll
+pvesm status > /dev/null
+
+# Expected: INFO message
+journalctl -t pve-storage-netapp --since "3 minutes ago" -p info | grep "reachable again"
+# Expected: "Storage 'netapp1' reachable again after Ns outage (failure count: N)"
+```
+
+### 22.3 LIF redundancy warning (unit test with mock API)
+
+Verifies `_check_lif_redundancy` warns when SVM has fewer than 2 iSCSI LIFs.
+
+```bash
+# Clear cooldown flag
+rm -f /var/run/pve-storage-netapp/test-lif-warn
+
+perl -I/usr/share/perl5 -e '
+package MockAPI;
+sub new { bless {}, shift }
+sub iscsi_get_portals { return [{target=>"x", address=>"1.2.3.4"}]; }  # 1 LIF only
+
+package main;
+use PVE::Storage::Custom::NetAppONTAPPlugin;
+my $api = MockAPI->new;
+my $scfg = { "ontap-protocol" => "iscsi" };
+PVE::Storage::Custom::NetAppONTAPPlugin::_check_lif_redundancy($api, "test", $scfg);
+'
+
+# Check syslog
+journalctl -t pve-storage-netapp --since "30 seconds ago" -p warning
+# Expected: "WARNING: Storage 'test' SVM has only 1 iSCSI LIF -- no path redundancy"
+```
+
+### 22.4 Aggregate capacity warning (unit test)
+
+Verifies `_check_aggregate_capacity` warns at >=90% and emits CRITICAL at >=95%.
+
+```bash
+# Clear cooldown
+rm -f /var/run/pve-storage-netapp/test-aggr-warn
+
+# Test 95% (should be CRITICAL/err)
+perl -I/usr/share/perl5 -e '
+package MockAPI;
+sub new { bless {}, shift }
+sub aggregate_get {
+    return { space => { block_storage => { size => 100_000_000_000, used => 95_000_000_000 } } };
+}
+
+package main;
+use PVE::Storage::Custom::NetAppONTAPPlugin;
+my $api = MockAPI->new;
+my $scfg = { "ontap-aggregate" => "aggr1" };
+PVE::Storage::Custom::NetAppONTAPPlugin::_check_aggregate_capacity($api, "test", $scfg);
+'
+
+# Check syslog
+journalctl -t pve-storage-netapp --since "30 seconds ago" -p err
+# Expected: "CRITICAL: Storage 'test' aggregate 'aggr1' is at 95% capacity"
+```
+
+### 22.5 In-flight operation detection (postinst)
+
+Verifies postinst detects running storage operations and warns before reload.
+
+```bash
+# Simulate in-flight operation
+bash -c 'exec -a "qm move-disk" sleep 60' &
+DUMMY=$!
+sleep 1
+pgrep -af "qm move-disk"
+# Expected: dummy process visible
+
+# Run postinst configure
+DEBIAN_FRONTEND=noninteractive /var/lib/dpkg/info/jt-pve-storage-netapp.postinst configure 2>&1 \
+    | grep -A4 "WARNING.*progress"
+# Expected: warning block listing "qm move-disk" with 5-second grace
+
+# Cleanup
+kill $DUMMY
+```
+
+### 22.6 Static check: syslog identifier consistency
+
+```bash
+grep -c '"pve-storage-netapp"' lib/PVE/Storage/Custom/NetAppONTAPPlugin.pm
+# Expected: >=4 (one per syslog call site)
+
+grep -c 'sprintf' lib/PVE/Storage/Custom/NetAppONTAPPlugin.pm | head -1
+# Expected: >=4 (each syslog call should pre-format with sprintf to
+# prevent format-string injection from variable values)
+```
+
+### 22.7 activate_storage failure path also tracks
+
+Verifies that `activate_storage` failures (not just `status()` failures) increment the fail counter, since pvestatd may cache inactive storage and skip status() polls.
+
+```bash
+grep -A3 'sub activate_storage' lib/PVE/Storage/Custom/NetAppONTAPPlugin.pm | head -6
+
+grep -c '_record_status_failure.*activate_storage' lib/PVE/Storage/Custom/NetAppONTAPPlugin.pm
+# Expected: 3 (API, SVM lookup, aggregate query failures)
+```
+
+---
+
 ## Cleanup
 
 ```bash
@@ -1363,6 +1506,76 @@ pvesm list $STORAGE
 ## Release Test Results
 
 Each release must pass all tests above before publishing. Results are recorded below.
+
+### v0.2.10-1 Disaster Prevention & Monitoring Release (2026-04-30)
+
+**Scope:** v0.2.10 new monitoring features (Section 22) + comprehensive regression across Sections 1-5, 12, 17, 19, 21.
+
+**Environment:** Single-node test (PVE 9.1, ONTAP simulator), netapp1 storage, 2 iSCSI sessions.
+
+#### Section 22: v0.2.10 Disaster Prevention & Monitoring
+
+| # | Test | Result |
+|---|------|--------|
+| 22.1 | Storage disconnect: ERROR alert at 30s+, re-emits after 60s cooldown | PASS |
+| 22.2 | Storage recovery: INFO message after outage | PASS (`reachable again after 137s outage`) |
+| 22.3 | LIF redundancy: WARNING at <2 LIFs (mock API test) | PASS |
+| 22.4 | Aggregate capacity: CRITICAL at 95% (mock API test) | PASS |
+| 22.5 | In-flight operation detection: postinst warns + 5s grace | PASS (detected `qm move-disk` dummy process) |
+| 22.6 | Static: syslog uses sprintf-then-%s pattern | PASS (4+ matches) |
+| 22.7 | Static: activate_storage records failures (3 sites) | PASS |
+
+#### Regression: Core Operations
+
+| # | Section / Test | Result |
+|---|----------------|--------|
+| 1 | Basic connectivity: storage active, 2 iSCSI sessions | PASS |
+| 2.1-2.5 | VM disk lifecycle: alloc + path + R/W + free | PASS |
+| 3.1-3.7 | VM operations: snapshot + rollback + resize | PASS |
+| 4.1-4.2 | Disk migration: move-disk round trip | PASS |
+| 5.1 | Full clone | PASS |
+| 5.2 | Template + linked clone | PASS |
+| 12.1 | Stale device prevention: no residual after free | PASS |
+| 12.2 | No failed faulty multipath paths | PASS |
+| 17.1 | Status performance: 1.08s | PASS |
+
+#### Regression: Audit Fixes
+
+| # | Test | Result |
+|---|------|--------|
+| 19.1.1 | volume_delete with lun_unmap_all (11 occurrences) | PASS |
+| 19.1.3 | get_multipath_wwid removed | PASS |
+| 19.1.4 | No bare system() calls | PASS |
+| 19.1.5 | No bare open /sys | PASS |
+| 19.8 | ONTAP limit error translation (6/6) | PASS |
+| 19.9.1 | Static: rescan uses /sys/class/iscsi_host | PASS |
+| 19.9.2 | Strace: only host4+host5 scanned (iSCSI), not host0-3 (virtio_scsi/ata_piix) | PASS |
+
+#### Regression: Code Review Guards
+
+| # | Test | Result |
+|---|------|--------|
+| 21.1 | Orphan cleanup conditional untrack | PASS |
+| 21.2 | alloc_image bounded TOCTOU retry (5 retries) | PASS |
+| 21.3 | No multipath -F recommendations (only warnings) | PASS |
+| 21.4 | All glob() have alarm timeout | PASS |
+
+#### Bug Found and Fixed During Testing
+
+| Issue | Resolution |
+|-------|------------|
+| `_record_status_failure` only in `status()`, not `activate_storage`. PVE caches inactive storage so `status()` may not be called on every poll. Plugin failed to alert on real outages. | Added `_record_status_failure` calls in `activate_storage` for: API connection, SVM lookup, aggregate query failures. |
+| Original consecutive-count threshold (3 failures = 30s) didn't fire because PVE only retried plugin once per outage. | Replaced with timestamp-based duration tracking: emits ERROR after 30s of failure regardless of retry count, with 60s re-alert cooldown. |
+
+#### Final state
+
+- WWID tracking: empty (no residual)
+- D-state processes: 0
+- Multipath NETAPP devices: 0
+- Services: pvedaemon, pvestatd, pveproxy all active
+- pvesm status netapp1: active, 1.08s response
+
+**Verdict:** All v0.2.10 tests PASS. All regression tests PASS. v0.2.10-1 ready for release.
 
 ### v0.2.9-1 ASA Eventual Consistency Fix Release (2026-04-26)
 

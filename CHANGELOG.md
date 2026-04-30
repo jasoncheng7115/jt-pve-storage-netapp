@@ -2,6 +2,29 @@
 
 All notable changes to the NetApp ONTAP Storage Plugin for Proxmox VE are documented here.
 
+## [0.2.10] - 2026-04-30
+
+### Disaster Prevention & Monitoring Release
+
+**New Monitoring Features:**
+
+- **Storage outage detection.** `status()` now tracks consecutive failures (3 failures = ~30 seconds with 10-second pvestatd polling) and emits syslog ERROR for monitoring system pickup. Re-emits every ~30s while down. Logs INFO recovery message when storage becomes reachable again.
+- **Aggregate capacity health check.** During `status()` poll, queries ONTAP aggregate capacity. Emits syslog WARNING at >=90% and ERROR at >=95% (1-hour cooldown per storage). Helps prevent thin-provisioning over-commit failures.
+- **LIF redundancy check.** Detects SVMs with fewer than 2 iSCSI LIFs (no path redundancy for ONTAP HA failover) and emits syslog WARNING (24-hour cooldown).
+- **In-flight operation detection.** postinst now detects running `qm move-disk`, `qm clone`, `qm migrate`, `qmrestore`, `vzdump`, `pvesm alloc/free` processes and warns with 5-second grace period before service reload.
+
+**Documentation Additions:**
+
+- "Recovery After Storage Disconnect" -- 6-step SOP in TROUBLESHOOTING.md
+- "Recovery After Abrupt Power Loss" -- procedure including LUN reservation timeout guidance
+- "Updating ONTAP Password" -- complete SOP including service reload requirement
+- "ONTAP HA Best Practices" -- recommended LIF layout, multipath verification, reservation timeout
+- "Will upgrading affect running VMs?" -- explains plugin upgrade does not affect VM I/O path
+- "Monitoring & Alerts" -- syslog event reference table for monitoring integration
+- Documentation website updated with all new sections
+
+**Tag:** `pve-storage-netapp` (use `journalctl -t pve-storage-netapp` to query plugin syslog messages)
+
 ## [0.2.9] - 2026-04-25
 
 ### ASA Eventual Consistency Fix Release

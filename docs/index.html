@@ -886,24 +886,9 @@
         <span class="lang-en">Each VM disk maps to exactly one ONTAP FlexVol containing exactly one LUN, providing clean snapshot semantics.</span>
         <span class="lang-zh">每個 VM 磁碟對應到一個 ONTAP FlexVol，內含一個 LUN，提供乾淨的快照語意。</span>
     </p>
-    <div class="ascii-diagram">Proxmox VE Cluster                    NetApp ONTAP
-+------------------+                  +-------------------+
-|   PVE Node 1     |                  |   SVM: svm0       |
-|   +----------+   |    iSCSI/FC      |   +-------------+ |
-|   | VM 100   |&lt;--+-----------------&gt;|   | FlexVol     | |
-|   | scsi0    |   |   multipath      |   | pve_..._100 | |
-|   +----------+   |                  |   | +-------+   | |
-+------------------+                  |   | | LUN   |   | |
-        |                             |   | | lun0  |   | |
-        | live migration              |   | +-------+   | |
-        v                             |   +-------------+ |
-+------------------+                  |                   |
-|   PVE Node 2     |                  |   igroups:        |
-|   +----------+   |    iSCSI/FC      |   - pve_pve_pve1  |
-|   | VM 100   |&lt;--+-----------------&gt;|   - pve_pve_pve2  |
-|   | scsi0    |   |   multipath      |                   |
-|   +----------+   |                  +-------------------+
-+------------------+</div>
+    <figure class="diagram">
+        <img src="architecture-diagram.png" alt="Architecture diagram: Proxmox VE Cluster with NetApp ONTAP via iSCSI/FC and Multipath" loading="lazy">
+    </figure>
 
     <h3 class="subsection-title">
         <span class="lang-en">Object Mapping</span>

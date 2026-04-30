@@ -487,6 +487,20 @@ p code, li code {
     -webkit-text-size-adjust: none;
 }
 
+.diagram {
+    margin: 18px 0;
+    padding: 16px;
+    background: var(--surface-0);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-lg);
+    text-align: center;
+}
+.diagram img {
+    max-width: 100%;
+    height: auto;
+    display: inline-block;
+}
+
 /* ============================================================
    Collapsible (details/summary)
    ============================================================ */

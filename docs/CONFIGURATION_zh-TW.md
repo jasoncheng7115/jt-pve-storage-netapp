@@ -846,7 +846,7 @@ pvesm add netappontap storage-dev  --ontap-cluster-name pve-dev ...
 
 ### 最低需求：2 個 iSCSI LIF 分散在不同 controller
 
-單一 iSCSI LIF 是單點故障。若該 LIF 所在的 controller 故障，所有 I/O 會停止，直到 LIF 遷移至 partner controller（通常 30-90 秒），或更久（若沒自動 failover）。
+單一 iSCSI LIF 是單點故障。**iSCSI / SAN LIF 在 takeover 時不會自動遷移到 partner controller**，只有 NAS LIF 才會自動 failover。若只有一個 iSCSI LIF 且該 controller 故障，所有 I/O 會停止直到 controller 恢復。冗餘必須由「多個 LIF 分散在兩個 controller 上」加上「host 端 multipath (MPIO) 透過 ALUA 切換路徑」來達成。
 
 當外掛偵測到 SVM 的 iSCSI LIF 少於 2 個時，會發出 syslog WARNING（24 小時冷卻）：
 
@@ -920,18 +920,23 @@ vserver iscsi reservation modify -vserver <svm> -timeout 30
 
 節點故障後，VM 在健康節點上可以提早 30 秒重啟。低於 20 秒不建議（暫時性網路抖動可能誤觸 cleanup）。
 
-### LIF 故障時外掛的行為
+### ONTAP controller takeover / giveback 時會發生什麼
 
-1. Multipath kernel module 將失效路徑標記為 `failed faulty`
-2. I/O 自動繼續用其他路徑（與外掛無關）
-3. iSCSI initiator 定期重試失效的 LIF
-4. ONTAP 將 LIF 遷移至 partner controller 後，iSCSI session 重新建立
-5. Multipath 路徑回到 `active ready running`
+iSCSI / SAN LIF 在 takeover 時**不會自動遷移**。路徑切換是由 host 端 MPIO 透過 ALUA 路徑優先權處理。當某個 controller 故障（或被 takeover），該 controller 上的 LIF 會離線；活著的 controller 上的 LIF 繼續服務 I/O。一般 takeover 和 giveback 切換時間都**小於 10 秒**。
 
-外掛的 `status()` 在 failover 期間可能短暫 timeout。連續 3 次失敗（約 30 秒）後，外掛會發出 syslog ERROR 給監控系統：
+外掛的 `status()` 在切換期間可能短暫 timeout。流程：
+
+1. Controller A 故障，A 上的 LIF 變得無法存取
+2. Multipath kernel module 將通往 A 的路徑標記為 `failed faulty`
+3. I/O 繼續走通往 B 的剩餘路徑（與外掛無關）
+4. ALUA group 狀態更新：B 上的路徑變成 active/optimized
+5. takeover 完成後（< 10 秒），I/O 完全由活著的 controller 服務
+6. giveback 時 A 回來，同樣 < 10 秒切換窗口
+
+外掛持續失敗超過 30 秒後，會發出 syslog ERROR 給監控系統：
 
 ```
-Storage 'netapp1' unreachable for ~30s (consecutive failures: 3)
+Storage 'netapp1' unreachable for ~30s (failure count: 3)
 ```
 
 儲存恢復連線時，外掛會發出恢復訊息：

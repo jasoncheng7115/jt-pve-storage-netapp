@@ -846,7 +846,7 @@ For production deployments, configure the ONTAP SVM to survive a controller fail
 
 ### Minimum requirement: 2 iSCSI LIFs on different controllers
 
-A single iSCSI LIF is a single point of failure. If the controller hosting that LIF fails, all I/O stops until the LIF migrates to the partner controller (typically 30-90 seconds), or longer if failover does not happen automatically.
+A single iSCSI LIF is a single point of failure. **iSCSI/SAN LIFs do NOT auto-migrate to the partner controller** during a takeover -- only NAS LIFs do. If you have only one iSCSI LIF and the controller hosting it fails, all I/O stops until the controller is brought back. Redundancy MUST come from having multiple LIFs distributed across both controllers, with host-side multipath (MPIO) handling path selection via ALUA.
 
 The plugin emits a syslog WARNING (with 24-hour cooldown) if it detects an SVM with fewer than 2 iSCSI LIFs:
 
@@ -920,18 +920,23 @@ vserver iscsi reservation modify -vserver <svm> -timeout 30
 
 After a node failure, VMs can restart on a healthy node 30 seconds sooner. Going below 20s is not recommended (transient network issues may trigger false-positive cleanup).
 
-### What the plugin does on LIF failure
+### What happens during ONTAP controller takeover/giveback
 
-1. Multipath kernel module marks the failed path as `failed faulty`.
-2. I/O continues on remaining paths automatically (no plugin involvement).
-3. iSCSI initiator periodically retries the failed LIF.
-4. When ONTAP migrates the LIF to the partner controller, iSCSI session re-establishes.
-5. Multipath path returns to `active ready running` state.
+iSCSI/SAN LIFs do NOT migrate during takeover. Path failover is driven by the host's MPIO using ALUA path priorities. When a controller fails (or is taken over), the LIFs on that controller go offline; LIFs on the surviving controller continue serving I/O. Typical takeover and giveback completion times are **less than 10 seconds**.
 
-The plugin's `status()` may briefly time out during the failover window. After 3 consecutive failures (~30s), the plugin emits a syslog ERROR for monitoring systems:
+The plugin's `status()` may briefly time out during the takeover window. Sequence:
+
+1. Controller A goes down. LIFs hosted on controller A become unreachable.
+2. Multipath kernel module marks paths through controller A as `failed faulty`.
+3. I/O continues on remaining paths through controller B (no plugin involvement).
+4. ALUA group state updates: paths through controller B are now active/optimized.
+5. After takeover completes (< 10s), I/O is fully served by the surviving controller.
+6. On giveback, controller A returns. Same < 10s window for the path back.
+
+After 30 seconds of failure, the plugin emits a syslog ERROR for monitoring systems:
 
 ```
-Storage 'netapp1' unreachable for ~30s (consecutive failures: 3)
+Storage 'netapp1' unreachable for ~30s (failure count: 3)
 ```
 
 When the storage becomes reachable again, the plugin emits a recovery message:

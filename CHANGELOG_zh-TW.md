@@ -2,6 +2,24 @@
 
 NetApp ONTAP Storage Plugin for Proxmox VE 的所有重要變更都記錄在此。
 
+## [0.2.11] - 2026-04-30
+
+### SAN LIF 冗餘偵測修正 Release
+
+**Bug 修正（NetApp 原廠確認後）：**
+
+- **LIF 冗餘檢查現在會偵測「所有 LIF 都在同一個 home_node」的狀況。** 先前 v0.2.10 只計算 LIF 總數，忽略一個常見的設定錯誤：2 個以上的 iSCSI LIF 都在同一個 controller 上。由於 SAN LIF 不會自動遷移，這種設定毫無 HA 冗餘可言 -- 單一 controller 故障會讓所有 LIF 同時離線。新版本檢查 LIF 是否分散在至少 2 個 home_node 上。
+- **SAN LIF 行為文件修正。** 先前的說明錯誤地寫成「iSCSI LIF 會在 takeover 時遷移到 partner controller（30-90 秒）」。NetApp 原廠確認：只有 NAS LIF 會自動遷移，SAN（iSCSI/FC）LIF 不會。路徑切換靠 host 端 MPIO + ALUA 選擇活著的路徑。典型 takeover/giveback 切換時間在 10 秒以內。
+
+**API 新增：**
+
+- `API.pm` 新增 `iscsi_get_lifs_with_home_node()`，回傳 LIF metadata：address、home_node、current_node、state。`_check_lif_redundancy()` 用此進行正確的 HA 驗證。既有的 `iscsi_get_portals()` 不變（仍用於 iSCSI 登入流程）。
+
+**文件修正：**
+
+- `docs/CONFIGURATION.md` 與 zh-TW：重寫「ONTAP HA 配置最佳實踐 > takeover 時會發生什麼」段落，使用正確的 ALUA/MPIO 流程說明。
+- `CLAUDE.md` 新增「ONTAP HA / SAN LIF Behavior」參考區段，避免未來文件再次寫錯。
+
 ## [0.2.10] - 2026-04-30
 
 ### 災難預防與監控 Release

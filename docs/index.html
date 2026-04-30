@@ -142,7 +142,7 @@
     <div class="hero__glow"></div>
     <div class="hero__glow-left"></div>
     <div class="hero__content">
-        <div class="hero__badge">v0.2.10 <span class="hero__badge-sep"></span> MIT License</div>
+        <div class="hero__badge">v0.2.11 <span class="hero__badge-sep"></span> MIT License</div>
         <h1 class="hero__title">jt-pve-storage-netapp</h1>
         <p class="hero__project-desc">
             <span class="lang-en">NetApp ONTAP SAN/iSCSI/FC Storage Plugin for Proxmox VE</span>
@@ -1436,6 +1436,15 @@
         <span class="lang-en">Version history. For full details see <a href="https://github.com/jasoncheng7115/jt-pve-storage-netapp/blob/main/CHANGELOG.md">CHANGELOG.md</a>.</span>
         <span class="lang-zh">版本紀錄。完整內容請參閱 <a href="https://github.com/jasoncheng7115/jt-pve-storage-netapp/blob/main/CHANGELOG_zh-TW.md">CHANGELOG_zh-TW.md</a>。</span>
     </p>
+
+    <div class="changelog-entry">
+        <div class="changelog-version">v0.2.11 <span class="changelog-tag changelog-tag--fix">Fix</span></div>
+        <div class="changelog-date">2026-04-30</div>
+        <div class="changelog-summary">
+            <span class="lang-en">SAN LIF Redundancy Detection Fix. After NetApp clarification: SAN (iSCSI/FC) LIFs do NOT auto-migrate during takeover -- only NAS LIFs do. Path failover relies on host MPIO + ALUA. Plugin now detects "all LIFs share same home_node" misconfiguration (single controller failure risk). New <code>iscsi_get_lifs_with_home_node()</code> API returns LIF metadata for HA validation. Documentation corrected.</span>
+            <span class="lang-zh">SAN LIF 冗餘偵測修正。NetApp 原廠確認後：SAN (iSCSI/FC) LIF 在 takeover 時不會自動遷移，只有 NAS LIF 會。路徑切換靠 host MPIO + ALUA。外掛現在會偵測「所有 LIF 都在同一 home_node」的設定錯誤（單一 controller 故障即全斷風險）。新增 <code>iscsi_get_lifs_with_home_node()</code> API 回傳 LIF metadata 供 HA 驗證。文件已修正。</span>
+        </div>
+    </div>
 
     <div class="changelog-entry">
         <div class="changelog-version">v0.2.10 <span class="changelog-tag changelog-tag--feature">Feature</span></div>

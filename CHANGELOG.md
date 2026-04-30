@@ -2,6 +2,24 @@
 
 All notable changes to the NetApp ONTAP Storage Plugin for Proxmox VE are documented here.
 
+## [0.2.11] - 2026-04-30
+
+### SAN LIF Redundancy Detection Fix Release
+
+**Bug Fixes (after NetApp clarification):**
+
+- **LIF redundancy check now detects "all LIFs share same home_node".** Previous v0.2.10 version only counted total iSCSI LIFs and missed the common misconfiguration where 2+ LIFs are on the same controller. With SAN LIFs not auto-migrating, this configuration provides zero HA redundancy -- a single controller failure takes all LIFs offline simultaneously. The check now verifies LIFs are distributed across at least 2 home_nodes.
+- **SAN LIF behavior documentation corrected.** Previous text incorrectly stated iSCSI LIFs migrate to the partner controller during takeover (30-90 seconds). NetApp confirmed: only NAS LIFs auto-migrate; SAN (iSCSI/FC) LIFs do NOT. Path failover relies on host MPIO + ALUA selecting surviving paths. Typical takeover/giveback completes in less than 10 seconds.
+
+**API additions:**
+
+- New `iscsi_get_lifs_with_home_node()` in `API.pm` returns LIF metadata: address, home_node, current_node, state. Used by `_check_lif_redundancy()` for proper HA validation. The existing `iscsi_get_portals()` is unchanged (still used by iSCSI login flow).
+
+**Documentation corrections:**
+
+- `docs/CONFIGURATION.md` and zh-TW: rewrote "ONTAP HA Best Practices > What happens during takeover" section with correct ALUA/MPIO flow.
+- `CLAUDE.md` added "ONTAP HA / SAN LIF Behavior" reference section to prevent future documentation errors.
+
 ## [0.2.10] - 2026-04-30
 
 ### Disaster Prevention & Monitoring Release

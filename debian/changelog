@@ -1,3 +1,21 @@
+jt-pve-storage-netapp (0.2.11-1) stable; urgency=medium
+
+  * SAN LIF Redundancy Detection Fix Release
+  * Requirements: Proxmox VE 9.1 or later
+  * Bug Fixes (after NetApp clarification):
+    - LIF redundancy check now detects "all LIFs share same home_node"
+      condition. Previous version only counted total LIFs and missed
+      the common misconfiguration where 2+ iSCSI LIFs are on the same
+      controller, providing zero HA redundancy.
+    - SAN (iSCSI/FC) LIFs do NOT auto-migrate during takeover (only
+      NAS LIFs do). Path failover relies on host MPIO + ALUA selecting
+      surviving paths. Documentation corrected to reflect this.
+  * API additions:
+    - iscsi_get_lifs_with_home_node() returns LIF metadata including
+      home_node, current_node, and state for HA validation.
+
+ -- Jason Cheng <jason@jason.tools>  Wed, 30 Apr 2026 19:00:00 +0800
+
 jt-pve-storage-netapp (0.2.10-1) stable; urgency=medium
 
   * Disaster Prevention & Monitoring Release

@@ -178,7 +178,7 @@ systemctl enable --now multipathd
 
 # Step 4: Install the plugin package
 # (Automatically configures multipath and restarts PVE services)
-dpkg -i jt-pve-storage-netapp_0.2.10-1_all.deb
+dpkg -i jt-pve-storage-netapp_0.2.9-1_all.deb
 ```
 
 > **Note:** The plugin automatically:
@@ -223,7 +223,7 @@ apt install -y open-iscsi multipath-tools sg3-utils psmisc \
 systemctl enable --now iscsid multipathd
 
 # Install plugin (auto-configures multipath and restarts PVE services)
-dpkg -i jt-pve-storage-netapp_0.2.10-1_all.deb
+dpkg -i jt-pve-storage-netapp_0.2.9-1_all.deb
 ```
 
 **Installation Order for Clusters:**
@@ -232,23 +232,7 @@ dpkg -i jt-pve-storage-netapp_0.2.10-1_all.deb
 
 ## Upgrade SOP
 
-### Will upgrading affect running VMs?
-
-**Short answer: No.** Running VMs are not affected by a plugin upgrade in normal cases. Their I/O path is QEMU -> kernel block layer -> multipath -> iSCSI -- the plugin is only on the control plane.
-
-**Details:**
-
-| Component | Affected by upgrade? | Why |
-|-----------|---------------------|-----|
-| Running VM I/O | No | I/O bypasses the plugin entirely |
-| iSCSI sessions | No | Plugin upgrade does not restart iscsid |
-| Multipath devices | No | Plugin upgrade does not restart multipathd (only `multipathd reconfigure` if multipath.conf changed, which is non-disruptive) |
-| Active control-plane operations | **Yes** | move-disk / clone / snapshot in flight may be interrupted by pvedaemon reload |
-| New control-plane operations | Briefly delayed | New operations wait for service reload (~1-2 seconds) |
-
-**The plugin postinst will warn if it detects in-flight operations** (`qm move-disk`, `qm clone`, `qm migrate`, `qmrestore`, `vzdump`, `pvesm alloc/free`) and gives 5 seconds to abort with Ctrl+C. Since v0.2.5, services are reloaded with SIGHUP (re-exec), not full restart, so there is no stop-phase window where pvedaemon is unresponsive.
-
-**Recommended:** schedule upgrades during low-activity windows. Stop or migrate VMs only if you want zero risk of any control-plane operation interruption.
+When upgrading from a previous version, follow these steps **on every cluster node** in sequence (one node at a time):
 
 ### Step 1: Pre-upgrade backup
 
@@ -276,7 +260,7 @@ done
 
 ```bash
 # Update plugin package
-dpkg -i jt-pve-storage-netapp_0.2.10-1_all.deb
+dpkg -i jt-pve-storage-netapp_0.2.9-1_all.deb
 ```
 
 The postinst will automatically:
@@ -987,7 +971,7 @@ storage: No such storage
 **Solution:**
 ```bash
 # Install on the affected node
-dpkg -i jt-pve-storage-netapp_0.2.10-1_all.deb
+dpkg -i jt-pve-storage-netapp_0.2.9-1_all.deb
 apt install -f
 systemctl restart pvedaemon pveproxy
 ```

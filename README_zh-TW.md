@@ -178,7 +178,7 @@ systemctl enable --now multipathd
 
 # 步驟 4：安裝外掛程式套件
 # （自動配置 multipath 並重新啟動 PVE 服務）
-dpkg -i jt-pve-storage-netapp_0.2.10-1_all.deb
+dpkg -i jt-pve-storage-netapp_0.2.9-1_all.deb
 ```
 
 > **注意：** 外掛程式會自動：
@@ -223,7 +223,7 @@ apt install -y open-iscsi multipath-tools sg3-utils psmisc \
 systemctl enable --now iscsid multipathd
 
 # 安裝外掛程式（自動配置 multipath 並重新啟動 PVE 服務）
-dpkg -i jt-pve-storage-netapp_0.2.10-1_all.deb
+dpkg -i jt-pve-storage-netapp_0.2.9-1_all.deb
 ```
 
 **叢集安裝順序：**
@@ -232,23 +232,7 @@ dpkg -i jt-pve-storage-netapp_0.2.10-1_all.deb
 
 ## 升級 SOP
 
-### 升級會影響執行中的 VM 嗎？
-
-**簡短答案：不會。** 執行中的 VM 在正常情況下不會受外掛升級影響。VM 的 I/O 路徑是 QEMU -> kernel block layer -> multipath -> iSCSI，外掛只負責控制層 (control plane)。
-
-**詳細說明：**
-
-| 元件 | 升級會影響嗎？ | 原因 |
-|------|--------------|------|
-| 執行中 VM 的 I/O | 否 | I/O 完全繞過外掛 |
-| iSCSI session | 否 | 外掛升級不會重啟 iscsid |
-| Multipath 裝置 | 否 | 外掛升級不會重啟 multipathd（multipath.conf 變更時只做非中斷性的 `multipathd reconfigure`）|
-| 進行中的控制層操作 | **會** | 進行中的 move-disk / clone / snapshot 可能因 pvedaemon reload 而中斷 |
-| 新的控制層操作 | 短暫延遲 | 新操作會等待服務 reload 完成（約 1-2 秒）|
-
-**外掛 postinst 會偵測進行中的操作**（`qm move-disk`、`qm clone`、`qm migrate`、`qmrestore`、`vzdump`、`pvesm alloc/free`），並給 5 秒讓你按 Ctrl+C 取消。從 v0.2.5 起，服務改用 SIGHUP（re-exec）而非完整 restart，所以沒有 stop-phase 期間 pvedaemon 不回應的問題。
-
-**建議：** 在低活動時段升級。只有想完全避免任何控制層操作中斷風險時，才需要先停或遷移 VM。
+從舊版本升級時，請在**每個叢集節點**依序執行下列步驟（一次升級一台節點）：
 
 ### 步驟 1：升級前備份
 
@@ -276,7 +260,7 @@ done
 
 ```bash
 # 升級 plugin 套件
-dpkg -i jt-pve-storage-netapp_0.2.10-1_all.deb
+dpkg -i jt-pve-storage-netapp_0.2.9-1_all.deb
 ```
 
 postinst 會自動：
@@ -977,7 +961,7 @@ storage: No such storage
 **解決方案：**
 ```bash
 # 在受影響的節點上安裝
-dpkg -i jt-pve-storage-netapp_0.2.10-1_all.deb
+dpkg -i jt-pve-storage-netapp_0.2.9-1_all.deb
 apt install -f
 systemctl restart pvedaemon pveproxy
 ```

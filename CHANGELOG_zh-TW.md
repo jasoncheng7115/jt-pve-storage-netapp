@@ -2,29 +2,6 @@
 
 NetApp ONTAP Storage Plugin for Proxmox VE 的所有重要變更都記錄在此。
 
-## [0.2.10] - 2026-04-30
-
-### 災難預防與監控 Release
-
-**新增監控功能：**
-
-- **儲存中斷偵測。** `status()` 現在會追蹤連續失敗次數（連續 3 次失敗 = 約 30 秒，pvestatd 每 10 秒 poll），達到門檻後發送 syslog ERROR 給監控系統。中斷期間每約 30 秒再次發送。儲存恢復連線時發送 INFO 恢復訊息。
-- **Aggregate 容量健康檢查。** `status()` poll 時查詢 ONTAP aggregate 容量，>=90% 發送 syslog WARNING，>=95% 發送 ERROR（每個 storage 1 小時冷卻）。協助避免精簡配置 over-commit 失敗。
-- **LIF 冗餘檢查。** 偵測 SVM iSCSI LIF 少於 2 個（ONTAP HA failover 無路徑冗餘）的情況，發送 syslog WARNING（24 小時冷卻）。
-- **進行中操作偵測。** postinst 偵測執行中的 `qm move-disk`、`qm clone`、`qm migrate`、`qmrestore`、`vzdump`、`pvesm alloc/free` 程序，警告並給 5 秒緩衝才繼續 reload 服務。
-
-**文件新增：**
-
-- 「儲存斷線後的恢復程序」-- TROUBLESHOOTING.md 中的 6 步驟 SOP
-- 「Proxmox VE 節點突然斷電後的恢復」-- 含 LUN reservation timeout 建議
-- 「更新 ONTAP 密碼」-- 完整 SOP，包含必要的服務 reload
-- 「ONTAP HA 配置最佳實踐」-- 建議的 LIF 配置、multipath 驗證、reservation timeout
-- 「升級會影響執行中的 VM 嗎？」-- 說明外掛升級不影響 VM I/O 路徑
-- 「監控與警示」-- syslog 事件對照表，用於監控系統整合
-- 文件網站同步更新所有新章節
-
-**Tag：** `pve-storage-netapp`（用 `journalctl -t pve-storage-netapp` 查詢外掛 syslog 訊息）
-
 ## [0.2.9] - 2026-04-25
 
 ### ASA 最終一致性修復 Release

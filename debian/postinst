@@ -251,31 +251,6 @@ case "$1" in
         echo "=============================================="
         echo ""
 
-        # Detect in-flight storage operations.
-        # Reloading pvedaemon/pvestatd while a long-running operation
-        # (move-disk, clone, migrate, vzdump) is active can interrupt
-        # the operation. We warn but do not block -- user decides.
-        IN_FLIGHT=""
-        for pat in "qm move-disk" "qm clone" "qm migrate" "qmrestore" "vzdump" "pvesm alloc" "pvesm free"; do
-            if pgrep -af "$pat" 2>/dev/null | grep -qv "pgrep -af"; then
-                IN_FLIGHT="$IN_FLIGHT  - $pat\n"
-            fi
-        done
-        if [ -n "$IN_FLIGHT" ]; then
-            echo -e "\033[1;33m!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!\033[0m"
-            echo -e "\033[1;33m  WARNING: Storage operation(s) currently in progress:\033[0m"
-            echo -e "\033[1;33m!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!\033[0m"
-            echo ""
-            echo -e "$IN_FLIGHT"
-            echo "  Reloading PVE services during these operations may interrupt them."
-            echo "  Recommendation: cancel this install (Ctrl+C), wait for operations"
-            echo "  to complete, then retry."
-            echo ""
-            echo "  Continuing in 5 seconds (Ctrl+C to abort)..."
-            sleep 5
-            echo ""
-        fi
-
         # Add NetApp multipath configuration
         add_netapp_multipath_config
         echo ""

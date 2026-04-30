@@ -1008,6 +1008,33 @@ sub iscsi_get_portals {
     return \@portals;
 }
 
+# Get iSCSI LIFs with home-node information for HA redundancy checks.
+# Returns arrayref of { address, home_node, current_node, state }.
+# home_node is what matters for redundancy: if all LIFs share the same
+# home_node, a single controller failure takes them all offline (iSCSI
+# LIFs do NOT auto-migrate during takeover -- only NAS LIFs do).
+sub iscsi_get_lifs_with_home_node {
+    my ($self) = @_;
+    my $svm_uuid = $self->get_svm_uuid();
+    my $resp = $self->get('/network/ip/interfaces', {
+        'svm.uuid' => $svm_uuid,
+        'services' => 'data_iscsi',
+        fields     => 'ip.address,location.home_node.name,location.node.name,state',
+    });
+    my @lifs;
+    if ($resp->{records}) {
+        for my $lif (@{$resp->{records}}) {
+            push @lifs, {
+                address      => $lif->{ip}{address},
+                home_node    => $lif->{location}{home_node}{name} // 'unknown',
+                current_node => $lif->{location}{node}{name} // 'unknown',
+                state        => $lif->{state} // 'unknown',
+            };
+        }
+    }
+    return \@lifs;
+}
+
 #
 # Aggregate information (for capacity)
 #

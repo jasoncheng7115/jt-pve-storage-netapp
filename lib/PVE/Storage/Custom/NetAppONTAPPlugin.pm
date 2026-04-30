@@ -1066,10 +1066,16 @@ sub _check_aggregate_capacity {
     warn "$level_text: aggregate '$aggr_name' at ${pct}% capacity\n";
 }
 
-# Check LIF redundancy for ONTAP HA. Single-LIF SVMs have no failover
-# redundancy: if the controller hosting that LIF fails, all I/O stops
-# until the LIF migrates (30-90s) or admin intervention.
-# Cooldown: 24 hours per storage (this is config-related, rarely changes).
+# Check LIF redundancy for ONTAP HA. SAN LIFs do NOT auto-migrate during
+# takeover (only NAS LIFs do). Path failover relies on host MPIO + ALUA
+# selecting LIFs on the surviving controller. Therefore "2+ LIFs" is
+# insufficient if all LIFs share the same home_node -- a single
+# controller failure would take them all offline simultaneously.
+#
+# Two failure modes detected:
+#  (a) total LIF count < 2 (single point of failure)
+#  (b) all LIFs have the same home_node (single controller failure)
+# Cooldown: 24 hours per storage (config-related, rarely changes).
 sub _check_lif_redundancy {
     my ($api, $storeid, $scfg) = @_;
     my $proto = $scfg->{'ontap-protocol'} // 'iscsi';
@@ -1080,25 +1086,46 @@ sub _check_lif_redundancy {
     my $last = (stat($flag))[9] // 0;
     return if (time() - $last) < 86400;  # 24 hour cooldown
 
-    my $portals = eval { $api->iscsi_get_portals(); };
-    return unless $portals && ref($portals) eq 'ARRAY';
+    my $lifs = eval { $api->iscsi_get_lifs_with_home_node(); };
+    return unless $lifs && ref($lifs) eq 'ARRAY';
 
-    my $count = scalar(@$portals);
-    return if $count >= 2;  # 2+ LIFs is healthy
+    my $count = scalar(@$lifs);
+    my %home_nodes;
+    for my $lif (@$lifs) {
+        $home_nodes{$lif->{home_node} // 'unknown'}++;
+    }
+    my $node_count = scalar(keys %home_nodes);
+
+    # Healthy: 2+ LIFs distributed across 2+ home_nodes
+    return if $count >= 2 && $node_count >= 2;
 
     if (open(my $fh, '>', $flag)) { close($fh); }
 
-    my $msg = sprintf(
-        "WARNING: Storage '%s' SVM has only %d iSCSI LIF -- no path redundancy. " .
-        "Recommend at least 2 LIFs on different controllers for HA.",
-        $storeid, $count);
+    my $msg;
+    if ($count < 2) {
+        $msg = sprintf(
+            "WARNING: Storage '%s' SVM has only %d iSCSI LIF -- no path redundancy. " .
+            "Recommend at least 2 LIFs on different controllers for HA. " .
+            "Note: SAN LIFs do not auto-migrate during takeover.",
+            $storeid, $count);
+    } else {
+        # 2+ LIFs but all on same home_node
+        my @nodes = keys %home_nodes;
+        $msg = sprintf(
+            "WARNING: Storage '%s' SVM has %d iSCSI LIFs but all share home_node '%s'. " .
+            "A single controller failure will take all LIFs offline. " .
+            "SAN LIFs do not auto-migrate during takeover. " .
+            "Distribute LIFs across both controllers for HA.",
+            $storeid, $count, $nodes[0]);
+    }
+
     eval {
         require Sys::Syslog;
         Sys::Syslog::openlog("pve-storage-netapp", "pid", "daemon");
         Sys::Syslog::syslog("warning", "%s", $msg);
         Sys::Syslog::closelog();
     };
-    warn "WARNING: SVM has only $count iSCSI LIF -- no path redundancy. " .
+    warn "WARNING: iSCSI LIF redundancy issue (count=$count, home_nodes=$node_count). " .
          "See docs/CONFIGURATION.md 'ONTAP HA Best Practices'.\n";
 }
 

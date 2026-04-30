@@ -642,6 +642,193 @@ Cannot delete volume: device is still in use (mounted, has holders, or open by p
 
 ---
 
+## 儲存斷線後的恢復程序
+
+當 ONTAP 系統長時間無法連線（網路中斷、ONTAP 重啟、controller failover 超過 multipath `no_path_retry` 時間），請依以下程序確認與恢復。
+
+### 步驟 1：確認儲存可連線
+
+```bash
+# API 連線
+curl -sk -u <user>:<password> https://<ontap-ip>/api/cluster/nodes \
+    | grep -q '"name"' && echo "API OK" || echo "API 仍失敗"
+
+# iSCSI session
+iscsiadm -m session
+# 預期：所有設定的 portal 都顯示 active session
+
+# Multipath 路徑
+multipath -ll | grep -A4 NETAPP
+# 預期：所有路徑為「active ready running」
+```
+
+### 步驟 2：檢查掛起的程序
+
+```bash
+# 找出 D-state 程序（不可中斷的睡眠狀態）
+ps -eo pid,stat,comm | awk '$2 ~ /D/'
+# 預期：空（沒有 D-state 程序）
+
+# 若出現 D-state 程序：絕對不要 kill -9。等它自己結束（kernel 內部
+# 操作會逾時），或重新開機節點。
+```
+
+### 步驟 3：確認 VM I/O 已恢復
+
+對每台使用 NetApp 儲存的執行中 VM：
+
+```bash
+# 在 VM 內檢查檔案系統狀態
+dmesg | tail -50 | grep -iE 'I/O error|read-only|remount'
+
+# 若中斷期間檔案系統變成唯讀：
+mount -o remount,rw <掛載點>
+# 或重啟 VM 以恢復完整檔案系統狀態
+```
+
+### 步驟 4：檢查 plugin 追蹤狀態
+
+```bash
+# WWID 追蹤檔應反映當前 ONTAP 上的 LUN
+cat /var/lib/pve-storage-netapp/<storeid>-wwids.json | python3 -m json.tool
+
+# 強制觸發 status() poll 進行自動匯入
+pvesm status | grep <storeid>
+# 預期：active，容量為非零值
+```
+
+### 步驟 5：檢查殘留裝置
+
+若中斷期間其他節點刪除了 LUN：
+
+```bash
+# 找尋過期的 multipath 裝置
+multipath -ll | grep -B1 NETAPP | grep "failed faulty"
+
+# 若有：plugin 的 status() 背景清理會在 1-2 次 poll 內自動移除。
+# 必要時手動觸發：
+pvesm status > /dev/null
+sleep 30
+pvesm status > /dev/null
+
+# 驗證清理完成
+multipath -ll | grep -B1 NETAPP | grep "failed faulty"
+# 預期：空
+```
+
+### 步驟 6：確認警示已清除
+
+若有監控系統收 syslog/journal，確認儲存恢復訊息已出現：
+
+```bash
+journalctl -t pve-storage-netapp --since "1 hour ago"
+# 預期：「Storage 'X' reachable again after N consecutive failures」
+```
+
+---
+
+## Proxmox VE 節點突然斷電後的恢復
+
+當 Proxmox VE 節點未正常關機就斷電。
+
+### 會發生什麼
+
+- VM 的記憶體狀態會遺失。ONTAP LUN 上的資料是 crash-consistent（寫入要嘛完整、要嘛缺失，不會有部分損毀）。
+- iSCSI session 會突然中斷。ONTAP 會保留 LUN reservation 直到逾時。
+- Plugin 追蹤檔（`/var/lib/pve-storage-netapp/`）保留於本機磁碟，重開機後仍存在。
+- Plugin lock 檔（`/var/run/pve-storage-netapp/`）會被清除（tmpfs，重開機後消失）。
+
+### 恢復程序
+
+```bash
+# 1. 節點開機後確認服務
+systemctl is-active iscsid multipathd pvedaemon pvestatd pveproxy
+# 預期：全部 active
+
+# 2. 確認 iSCSI session 已重新連線
+iscsiadm -m session
+# 預期：所有設定的 ONTAP LIF 都有 session
+
+# 3. 確認 multipath
+multipath -ll | head -20
+# 預期：NETAPP 裝置可見，所有路徑為 active
+
+# 4. 確認 plugin 儲存
+pvesm status | grep netapp
+# 預期：active
+
+# 5. 若 VM 在 HA 群組中，檢查是否已遷移到其他節點
+pvecm status
+ha-manager status
+```
+
+### LUN reservation timeout
+
+ONTAP 的 LUN reservation 預設逾時為 30-60 秒。若在逾時前嘗試在此節點啟動 VM，會看到 SCSI reservation conflict 錯誤。等待 60 秒後再試。
+
+縮短逾時（建議用於 HA 場景）：
+
+```
+# 在 ONTAP CLI
+vserver iscsi reservation modify -vserver <svm> -timeout 30
+```
+
+建議值：
+- **30 秒**（推薦，平衡）
+- 60s = ONTAP 預設值，保守
+- < 20s 不建議（暫時性網路抖動可能誤觸 cleanup）
+
+---
+
+## 更新 ONTAP 密碼
+
+ONTAP API 使用者密碼變更時，每個 Proxmox VE 節點都必須更新。叢集檔案系統會自動同步 `/etc/pve/storage.cfg`，但 pvedaemon/pvestatd 中快取的 API client 物件必須清除。
+
+### 程序
+
+```bash
+# 1. 先在 ONTAP 端改密碼
+ssh <ontap-cluster> "security login password -username pveadmin"
+# 或透過 OnCommand System Manager UI
+
+# 2. 更新 PVE 儲存設定（在任一節點執行；
+#    /etc/pve/storage.cfg 會自動複製到所有節點）
+pvesm set <storage-id> --ontap-password '<新密碼>'
+
+# 3. 確認設定已更新
+grep ontap-password /etc/pve/storage.cfg
+
+# 4. 在每個 PVE 節點 reload 服務以清除快取的 API client
+for node in $(pvecm nodes 2>/dev/null | awk 'NR>3 {print $3}'); do
+    ssh root@$node "systemctl reload pvedaemon pvestatd pveproxy"
+done
+
+# 5. 確認所有節點儲存可連線
+pvesm status | grep <storage-id>
+# 預期：active
+```
+
+### 跳過步驟 4 會發生什麼
+
+Plugin 在記憶體中快取 `LWP::UserAgent` 物件 5 分鐘。若不 reload 服務：
+- pvestatd 會繼續用舊密碼直到快取過期（5 分鐘）。
+- 此期間的操作會收到 HTTP 401，plugin 會用重新初始化 retry。
+- 症狀：`pvesm status` 顯示 `active`，但 `journalctl -u pvedaemon` 中有錯誤訊息。
+
+### 密碼含特殊字元
+
+若密碼含 shell 特殊字元（`$`、`!`、反引號等），務必用單引號包起來：
+
+```bash
+# 安全：單引號保留所有特殊字元
+pvesm set <storage-id> --ontap-password '$omeP@ss!w0rd`'
+
+# 危險：雙引號會展開 $ 和反引號
+pvesm set <storage-id> --ontap-password "$omeP@ss"  # 錯誤
+```
+
+---
+
 ## 取得協助
 
 1. **收集診斷資訊：**

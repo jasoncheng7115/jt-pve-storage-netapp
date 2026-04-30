@@ -457,13 +457,31 @@ sub _find_free_diskid {
 sub activate_storage {
     my ($class, $storeid, $scfg, $cache) = @_;
 
-    # Verify ONTAP connectivity
-    my $api = _get_api($scfg);
-    $api->get_svm_uuid();
+    # Verify ONTAP connectivity. If this fails (network down, API down,
+    # auth changed), record the failure so monitoring systems are alerted.
+    # We re-throw the error after recording so PVE behavior is unchanged.
+    my $api = eval { _get_api($scfg); };
+    if (!$api || $@) {
+        my $err = $@ || "API client not available";
+        _record_status_failure($storeid, "activate_storage: API connection failed: $err");
+        die $err;
+    }
+
+    eval { $api->get_svm_uuid(); };
+    if ($@) {
+        my $err = $@;
+        _record_status_failure($storeid, "activate_storage: SVM lookup failed: $err");
+        die $err;
+    }
 
     # Verify aggregate exists and is available
     my $aggregate = $scfg->{'ontap-aggregate'};
-    my $aggr_info = $api->aggregate_get($aggregate);
+    my $aggr_info = eval { $api->aggregate_get($aggregate); };
+    if ($@) {
+        my $err = $@;
+        _record_status_failure($storeid, "activate_storage: aggregate query failed: $err");
+        die $err;
+    }
     unless ($aggr_info) {
         die "Aggregate '$aggregate' not found on ONTAP cluster. " .
             "Please verify the aggregate name in storage configuration.";
@@ -905,12 +923,192 @@ sub _cleanup_orphaned_devices {
     };
 }
 
+sub _health_state_dir {
+    my $dir = '/var/run/pve-storage-netapp';
+    mkdir $dir, 0755 unless -d $dir;
+    return $dir;
+}
+
+# Track storage failure duration and emit syslog ERROR after threshold.
+# Uses first-failure timestamp + count, NOT consecutive count alone, because
+# PVE caches storage state and may not call activate_storage/status() on
+# every pvestatd poll once a storage is marked inactive. By tracking the
+# timestamp of the first failure, we still emit alerts even if PVE retries
+# the plugin only once.
+#
+# State file format (single line, space-separated):
+#   <first_failure_epoch> <count> <last_alert_epoch>
+sub _record_status_failure {
+    my ($storeid, $reason) = @_;
+    my $dir = _health_state_dir();
+    my $file = "$dir/$storeid-failstate";
+    my $now = time();
+
+    my ($first, $count, $last_alert) = (0, 0, 0);
+    if (open(my $fh, '<', $file)) {
+        my $line = <$fh>;
+        close($fh);
+        if (defined $line && $line =~ /^(\d+)\s+(\d+)\s+(\d+)/) {
+            ($first, $count, $last_alert) = ($1, $2, $3);
+        }
+    }
+
+    if (!$first) {
+        $first = $now;
+        $count = 1;
+    } else {
+        $count++;
+    }
+
+    # Threshold: emit syslog ERROR if storage has been failing for >= 30
+    # seconds AND we haven't alerted in the last 60 seconds.
+    # 30 seconds is short enough to detect quick outages but long enough to
+    # avoid false positives from transient network blips.
+    my $duration = $now - $first;
+    my $alert_emitted = 0;
+    if ($duration >= 30 && ($now - $last_alert) >= 60) {
+        my $reason_safe = $reason // 'unknown';
+        $reason_safe =~ s/[\r\n]+/ /g;
+        my $msg = sprintf(
+            "Storage '%s' unreachable for ~%ds (failure count: %d). Reason: %s",
+            $storeid, $duration, $count, $reason_safe);
+        eval {
+            require Sys::Syslog;
+            Sys::Syslog::openlog("pve-storage-netapp", "pid", "daemon");
+            Sys::Syslog::syslog("err", "%s", $msg);
+            Sys::Syslog::closelog();
+        };
+        $last_alert = $now;
+        $alert_emitted = 1;
+    }
+
+    # Atomic write
+    my $tmp = "$file.tmp.$$";
+    if (open(my $fh, '>', $tmp)) {
+        print $fh "$first $count $last_alert\n";
+        close($fh);
+        rename($tmp, $file);
+    }
+    return $count;
+}
+
+sub _record_status_success {
+    my ($storeid) = @_;
+    my $dir = _health_state_dir();
+    my $file = "$dir/$storeid-failstate";
+    if (-e $file) {
+        # Read previous state to log recovery if outage exceeded threshold
+        my ($first, $count, $last_alert) = (0, 0, 0);
+        if (open(my $fh, '<', $file)) {
+            my $line = <$fh>;
+            close($fh);
+            if (defined $line && $line =~ /^(\d+)\s+(\d+)\s+(\d+)/) {
+                ($first, $count, $last_alert) = ($1, $2, $3);
+            }
+        }
+        unlink($file);
+        # Only log recovery if we actually emitted an alert (avoid noise
+        # for transient single-poll failures that recovered immediately)
+        if ($last_alert > 0) {
+            my $now = time();
+            my $duration = $now - $first;
+            my $msg = sprintf(
+                "Storage '%s' reachable again after %ds outage (failure count: %d)",
+                $storeid, $duration, $count);
+            eval {
+                require Sys::Syslog;
+                Sys::Syslog::openlog("pve-storage-netapp", "pid", "daemon");
+                Sys::Syslog::syslog("info", "%s", $msg);
+                Sys::Syslog::closelog();
+            };
+        }
+    }
+}
+
+# Check aggregate capacity and emit syslog WARNING if approaching full.
+# Cooldown: 1 hour per storage to avoid log flooding.
+# Thresholds: 90% WARNING, 95% ERROR.
+sub _check_aggregate_capacity {
+    my ($api, $storeid, $scfg) = @_;
+    my $aggr_name = $scfg->{'ontap-aggregate'};
+    return unless $aggr_name;
+
+    my $dir = _health_state_dir();
+    my $flag = "$dir/$storeid-aggr-warn";
+    my $last = (stat($flag))[9] // 0;
+    return if (time() - $last) < 3600;  # 1 hour cooldown
+
+    my $aggr = eval { $api->aggregate_get($aggr_name); };
+    return unless $aggr && $aggr->{space} && $aggr->{space}{block_storage};
+
+    my $total = $aggr->{space}{block_storage}{size} // 0;
+    my $used  = $aggr->{space}{block_storage}{used} // 0;
+    return unless $total > 0;
+
+    my $pct = int($used * 100 / $total);
+    return if $pct < 90;
+
+    # Touch flag file to record warning
+    if (open(my $fh, '>', $flag)) { close($fh); }
+
+    my $level = $pct >= 95 ? "err" : "warning";
+    my $level_text = $pct >= 95 ? "CRITICAL" : "WARNING";
+    my $msg = sprintf(
+        "%s: Storage '%s' aggregate '%s' is at %d%% capacity (used %d GB / total %d GB). Thin-provisioned LUNs may fail to grow.",
+        $level_text, $storeid, $aggr_name, $pct,
+        int($used / 1073741824), int($total / 1073741824));
+    eval {
+        require Sys::Syslog;
+        Sys::Syslog::openlog("pve-storage-netapp", "pid", "daemon");
+        Sys::Syslog::syslog($level, "%s", $msg);
+        Sys::Syslog::closelog();
+    };
+    warn "$level_text: aggregate '$aggr_name' at ${pct}% capacity\n";
+}
+
+# Check LIF redundancy for ONTAP HA. Single-LIF SVMs have no failover
+# redundancy: if the controller hosting that LIF fails, all I/O stops
+# until the LIF migrates (30-90s) or admin intervention.
+# Cooldown: 24 hours per storage (this is config-related, rarely changes).
+sub _check_lif_redundancy {
+    my ($api, $storeid, $scfg) = @_;
+    my $proto = $scfg->{'ontap-protocol'} // 'iscsi';
+    return unless $proto eq 'iscsi';  # Only check iSCSI (FC handled by SAN switch)
+
+    my $dir = _health_state_dir();
+    my $flag = "$dir/$storeid-lif-warn";
+    my $last = (stat($flag))[9] // 0;
+    return if (time() - $last) < 86400;  # 24 hour cooldown
+
+    my $portals = eval { $api->iscsi_get_portals(); };
+    return unless $portals && ref($portals) eq 'ARRAY';
+
+    my $count = scalar(@$portals);
+    return if $count >= 2;  # 2+ LIFs is healthy
+
+    if (open(my $fh, '>', $flag)) { close($fh); }
+
+    my $msg = sprintf(
+        "WARNING: Storage '%s' SVM has only %d iSCSI LIF -- no path redundancy. " .
+        "Recommend at least 2 LIFs on different controllers for HA.",
+        $storeid, $count);
+    eval {
+        require Sys::Syslog;
+        Sys::Syslog::openlog("pve-storage-netapp", "pid", "daemon");
+        Sys::Syslog::syslog("warning", "%s", $msg);
+        Sys::Syslog::closelog();
+    };
+    warn "WARNING: SVM has only $count iSCSI LIF -- no path redundancy. " .
+         "See docs/CONFIGURATION.md 'ONTAP HA Best Practices'.\n";
+}
+
 sub status {
     my ($class, $storeid, $scfg, $cache) = @_;
 
     my $api = eval { _get_api($scfg); };
     if (!$api) {
         warn "Failed to connect to ONTAP API for status check: $@";
+        _record_status_failure($storeid, "API connection failed: $@");
         return (0, 0, 0, 0);
     }
 
@@ -946,8 +1144,18 @@ sub status {
     };
     if ($@) {
         warn "Failed to get storage status: $@";
+        _record_status_failure($storeid, "capacity query failed: $@");
         return (0, 0, 0, 0);
     }
+
+    # Success: clear failure counter (will log recovery if was previously failing)
+    _record_status_success($storeid);
+
+    # Aggregate capacity health check (syslog WARNING/ERROR with cooldown)
+    eval { _check_aggregate_capacity($api, $storeid, $scfg); };
+
+    # LIF redundancy check (24h cooldown, warns if < 2 iSCSI LIFs)
+    eval { _check_lif_redundancy($api, $storeid, $scfg); };
 
     return ($cache->{total}, $cache->{avail}, $cache->{used}, 1);
 }

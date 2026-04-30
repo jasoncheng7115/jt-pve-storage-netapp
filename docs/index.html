@@ -142,7 +142,7 @@
     <div class="hero__glow"></div>
     <div class="hero__glow-left"></div>
     <div class="hero__content">
-        <div class="hero__badge">v0.2.9 <span class="hero__badge-sep"></span> MIT License</div>
+        <div class="hero__badge">v0.2.10 <span class="hero__badge-sep"></span> MIT License</div>
         <h1 class="hero__title">jt-pve-storage-netapp</h1>
         <p class="hero__project-desc">
             <span class="lang-en">NetApp ONTAP SAN/iSCSI/FC Storage Plugin for Proxmox VE</span>
@@ -1451,6 +1451,15 @@
         <span class="lang-en">Version history. For full details see <a href="https://github.com/jasoncheng7115/jt-pve-storage-netapp/blob/main/CHANGELOG.md">CHANGELOG.md</a>.</span>
         <span class="lang-zh">版本紀錄。完整內容請參閱 <a href="https://github.com/jasoncheng7115/jt-pve-storage-netapp/blob/main/CHANGELOG_zh-TW.md">CHANGELOG_zh-TW.md</a>。</span>
     </p>
+
+    <div class="changelog-entry">
+        <div class="changelog-version">v0.2.10 <span class="changelog-tag changelog-tag--feature">Feature</span></div>
+        <div class="changelog-date">2026-04-30</div>
+        <div class="changelog-summary">
+            <span class="lang-en">Disaster Prevention &amp; Monitoring. New syslog alerting: storage outage ERROR after 30s+ failure (with 60s re-alert cooldown), recovery INFO message, aggregate capacity WARNING at 90%/CRITICAL at 95%, LIF redundancy WARNING when SVM has &lt;2 iSCSI LIFs. postinst now detects in-flight storage operations and warns with 5-second grace. Documentation: 4 new SOPs (disconnect recovery, power loss recovery, password change, ONTAP HA best practices) and "Will upgrading affect running VMs?" Q&amp;A.</span>
+            <span class="lang-zh">災難預防與監控。新增 syslog 警示：儲存中斷超過 30 秒觸發 ERROR（60 秒冷卻避免洪水）、恢復連線發送 INFO、Aggregate 容量 90% WARNING / 95% CRITICAL、SVM iSCSI LIF 少於 2 個發送 WARNING。postinst 偵測進行中儲存操作並警告 5 秒緩衝。文件新增 4 個 SOP（斷線恢復、斷電恢復、密碼變更、ONTAP HA 最佳實踐）以及「升級會影響執行中 VM 嗎？」Q&amp;A。</span>
+        </div>
+    </div>
 
     <div class="changelog-entry">
         <div class="changelog-version">v0.2.9 <span class="changelog-tag changelog-tag--fix">Fix</span></div>

@@ -27,6 +27,7 @@ use PVE::Storage::Custom::NetAppONTAP::Naming qw(
 );
 use PVE::Storage::Custom::NetAppONTAP::ISCSI qw(
     get_initiator_name
+    probe_portal
     discover_targets
     login_target
     logout_target
@@ -145,6 +146,17 @@ sub properties {
             maximum => 300,
             default => 60,
         },
+        'ontap-portal-probe-timeout' => {
+            description => "Timeout in seconds for the TCP pre-check that"
+                . " skips unreachable iSCSI portals before iscsiadm"
+                . " discovery/login. Set to 0 to disable the pre-check"
+                . " (legacy behaviour). Raise on high-latency or congested"
+                . " storage networks.",
+            type => 'integer',
+            minimum => 0,
+            maximum => 30,
+            default => 2,
+        },
     };
 }
 
@@ -161,6 +173,7 @@ sub options {
         'ontap-cluster-name' => { optional => 1 },
         'ontap-protocol'     => { optional => 1 },
         'ontap-device-timeout' => { optional => 1 },
+        'ontap-portal-probe-timeout' => { optional => 1 },
         nodes                => { optional => 1 },
         disable              => { optional => 1 },
         content              => { optional => 1 },
@@ -504,25 +517,68 @@ sub activate_storage {
         my $portals = $api->iscsi_get_portals();
         die "No iSCSI portals found on SVM $scfg->{'ontap-svm'}" unless @$portals;
 
-        # Discover and login to targets
-        my $portal_success = 0;
+        my $probe_timeout = $scfg->{'ontap-portal-probe-timeout'} // 2;
+        my @logged_in;
+        my @unreachable;
+        my @failed;
+
         for my $portal (@$portals) {
             my $portal_addr = "$portal->{address}:$portal->{port}";
-            # Skip discovery if already logged in to this portal
+
+            # Fast path: already logged in
             if (is_portal_logged_in($portal_addr, $portal->{target})) {
-                $portal_success++;
+                push @logged_in, $portal_addr;
                 next;
             }
+
+            # TCP pre-check: skip portals this host cannot reach so we do
+            # NOT eat 30s discovery + 60s login timeouts per dead LIF.
+            # ONTAP HA best practice distributes iSCSI LIFs across both
+            # controllers and across multiple network segments; with
+            # asymmetric cabling the unreachable LIFs would otherwise
+            # stall every activate_storage()/status() and cascade into
+            # pvestatd timeouts that wedge the web UI.
+            if ($probe_timeout > 0
+                && !probe_portal($portal->{address}, $portal->{port},
+                                 timeout => $probe_timeout)) {
+                push @unreachable, $portal_addr;
+                next;
+            }
+
             eval {
                 discover_targets($portal->{address}, port => $portal->{port});
-                login_target($portal->{address}, $portal->{target}, port => $portal->{port});
-                $portal_success++;
+                login_target($portal->{address}, $portal->{target},
+                             port => $portal->{port});
             };
-            # Continue on error - some portals might not be reachable
-            warn "Failed to connect to portal $portal->{address}: $@" if $@;
+            if ($@) {
+                my $err = $@;
+                push @failed, "$portal_addr ($err)";
+                warn "Failed to connect to portal $portal->{address}: $err";
+            } else {
+                push @logged_in, $portal_addr;
+            }
         }
-        die "Failed to connect to any iSCSI portal on SVM '$scfg->{'ontap-svm'}'. " .
-            "Check network connectivity and iSCSI LIF configuration." unless $portal_success;
+
+        if (@unreachable) {
+            warn "Skipped " . scalar(@unreachable)
+                . " unreachable iSCSI portal(s) on SVM '$scfg->{'ontap-svm'}': "
+                . join(", ", @unreachable)
+                . " (no TCP response within ${probe_timeout}s).\n"
+                . "  If this is unexpected, check network/switch zoning"
+                . " between this node and the listed LIFs, or move"
+                . " unused LIFs off the SVM.\n";
+        }
+
+        unless (@logged_in) {
+            my $msg = "No iSCSI portal on SVM '$scfg->{'ontap-svm'}' is"
+                . " reachable from this node.";
+            $msg .= " Unreachable: " . join(", ", @unreachable) if @unreachable;
+            $msg .= " Failed: " . join("; ", @failed) if @failed;
+            $msg .= "\n  Verify network connectivity to the SVM's iSCSI"
+                . " LIFs, or use 'pvesm set <storeid> --nodes <list>' to"
+                . " bind this storage only to nodes that can reach it.";
+            die "$msg\n";
+        }
     }
 
     # Ensure igroup exists (common for both protocols)

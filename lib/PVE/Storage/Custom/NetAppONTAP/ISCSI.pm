@@ -6,6 +6,7 @@ use warnings;
 use Carp qw(croak);
 use IPC::Open3;
 use IO::Select;
+use IO::Socket::INET;
 use Symbol qw(gensym);
 
 use Exporter qw(import);
@@ -13,6 +14,7 @@ use Exporter qw(import);
 our @EXPORT_OK = qw(
     get_initiator_name
     set_initiator_name
+    probe_portal
     discover_targets
     login_target
     logout_target
@@ -142,6 +144,38 @@ sub set_initiator_name {
     warn "Failed to restart iscsid (exit $exit): $stderr\n" if $exit != 0;
 
     return 1;
+}
+
+# TCP probe a portal to check reachability before invoking iscsiadm.
+# iscsiadm discovery has a 30s timeout and login can stall up to 60s
+# per unreachable LIF. On multi-LIF SVMs with asymmetric cabling or
+# partial fabric reach, a single activate_storage() can otherwise eat
+# minutes of pvestatd cycle and wedge the web UI. A bounded TCP connect
+# is sufficient to filter dead paths before they reach iscsiadm.
+sub probe_portal {
+    my ($ip, $port, %opts) = @_;
+    croak "ip is required" unless $ip;
+    $port //= 3260;
+    my $timeout = $opts{timeout} // 2;
+
+    my $reachable = 0;
+    eval {
+        local $SIG{ALRM} = sub { die "timeout\n" };
+        alarm($timeout);
+        my $sock = IO::Socket::INET->new(
+            PeerAddr => $ip,
+            PeerPort => $port,
+            Proto    => 'tcp',
+            Timeout  => $timeout,
+        );
+        if ($sock) {
+            $reachable = 1;
+            $sock->close();
+        }
+        alarm(0);
+    };
+    alarm(0);
+    return $reachable;
 }
 
 # Discover iSCSI targets on a portal
@@ -474,12 +508,16 @@ PVE::Storage::Custom::NetAppONTAP::ISCSI - iSCSI management utilities
 
     use PVE::Storage::Custom::NetAppONTAP::ISCSI qw(
         get_initiator_name
+        probe_portal
         discover_targets
         login_target
     );
 
     # Get local initiator IQN
     my $iqn = get_initiator_name();
+
+    # TCP probe before iscsiadm
+    next unless probe_portal('192.168.1.100', 3260, timeout => 2);
 
     # Discover targets
     my $targets = discover_targets('192.168.1.100');

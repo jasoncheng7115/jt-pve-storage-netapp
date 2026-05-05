@@ -2,6 +2,28 @@
 
 All notable changes to the NetApp ONTAP Storage Plugin for Proxmox VE are documented here.
 
+## [0.2.12] - 2026-05-05
+
+### iSCSI Portal TCP Pre-check Release
+
+**Bug Fixes (sibling-pattern audit from jt-pve-storage-purestorage v1.1.9):**
+
+- **`activate_storage()` now TCP-probes every iSCSI LIF before `iscsiadm` discovery/login.** Previous behaviour iterated every portal returned by `iscsi_get_portals()` and called `iscsiadm -m discovery` followed by `iscsiadm -m node -l` regardless of TCP reachability. On multi-LIF SVMs with asymmetric cabling or partial fabric reach (a common production layout once HA best practices are followed), each unreachable LIF stalled iscsiadm for 30s (discovery) plus up to 60s (login). Wrapping the calls in `eval` prevents the loop from dying but does NOT prevent the cumulative stall. Since `pvestatd` polls `activate_storage` every cycle, the stall cascaded into web UI hangs and starved every other storage on the node. The Pure plugin shipped this exact same fix as v1.1.9 today against a customer field reproducer (4-LIF FlashArray, 2-segment cabling reaching only 1 segment); cross-project audit confirmed the identical pattern existed at `NetAppONTAPPlugin.pm:502-526` and is now fixed.
+- The fix is especially important for NetApp because v0.2.11's `_check_lif_redundancy()` actively recommends "distribute LIFs across both controllers" — a configuration that maximises the bug surface when host-side fabric reach is asymmetric.
+
+**API additions:**
+
+- New `probe_portal($ip, $port, timeout => $t)` in `ISCSI.pm`. Bounded `IO::Socket::INET` TCP connect with `alarm()` guard. Returns 1 if reachable within timeout, 0 otherwise.
+
+**New configuration option:**
+
+- `ontap-portal-probe-timeout` (integer 0..30, default 2 seconds). Set to 0 to disable the pre-check (restore pre-0.2.12 behaviour). Raise on high-latency or congested storage networks. Configurable via `pvesm set <storeid> --ontap-portal-probe-timeout <n>`.
+
+**Behavioural change:**
+
+- When all LIFs are unreachable, `activate_storage()` now dies with an actionable message that lists the unreachable portals, the failed portals (with their `iscsiadm` errors), and a hint about `pvesm set <storeid> --nodes <list>` for binding the storage to specific nodes. Previous error said only "Failed to connect to any iSCSI portal".
+- When some LIFs are unreachable but at least one is up, a single `warn` lists the skipped portals and recovery hints, then activation continues normally with the reachable subset.
+
 ## [0.2.11] - 2026-04-30
 
 ### SAN LIF Redundancy Detection Fix Release

@@ -2,6 +2,28 @@
 
 NetApp ONTAP Storage Plugin for Proxmox VE 的所有重要變更都記錄在此。
 
+## [0.2.12] - 2026-05-05
+
+### iSCSI Portal TCP 預先檢查 Release
+
+**Bug 修正(來自姊妹專案 jt-pve-storage-purestorage v1.1.9 的同類型稽核):**
+
+- **`activate_storage()` 現在會在呼叫 `iscsiadm` 之前,先用 TCP probe 確認每一個 iSCSI LIF 是否可達。** 舊行為直接把 `iscsi_get_portals()` 回傳的所有 portal 全部拿去 `iscsiadm -m discovery` 再 `iscsiadm -m node -l`,完全不檢查 TCP 連線是否通。在多 LIF SVM 配置(這正是 ONTAP HA 推薦做法)且主機端線路或 zoning 不對稱時,每個不通的 LIF 都會讓 `iscsiadm` 卡 30 秒(discovery)再加上最多 60 秒(login)。雖然外面包了 `eval` 不會 die,但累積的 timeout 還是會把整次 `activate_storage()` 拖到上百秒。`pvestatd` 每個輪詢都會走 `activate_storage`,所以這個卡頓會連鎖造成 web UI 凍結、其他儲存被排隊餓死。今天 Pure 那邊在客戶現場(4 LIF FlashArray、2 段網路只通到 1 段)修了 v1.1.9 把這個問題解掉,跨專案稽核確認 NetApp 這邊在 `NetAppONTAPPlugin.pm:502-526` 是一模一樣的程式樣式,本版同步修正。
+- 這個修正對 NetApp 特別重要 — v0.2.11 的 `_check_lif_redundancy()` 會主動建議使用者「把 LIF 分散到兩個 controller」,而這正是受害面最大的配置。使用者越照建議做,asymmetric 線路下中招機率越高。
+
+**API 新增:**
+
+- `ISCSI.pm` 新增 `probe_portal($ip, $port, timeout => $t)`。內部用 `IO::Socket::INET` 配 `alarm()` 做帶上限的 TCP connect。可達回傳 1,不可達回傳 0。
+
+**新組態選項:**
+
+- `ontap-portal-probe-timeout`(整數 0..30,預設 2 秒)。設 0 可關閉預先檢查,回到 0.2.12 之前的行為。網路延遲較高或壅塞的儲存網路可調高。可用 `pvesm set <storeid> --ontap-portal-probe-timeout <n>` 修改。
+
+**行為變更:**
+
+- 當所有 LIF 都不可達時,`activate_storage()` 現在會 die,訊息會列出不可達的 portals、登入失敗的 portals(連同 `iscsiadm` 錯誤)以及如何用 `pvesm set <storeid> --nodes <list>` 把儲存綁到只在通的節點上。舊版只會說「Failed to connect to any iSCSI portal」。
+- 當部分 LIF 不可達但至少有一個通時,會用一行 `warn` 列出被跳過的 portals 與排查提示,然後正常用可達的 LIF 子集繼續啟用儲存。
+
 ## [0.2.11] - 2026-04-30
 
 ### SAN LIF 冗餘偵測修正 Release

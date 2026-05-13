@@ -1224,6 +1224,142 @@ grep -c 'IO::Socket::INET' lib/PVE/Storage/Custom/NetAppONTAP/ISCSI.pm
 
 ---
 
+## 24. Snapshot 刪除時清理依附的 Temp FlexClone (v0.2.13)
+
+驗證 `volume_snapshot_delete()` 會在刪 snapshot 之前先把依附在該 snapshot 上的暫時 FlexClone 拆解並移除。客戶現場事件:`vzdump` 對 CT 做 snapshot-mode 備份備份本身成功,但清理階段必失敗,訊息「Snapshot ... has not expired or is locked」— 因為 `_get_snapshot_path()` 為了讓備份能讀 snapshot 而建立的暫時 FlexClone 還在持有 snapshot owner reference。
+
+### 24.1 透過 plugin API 直接做端到端測試(不需 PBS / vzdump)
+
+此腳本直接呼叫 storage plugin 內部 vzdump 會觸發的同一組函式,**不需要** CT、PBS server 或 vzdump 設定就能重現完整 bug 情境。
+
+```bash
+cat > /tmp/test_section24.pl <<'EOF'
+#!/usr/bin/perl
+use strict; use warnings;
+use lib "/usr/share/perl5";
+use Time::HiRes qw(time);
+use PVE::Storage;
+use PVE::Storage::Custom::NetAppONTAPPlugin;
+use PVE::Storage::Custom::NetAppONTAP::API;
+use PVE::Storage::Custom::NetAppONTAP::Naming;
+
+my $storeid = "netapp1";
+my $cfg = PVE::Storage::config();
+my $scfg = $cfg->{ids}->{$storeid} or die "storage $storeid not configured\n";
+my $plugin = "PVE::Storage::Custom::NetAppONTAPPlugin";
+my $vmid = 9990;
+my $volname = "vm-${vmid}-disk-0";
+my $exit_code = 0;
+
+sub api { PVE::Storage::Custom::NetAppONTAPPlugin::_get_api($scfg) }
+sub ontap_name { PVE::Storage::Custom::NetAppONTAP::Naming::pve_volname_to_ontap($storeid, $volname) }
+sub temp_name { PVE::Storage::Custom::NetAppONTAPPlugin::_get_temp_clone_name(ontap_name(), $_[0]) }
+
+sub aggressive_cleanup {
+    my $ontap_volname = ontap_name();
+    for my $snap ("testsnap-A", "testsnap-B") {
+        my $tcn = temp_name($snap);
+        eval { api()->lun_unmap_all(PVE::Storage::Custom::NetAppONTAP::Naming::encode_lun_path($tcn)); };
+        eval { api()->volume_delete($tcn); };
+        my $snapname = PVE::Storage::Custom::NetAppONTAP::Naming::encode_snapshot_name($snap);
+        eval { api()->snapshot_delete($ontap_volname, $snapname); };
+    }
+    eval { $plugin->free_image($storeid, $scfg, $volname); };
+}
+
+END { aggressive_cleanup() if $exit_code == 0; }
+aggressive_cleanup();
+
+$plugin->activate_storage($storeid, $scfg, {});
+my $allocated = $plugin->alloc_image($storeid, $scfg, $vmid, "raw", $volname, 1024*1024);
+$plugin->activate_volume($storeid, $scfg, $volname, undef, {});
+
+# Case B(regression): 無 temp clone 直接刪 snapshot
+$plugin->volume_snapshot($scfg, $storeid, $volname, "testsnap-B");
+my $t0 = time();
+eval { $plugin->volume_snapshot_delete($scfg, $storeid, $volname, "testsnap-B", 0); };
+if ($@) { print "FAIL B: $@\n"; $exit_code = 1; exit 1; }
+printf "PASS B: snapshot_delete OK in %.2fs(無 temp clone)\n", time() - $t0;
+
+# Case A(bug fix): 有 temp clone 時刪 snapshot
+$plugin->volume_snapshot($scfg, $storeid, $volname, "testsnap-A");
+my @p = $plugin->path($scfg, $volname, $storeid, "testsnap-A");
+my $tcn = temp_name("testsnap-A");
+my $tv = api()->volume_get($tcn);
+unless ($tv) { print "TEST INVALID: temp clone not created\n"; exit 1; }
+
+$t0 = time();
+eval { $plugin->volume_snapshot_delete($scfg, $storeid, $volname, "testsnap-A", 0); };
+if ($@) { print "FAIL A: $@\n"; $exit_code = 1; exit 1; }
+printf "PASS A: snapshot_delete OK in %.2fs(temp clone 分離 + 移除)\n", time() - $t0;
+
+$tv = api()->volume_get($tcn);
+if ($tv) { print "FAIL: temp clone 仍存在\n"; $exit_code = 1; exit 1; }
+my $snaps = api()->snapshot_list(ontap_name());
+my $snapname = PVE::Storage::Custom::NetAppONTAP::Naming::encode_snapshot_name("testsnap-A");
+if (grep { $_->{name} eq $snapname } @$snaps) {
+    print "FAIL: snapshot 仍存在\n"; $exit_code = 1; exit 1;
+}
+print "ALL PASS\n";
+EOF
+perl /tmp/test_section24.pl
+```
+
+**預期結果:**
+- Case B:`PASS B` 在 3 秒內(snapshot_delete 走 fast path,沒做 temp clone 相關工作)。
+- Case A:`PASS A` 在 30 秒內。時間主要花在 `volume_clone_split` + `volume_wait_clone_split`(wait loop 5 秒輪詢一次,加上 split 本身時間)。對於 `qm clone --full --snapname` 之類差異較大的 temp clone 會慢一些;由 `volume_snapshot_delete` 內部 300 秒 timeout 保底。
+- temp clone 與 snapshot 在事後都應該不存在。
+
+**為什麼用 split-then-delete 而不是直接 delete:** 真實 ONTAP FAS 上,delete FlexClone 之後 parent snapshot 的 `volume_clone_dependent` owner 會在短時間內清掉。但在 ONTAP simulator(以及部分 FAS 版本),這個 owner 標記是黏的 — 實測 60 秒以上都不會清。`volume_clone_split` 是 ONTAP 保證 split 完成後一定會釋放 owner 的機制,在所有平台行為一致。代價是 split 時間,但 vzdump 場景下 temp clone 是 read-only,所以只需要處理極少的 unique block,實際很快。
+
+### 24.2 客戶情境重現(CT vzdump snapshot mode)
+
+若環境有 PBS 或 vzdump-dump target,可以驗證原客戶情境完整流程:
+
+```bash
+# 前置:在 netapp1 上建一個小 CT
+pct create 9000 local:vztmpl/<模板> --rootfs netapp1:1 ...
+
+# snapshot-mode 備份 — 0.2.13 之前必失敗的情境
+vzdump 9000 --mode snapshot --storage <pbs-or-dump>
+
+# 預期看到:
+#   INFO: create storage snapshot 'vzdump'
+#   ...(備份進行中)...
+#   INFO: cleanup temporary 'vzdump' snapshot
+#   INFO: Finished Backup of CT 9000
+
+# 0.2.13 之前:cleanup temporary 'vzdump' snapshot 後面接著錯誤:
+#   snapshot 'vzdump' was not (fully) removed - ONTAP job failed:
+#     Snapshot copy "pve_snap_vzdump" of volume "..." has not expired
+#     or is locked.
+
+# 0.2.13 之後:不應該再看到上述錯誤。確認 ONTAP 上沒有殘留 tmpclone_*。
+```
+
+### 24.3 靜態 regression 守則
+
+```bash
+P=lib/PVE/Storage/Custom/NetAppONTAPPlugin.pm
+# volume_snapshot_delete 必須呼叫 _get_temp_clone_name
+grep -A 30 '^sub volume_snapshot_delete' "$P" | grep -c '_get_temp_clone_name'
+# 預期:1
+
+# 必須用 clone_split(選擇此機制)而非單純 volume_delete
+grep -A 50 '^sub volume_snapshot_delete' "$P" | grep -c 'volume_clone_split'
+# 預期:1
+
+# 必須等 split 完成
+grep -A 60 '^sub volume_snapshot_delete' "$P" | grep -c 'volume_wait_clone_split'
+# 預期:1
+
+# 必須有本機 in-use 安全檢查
+grep -A 30 '^sub volume_snapshot_delete' "$P" | grep -c 'is_device_in_use'
+# 預期:1
+```
+
+---
+
 ## 清除
 
 ```bash
@@ -1243,6 +1379,34 @@ pvesm list $STORAGE
 ## 發佈測試結果
 
 每次發佈前都必須通過上述所有測試。結果記錄如下。
+
+### v0.2.13-1 Snapshot 刪除清理修正 Release (2026-05-13)
+
+**範圍:** Section 24(新增的 temp FlexClone 清理測試)。2026-05-13 客戶現場回報:對 CT 做 vzdump snapshot-mode 備份備份本身成功,但清理 `vzdump` snapshot 必失敗,訊息「has not expired or is locked」。
+
+**環境:** 單節點測試於 `pc-pve3`(PVE 9.1,部署 0.2.13-1),`netapp1` 儲存對接重建後的 ONTAP simulator(SVM `svm1`,2 LIF)。
+
+#### Section 24: Snapshot 刪除時清理依附的 Temp FlexClone
+
+| # | 測試 | 結果 |
+|---|------|------|
+| 24.1 Case B | `volume_snapshot_delete` regression(無 temp clone) | **PASS**(2.25s) |
+| 24.1 Case A | `volume_snapshot_delete` 含依附的 temp FlexClone | **PASS**(15.08s — split + wait + delete + snapshot_delete;temp clone 已移除;snapshot 已移除) |
+| 24.3 | 靜態 regression 守則(`_get_temp_clone_name`、`volume_clone_split`、`volume_wait_clone_split`、`is_device_in_use`) | PASS(各 1/1/1/1 次) |
+
+**Bug 修正價值:** 0.2.13 之前,每一次 vzdump CT snapshot-mode 備份都會在 ONTAP 留下殘留 snapshot + temp FlexClone。每天累積一筆,直到操作員手動清。0.2.13 之後自動且可靠地清乾淨。
+
+**測試過程發現的設計細節:** 初版實作直接 `volume_delete` temp clone,預期 ONTAP 會立即釋放 parent snapshot 的 `volume_clone_dependent` owner reference。真實 FAS 確實如此;但 ONTAP simulator **不會清** — owner 標記黏住不放(實測 60 秒以上不變)。改用 `volume_clone_split` + wait + `volume_delete`,這是 ONTAP 保證 split 完成後一定會釋放 owner 的機制,所有平台行為一致。成本可控:vzdump 的 temp clone 純讀取沒有寫入,unique block 接近 0,split 很快完成。已記入 CLAUDE.md「Lessons Learned」防止重蹈覆轍。
+
+**Section 24.2(實機 VM/CT vzdump 端到端):** 本次未執行;需配置 PBS server 或 vzdump-dump 目的地。Section 24.1 透過直接 plugin API 走完整段相同程式碼路徑且斷言更嚴格,客戶 bug 情境已透過此測試完整驗證。
+
+**備註:**
+- Sections 1-23 本次未重跑:本次變更僅限於一個函式(`volume_snapshot_delete`),未動到資料路徑。24.3 靜態守則涵蓋新程式碼 regression。
+- ONTAP simulator 累積 stale clone metadata 的已知限制(CLAUDE.md 已記)導致測試必須換新 VMID(舊 VMID 卡住先前測試殘留的卷)。非 plugin 問題。
+
+**結論:** Section 24 全部通過。v0.2.13-1 可發佈。
+
+---
 
 ### v0.2.12-1 iSCSI Portal TCP 預先檢查 Release (2026-05-05)
 

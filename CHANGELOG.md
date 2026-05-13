@@ -2,6 +2,28 @@
 
 All notable changes to the NetApp ONTAP Storage Plugin for Proxmox VE are documented here.
 
+## [0.2.13] - 2026-05-13
+
+### Snapshot Delete Cleanup Fix Release
+
+**Bug Fix (production incident, customer report 2026-05-13):**
+
+- **`volume_snapshot_delete()` now removes the dependent temp FlexClone synchronously before deleting the snapshot.** Customer's `vzdump` CT snapshot-mode backup completed successfully but failed at the cleanup step with:
+  ```
+  snapshot 'vzdump' was not (fully) removed - ONTAP job failed:
+    Snapshot copy "pve_snap_vzdump" of volume "..." in SVM "..."
+    has not expired or is locked.
+  ```
+  Root cause: when PVE reads a snapshot (vzdump CT backup, `qm clone --snapname`, `qemu-img convert` from a snapshot, etc.), `path($vol, $snap)` calls `_get_snapshot_path()` which creates a temporary FlexClone with the snapshot as parent. ONTAP locks the parent snapshot from deletion while any FlexClone references it. The plugin's existing cleanup is a TTL-based 1-hour background task (`_cleanup_temp_clones`), but vzdump calls `volume_snapshot_delete` IMMEDIATELY after the backup completes — well within the TTL — so the snapshot delete always fails. The fix synchronously checks for the deterministic temp clone name, refuses to proceed if its LUN is still in use locally (lsof-style holder check via `is_device_in_use`), otherwise unmaps + deletes the temp volume before proceeding with the snapshot delete.
+
+**Risk analysis (production-safety review):**
+
+- Concurrent local readers: PVE locks at VM/CT level, so two parallel readers on the same snapshot inside one node should not happen via standard PVE flows. The `is_device_in_use` check is the safety net for edge cases — refuses with an actionable error message naming the device and `lsof` hint.
+- Concurrent cross-node readers: not directly observable from the deleting node. The plugin relies on the convention that `volume_snapshot_delete` is called from the same node that opened the snapshot (which holds for vzdump). Same trade-off as the existing `_cleanup_temp_clones` background reaper.
+- API failures during cleanup: each step is `eval`-wrapped. If `volume_delete` of the temp clone fails, the function dies with a clear message and does NOT proceed to call `snapshot_delete` (which would have failed with the original locked error anyway). Operator gets the specific failure instead of the confusing downstream one.
+- Background TTL reaper race: if both fire simultaneously and one wins, the other gets "volume not found" — tolerated by `eval`.
+- Not changed: `volume_snapshot_rollback`, `free_image`. ONTAP behaviour around clones is different for these (rollback typically allowed, free_image cleans snapshots itself). Separate audit if needed; out of scope for this release.
+
 ## [0.2.12] - 2026-05-05
 
 ### iSCSI Portal TCP Pre-check Release

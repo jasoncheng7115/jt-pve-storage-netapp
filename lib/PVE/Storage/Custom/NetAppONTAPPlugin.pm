@@ -2154,6 +2154,102 @@ sub volume_snapshot_delete {
     my $ontap_volname = pve_volname_to_ontap($storeid, $volname);
     my $ontap_snapname = encode_snapshot_name($snap);
 
+    # ONTAP locks a snapshot while any FlexClone uses it as parent.
+    # _get_snapshot_path() creates such a temp FlexClone whenever PVE
+    # opens this snapshot for read (vzdump CT snapshot-mode backup,
+    # qm clone --snapname, qemu-img convert from snapshot, etc.).
+    # The TTL-based _cleanup_temp_clones() background task reaps them
+    # after 1 hour, but vzdump calls volume_snapshot_delete IMMEDIATELY
+    # after the backup completes -- well within the TTL -- so the
+    # snapshot_delete fails with "has not expired or is locked".
+    # Reap the dependent temp clone synchronously here so the
+    # snapshot delete can proceed.
+    my $temp_clone_name = _get_temp_clone_name($ontap_volname, $snap);
+    my $temp_vol = eval { $api->volume_get($temp_clone_name); };
+    if ($temp_vol) {
+        my $temp_lun_path = encode_lun_path($temp_clone_name);
+        my $temp_wwid = eval { $api->lun_get_wwid($temp_lun_path); };
+
+        # Safety: refuse to tear down the temp clone if its block
+        # device is still in use locally. Cross-node usage is not
+        # directly observable, but we rely on the convention that
+        # snapshot_delete is called by the same node that opened the
+        # snapshot (vzdump completes on one node and deletes there).
+        if ($temp_wwid) {
+            my $temp_device = get_device_by_wwid($temp_wwid);
+            if ($temp_device && -b $temp_device && is_device_in_use($temp_device)) {
+                die "Cannot delete snapshot '$snap': temporary FlexClone "
+                  . "'$temp_clone_name' is still in use locally ($temp_device). "
+                  . "Wait for the operation that opened the snapshot to "
+                  . "complete (e.g. backup, clone), or check holders with "
+                  . "'lsof $temp_device'.\n";
+            }
+        }
+
+        warn "Detaching temporary FlexClone '$temp_clone_name' from "
+           . "snapshot '$ontap_snapname' before snapshot delete\n";
+
+        # ONTAP snapshot deletion rejects when the snapshot has owners
+        # (the FlexClone). Two ways to release the owner reference:
+        #
+        # (1) `volume_delete` the clone. Real FAS clears the
+        #     `volume_clone_dependent` owner shortly after delete, but
+        #     the ONTAP simulator keeps the marker indefinitely. Field
+        #     behaviour varies by ONTAP version and platform.
+        # (2) `volume_clone_split` the clone. ONTAP guarantees the
+        #     parent snapshot's owner reference is released once the
+        #     split job completes, on every platform (real and sim).
+        #
+        # We use (2) for predictability. Cost: the split job copies the
+        # clone's unique blocks. For temp clones created in this same
+        # operation (vzdump read-only snapshot access) this is fast --
+        # the clone has no writes, only reads. For temp clones from
+        # `qm clone --full --snapname`, the cost is bounded by the
+        # delta written into the clone (usually small or zero by the
+        # time snapshot_delete is called).
+        if ($temp_wwid) {
+            eval { $api->lun_unmap_all($temp_lun_path); };
+            warn "lun_unmap_all on temp clone failed: $@" if $@;
+        }
+
+        eval { $api->volume_clone_split($temp_clone_name); };
+        if ($@) {
+            die "Cannot delete snapshot '$snap': volume_clone_split on "
+              . "temp clone '$temp_clone_name' failed: $@";
+        }
+
+        # Bounded wait. 5 minutes is generous for any reasonable temp
+        # clone size; if it takes longer something is wrong with ONTAP.
+        eval { $api->volume_wait_clone_split($temp_clone_name, timeout => 300); };
+        if ($@) {
+            die "Cannot delete snapshot '$snap': clone split for "
+              . "'$temp_clone_name' did not complete within 300s: $@";
+        }
+
+        # Delete the now-independent volume.
+        eval { $api->volume_delete($temp_clone_name); };
+        if ($@) {
+            # Volume is split but delete failed -- log and continue.
+            # The orphan volume will be left for operator cleanup or
+            # next vzdump cycle. Don't fail the whole snapshot_delete
+            # since the lock has already been released by the split.
+            warn "Post-split volume_delete of '$temp_clone_name' failed "
+               . "(orphan left behind): $@";
+        }
+
+        # Untrack from local state file (best effort; tmpfs may have
+        # been wiped on reboot, or another node holds the entry).
+        eval {
+            _with_temp_clone_lock(sub {
+                my $state = _read_temp_clone_state();
+                if ($state->{$storeid} && exists $state->{$storeid}{$temp_clone_name}) {
+                    delete $state->{$storeid}{$temp_clone_name};
+                    _write_temp_clone_state($state);
+                }
+            });
+        };
+    }
+
     $api->snapshot_delete($ontap_volname, $ontap_snapname);
 
     return 1;

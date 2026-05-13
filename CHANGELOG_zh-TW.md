@@ -2,6 +2,28 @@
 
 NetApp ONTAP Storage Plugin for Proxmox VE 的所有重要變更都記錄在此。
 
+## [0.2.13] - 2026-05-13
+
+### Snapshot 刪除清理修正 Release
+
+**Bug 修正(正式環境事件,2026-05-13 客戶回報):**
+
+- **`volume_snapshot_delete()` 現在會在刪 snapshot 之前,先同步移除依附在該 snapshot 上的暫時 FlexClone。** 客戶的 `vzdump` CT snapshot-mode 備份備份本身成功,但是清理那一步失敗,訊息:
+  ```
+  snapshot 'vzdump' was not (fully) removed - ONTAP job failed:
+    Snapshot copy "pve_snap_vzdump" of volume "..." in SVM "..."
+    has not expired or is locked.
+  ```
+  根本原因:PVE 要讀 snapshot(vzdump CT 備份、`qm clone --snapname`、從 snapshot 做 `qemu-img convert` 等)時,`path($vol, $snap)` 會呼叫 `_get_snapshot_path()`,以該 snapshot 為 parent 建立暫時 FlexClone。只要這個 FlexClone 還在,ONTAP 就會把 parent snapshot 鎖住不准刪。Plugin 原本的清理機制是 1 小時 TTL 的背景任務(`_cleanup_temp_clones`),但 vzdump 在備份完當下立刻呼叫 `volume_snapshot_delete`,還在 TTL 內,所以每次都失敗。本次修正在 `volume_snapshot_delete` 開頭同步檢查 deterministic 的暫時 clone 名稱,若該 clone 的 LUN 仍在本機被佔用(透過 `is_device_in_use` 做 lsof 式 holder 檢查)則拒絕並回報具體裝置,否則做 unmap + 刪除暫時 FlexClone,再進行 snapshot 刪除。
+
+**風險評估(正式環境安全審查):**
+
+- 本機並行讀者:PVE 在 VM/CT 層有 lock,單一節點上不會有兩個並行讀者在同一個 snapshot 上,標準流程不會出現此情境。`is_device_in_use` 檢查為極端情境的安全網,真的撞到會 die 並回報具體裝置與 `lsof` 提示。
+- 跨節點並行讀者:從刪除端無法直接觀察。Plugin 依賴「呼叫 `volume_snapshot_delete` 的節點 = 開啟 snapshot 的節點」這個慣例(vzdump 符合)。和既存 `_cleanup_temp_clones` 背景清理的 trade-off 相同。
+- 清理過程 API 失敗:每一步都用 `eval` 包。若 `volume_delete` 暫時 clone 失敗,函式 die 並輸出明確訊息,**不再呼叫** `snapshot_delete`(本來也會用舊的 locked 錯誤失敗),讓操作者直接看到具體失敗點而非下游混亂訊息。
+- 背景 TTL reaper 競爭:兩條清理路徑同時跑時其中一條會贏,另一條取得「volume not found」,由 `eval` 容忍。
+- 未動到:`volume_snapshot_rollback`、`free_image`。ONTAP 對 clone 的行為在這兩個情境下不同(rollback 通常允許,free_image 自己會清 snapshot),需要另外 audit;本版範圍不含。
+
 ## [0.2.12] - 2026-05-05
 
 ### iSCSI Portal TCP 預先檢查 Release

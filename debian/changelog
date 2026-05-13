@@ -1,3 +1,24 @@
+jt-pve-storage-netapp (0.2.13-1) stable; urgency=high
+
+  * Snapshot Delete Cleanup Fix Release
+  * Requirements: Proxmox VE 9.1 or later
+  * Bug Fix (production incident, customer report 2026-05-13):
+    - volume_snapshot_delete() now removes the dependent temp FlexClone
+      synchronously before deleting the snapshot. Previous behaviour
+      left the cleanup to the TTL-based background task (1 hour),
+      so vzdump CT snapshot-mode backups always failed at cleanup
+      with "ONTAP job failed: Snapshot copy ... has not expired or
+      is locked". The temp FlexClone is created by _get_snapshot_path()
+      whenever PVE opens a snapshot for read (vzdump CT backup,
+      qm clone --snapname, qemu-img convert, etc.) and locks the
+      parent snapshot from deletion. The fix checks for the
+      deterministic temp clone name, refuses to proceed if its LUN
+      is still in use locally (lsof-style holder check), otherwise
+      unmaps + deletes the temp volume, then proceeds with the
+      snapshot delete.
+
+ -- Jason Cheng <jason@jason.tools>  Wed, 13 May 2026 20:00:00 +0800
+
 jt-pve-storage-netapp (0.2.12-1) stable; urgency=high
 
   * iSCSI Portal TCP Pre-check Release

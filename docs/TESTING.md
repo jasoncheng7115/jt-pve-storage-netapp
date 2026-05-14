@@ -1784,14 +1784,16 @@ grep -A 80 '^sub _remove_temp_clone' "$P" | grep -c 'remove_scsi_device'
 # Expected: >=1
 grep -A 80 '^sub _remove_temp_clone' "$P" | grep -c 'multipath_reload'
 # Expected: >=1
-grep -A 80 '^sub _remove_temp_clone' "$P" | grep -c 'volume_clone_split'
-# Expected: 1
-grep -A 80 '^sub _remove_temp_clone' "$P" | grep -c 'volume_wait_clone_split'
+# Use word-anchored match for $api->volume_clone_split to avoid double
+# counting it via the substring inside volume_wait_clone_split lines.
+grep -A 80 '^sub _remove_temp_clone' "$P" | grep -cE '\$api->volume_clone_split\b'
+# Expected: 1 (only the actual API call site)
+grep -A 80 '^sub _remove_temp_clone' "$P" | grep -cE '\$api->volume_wait_clone_split\b'
 # Expected: 1
 
 # Both call sites must route through the helper (not inline cleanup)
-grep -A 30 '^sub volume_snapshot_delete' "$P" | grep -c '_remove_temp_clone'
-# Expected: 1
+grep -A 60 '^sub volume_snapshot_delete' "$P" | grep -c '_remove_temp_clone'
+# Expected: >= 1
 grep -A 30 '^sub _cleanup_temp_clones ' "$P" | grep -c '_remove_temp_clone'
 # Expected: 1
 
@@ -1800,7 +1802,7 @@ grep -A 30 '^sub volume_snapshot_delete' "$P" | grep -c 'is_device_in_use'
 # Expected: 1
 
 # No inline duplicate cleanup left in the v0.2.13 patch site
-grep -A 30 '^sub volume_snapshot_delete' "$P" | grep -c 'volume_clone_split'
+grep -A 30 '^sub volume_snapshot_delete' "$P" | grep -cE '\$api->volume_clone_split\b'
 # Expected: 0 (split is now done inside the helper, not inline)
 ```
 

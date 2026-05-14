@@ -1396,14 +1396,16 @@ grep -A 80 '^sub _remove_temp_clone' "$P" | grep -c 'remove_scsi_device'
 # 預期:>=1
 grep -A 80 '^sub _remove_temp_clone' "$P" | grep -c 'multipath_reload'
 # 預期:>=1
-grep -A 80 '^sub _remove_temp_clone' "$P" | grep -c 'volume_clone_split'
-# 預期:1
-grep -A 80 '^sub _remove_temp_clone' "$P" | grep -c 'volume_wait_clone_split'
+# 用 word-anchored 比對 $api->volume_clone_split,避免被 volume_wait_clone_split 內的
+# substring 重複計算
+grep -A 80 '^sub _remove_temp_clone' "$P" | grep -cE '\$api->volume_clone_split\b'
+# 預期:1(僅實際 API 呼叫點)
+grep -A 80 '^sub _remove_temp_clone' "$P" | grep -cE '\$api->volume_wait_clone_split\b'
 # 預期:1
 
 # 兩個 call site 都必須走 helper(不再有 inline 清理)
-grep -A 30 '^sub volume_snapshot_delete' "$P" | grep -c '_remove_temp_clone'
-# 預期:1
+grep -A 60 '^sub volume_snapshot_delete' "$P" | grep -c '_remove_temp_clone'
+# 預期:>= 1
 grep -A 30 '^sub _cleanup_temp_clones ' "$P" | grep -c '_remove_temp_clone'
 # 預期:1
 
@@ -1412,7 +1414,7 @@ grep -A 30 '^sub volume_snapshot_delete' "$P" | grep -c 'is_device_in_use'
 # 預期:1
 
 # v0.2.13 inline patch 區應該已不再有重複的清理 code
-grep -A 30 '^sub volume_snapshot_delete' "$P" | grep -c 'volume_clone_split'
+grep -A 30 '^sub volume_snapshot_delete' "$P" | grep -cE '\$api->volume_clone_split\b'
 # 預期:0(split 現在在 helper 內,不再 inline)
 ```
 

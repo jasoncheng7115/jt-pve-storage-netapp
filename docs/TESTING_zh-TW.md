@@ -1224,13 +1224,20 @@ grep -c 'IO::Socket::INET' lib/PVE/Storage/Custom/NetAppONTAP/ISCSI.pm
 
 ---
 
-## 24. Snapshot 刪除時清理依附的 Temp FlexClone (v0.2.13)
+## 24. Snapshot 刪除時清理依附的 Temp FlexClone(v0.2.13,v0.2.14 強化)
 
-驗證 `volume_snapshot_delete()` 會在刪 snapshot 之前先把依附在該 snapshot 上的暫時 FlexClone 拆解並移除。客戶現場事件:`vzdump` 對 CT 做 snapshot-mode 備份備份本身成功,但清理階段必失敗,訊息「Snapshot ... has not expired or is locked」— 因為 `_get_snapshot_path()` 為了讓備份能讀 snapshot 而建立的暫時 FlexClone 還在持有 snapshot owner reference。
+驗證 `volume_snapshot_delete()`(以及 `_cleanup_temp_clones`)會把依附在 snapshot 上的暫時 FlexClone **完整清乾淨** — **ONTAP 端跟 host 端都要乾淨** — 才刪 snapshot。
+
+**沿革:**
+- v0.2.13 修正 ONTAP 端:snapshot 刪除不再失敗於「has not expired or is locked」。
+- v0.2.13 的測試只驗 ONTAP 端。客戶現場一天內就遇到 v0.2.13 引入的 regression:每次備份都在 host 留下殘留 `dm-multipath` + 4 條 `sd*` 路徑,`multipathd` 持續洗版「tur checker reports path is down」。
+- v0.2.14 新增共用 helper `_remove_temp_clone()`,流程對齊 `free_image()` 的 7 步模式(抓 slave 清單 → unmap → cleanup_lun_devices → 移除 sd* → multipath_reload → split → wait → delete)。下面 Section 24 是**強化版**測試,明確驗證 host 端清理 — 就是可以 catch v0.2.13 bug 的斷言。
+
+**規則(來自 v0.2.14 事件,亦記入 CLAUDE.md):** 任何測試只要涵蓋「在 ONTAP 上刪 LUN/卷」的路徑,都**必須**包含 host 端 device 清理斷言(`get_device_by_wwid` 回 undef、sd* 不在 `/sys/block`、`/dev/mapper/<wwid>` 不存在)。只測 ONTAP 不夠 — 那些斷言不會 catch host 端的孤兒設備,而那會在幾秒內變成 operator 可見的 syslog 噪音。
 
 ### 24.1 透過 plugin API 直接做端到端測試(不需 PBS / vzdump)
 
-此腳本直接呼叫 storage plugin 內部 vzdump 會觸發的同一組函式,**不需要** CT、PBS server 或 vzdump 設定就能重現完整 bug 情境。
+此腳本直接呼叫 storage plugin 內部 vzdump 會觸發的同一組函式,**不需要** CT、PBS server 或 vzdump 設定就能重現完整 bug 情境。**包含 host 端 device 殘留斷言**(就是 v0.2.13 漏掉、會 catch 該 bug 的斷言 — 永久保留作 regression 守則)。
 
 ```bash
 cat > /tmp/test_section24.pl <<'EOF'
@@ -1242,18 +1249,20 @@ use PVE::Storage;
 use PVE::Storage::Custom::NetAppONTAPPlugin;
 use PVE::Storage::Custom::NetAppONTAP::API;
 use PVE::Storage::Custom::NetAppONTAP::Naming;
+use PVE::Storage::Custom::NetAppONTAP::Multipath qw(get_device_by_wwid get_multipath_slaves);
 
 my $storeid = "netapp1";
 my $cfg = PVE::Storage::config();
 my $scfg = $cfg->{ids}->{$storeid} or die "storage $storeid not configured\n";
 my $plugin = "PVE::Storage::Custom::NetAppONTAPPlugin";
-my $vmid = 9990;
+my $vmid = 9991;
 my $volname = "vm-${vmid}-disk-0";
 my $exit_code = 0;
 
 sub api { PVE::Storage::Custom::NetAppONTAPPlugin::_get_api($scfg) }
 sub ontap_name { PVE::Storage::Custom::NetAppONTAP::Naming::pve_volname_to_ontap($storeid, $volname) }
 sub temp_name { PVE::Storage::Custom::NetAppONTAPPlugin::_get_temp_clone_name(ontap_name(), $_[0]) }
+sub basename { (my $b = $_[0]) =~ s{.*/}{}; $b }
 
 sub aggressive_cleanup {
     my $ontap_volname = ontap_name();
@@ -1274,43 +1283,75 @@ $plugin->activate_storage($storeid, $scfg, {});
 my $allocated = $plugin->alloc_image($storeid, $scfg, $vmid, "raw", $volname, 1024*1024);
 $plugin->activate_volume($storeid, $scfg, $volname, undef, {});
 
-# Case B(regression): 無 temp clone 直接刪 snapshot
+# Case B(regression):無 temp clone 直接刪 snapshot
 $plugin->volume_snapshot($scfg, $storeid, $volname, "testsnap-B");
 my $t0 = time();
 eval { $plugin->volume_snapshot_delete($scfg, $storeid, $volname, "testsnap-B", 0); };
 if ($@) { print "FAIL B: $@\n"; $exit_code = 1; exit 1; }
 printf "PASS B: snapshot_delete OK in %.2fs(無 temp clone)\n", time() - $t0;
 
-# Case A(bug fix): 有 temp clone 時刪 snapshot
+# Case A(bug fix):有 temp clone 時刪 snapshot —— 驗 HOST + ONTAP
 $plugin->volume_snapshot($scfg, $storeid, $volname, "testsnap-A");
 my @p = $plugin->path($scfg, $volname, $storeid, "testsnap-A");
+my $temp_device = $p[0];
 my $tcn = temp_name("testsnap-A");
-my $tv = api()->volume_get($tcn);
-unless ($tv) { print "TEST INVALID: temp clone not created\n"; exit 1; }
+my $temp_lun_path = PVE::Storage::Custom::NetAppONTAP::Naming::encode_lun_path($tcn);
+my $temp_wwid = api()->lun_get_wwid($temp_lun_path);
+my @slaves_before = @{ get_multipath_slaves($temp_device) // [] };
+print "  temp clone wwid: $temp_wwid, slaves before: @slaves_before\n";
+
+unless (api()->volume_get($tcn)) { print "TEST INVALID: temp clone 未建立\n"; exit 1; }
 
 $t0 = time();
 eval { $plugin->volume_snapshot_delete($scfg, $storeid, $volname, "testsnap-A", 0); };
 if ($@) { print "FAIL A: $@\n"; $exit_code = 1; exit 1; }
-printf "PASS A: snapshot_delete OK in %.2fs(temp clone 分離 + 移除)\n", time() - $t0;
+printf "PASS A: snapshot_delete OK in %.2fs\n", time() - $t0;
 
-$tv = api()->volume_get($tcn);
-if ($tv) { print "FAIL: temp clone 仍存在\n"; $exit_code = 1; exit 1; }
+# ONTAP 端斷言
+if (api()->volume_get($tcn)) { print "FAIL ONTAP: temp clone 仍存在\n"; $exit_code = 1; exit 1; }
+print "  [ONTAP] temp clone: GONE\n";
 my $snaps = api()->snapshot_list(ontap_name());
 my $snapname = PVE::Storage::Custom::NetAppONTAP::Naming::encode_snapshot_name("testsnap-A");
 if (grep { $_->{name} eq $snapname } @$snaps) {
-    print "FAIL: snapshot 仍存在\n"; $exit_code = 1; exit 1;
+    print "FAIL ONTAP: snapshot 仍存在\n"; $exit_code = 1; exit 1;
 }
-print "ALL PASS\n";
+print "  [ONTAP] snapshot: GONE\n";
+
+# HOST 端斷言(v0.2.13->v0.2.14 關鍵斷言)
+my $mp_after = get_device_by_wwid($temp_wwid);
+if ($mp_after) {
+    print "FAIL HOST: temp WWID 對應的 multipath device 仍存在($mp_after)\n";
+    print "  multipathd 會 spam 'path is down'。v0.2.13 有此 bug。\n";
+    $exit_code = 1; exit 1;
+}
+print "  [HOST]  multipath device: GONE\n";
+
+my @alive_slaves = grep { -e "/sys/block/" . basename($_) } @slaves_before;
+if (@alive_slaves) {
+    print "FAIL HOST: 殘留 sd* 仍在 /sys/block: @alive_slaves\n";
+    $exit_code = 1; exit 1;
+}
+print "  [HOST]  sd* slaves: GONE\n";
+
+if (-b "/dev/mapper/$temp_wwid") {
+    print "FAIL HOST: /dev/mapper/$temp_wwid 仍存在\n";
+    $exit_code = 1; exit 1;
+}
+print "  [HOST]  /dev/mapper/<wwid>: GONE\n";
+
+print "ALL PASS(ONTAP + HOST 清理已驗證)\n";
 EOF
 perl /tmp/test_section24.pl
 ```
 
 **預期結果:**
-- Case B:`PASS B` 在 3 秒內(snapshot_delete 走 fast path,沒做 temp clone 相關工作)。
-- Case A:`PASS A` 在 30 秒內。時間主要花在 `volume_clone_split` + `volume_wait_clone_split`(wait loop 5 秒輪詢一次,加上 split 本身時間)。對於 `qm clone --full --snapname` 之類差異較大的 temp clone 會慢一些;由 `volume_snapshot_delete` 內部 300 秒 timeout 保底。
-- temp clone 與 snapshot 在事後都應該不存在。
+- Case B:`PASS B` 在 3 秒內。
+- Case A:`PASS A` 在 30 秒內(split + wait + delete + snapshot_delete;由 `volume_snapshot_delete` 內部 300 秒 timeout 保底)。
+- **HOST 端所有斷言皆 GONE**。任何斷言失敗就是 regression。
 
 **為什麼用 split-then-delete 而不是直接 delete:** 真實 ONTAP FAS 上,delete FlexClone 之後 parent snapshot 的 `volume_clone_dependent` owner 會在短時間內清掉。但在 ONTAP simulator(以及部分 FAS 版本),這個 owner 標記是黏的 — 實測 60 秒以上都不會清。`volume_clone_split` 是 ONTAP 保證 split 完成後一定會釋放 owner 的機制,在所有平台行為一致。代價是 split 時間,但 vzdump 場景下 temp clone 是 read-only,所以只需要處理極少的 unique block,實際很快。
+
+**為什麼 HOST 端斷言必填:** v0.2.13 通過了純 ONTAP 端的測試就 ship 到正式環境,但每次 CT 備份都會留下殘留 dm-multipath + 4 條 sd* 在 host,`multipathd` 持續洗版「tur checker reports path is down」。v0.2.14 在原本 fix 上補了缺失的 `cleanup_lun_devices` + `remove_scsi_device` + `multipath_reload` 步驟,而這些測試斷言就作為永久 regression 守則保留下來。
 
 ### 24.2 客戶情境重現(CT vzdump snapshot mode)
 
@@ -1341,21 +1382,38 @@ vzdump 9000 --mode snapshot --storage <pbs-or-dump>
 
 ```bash
 P=lib/PVE/Storage/Custom/NetAppONTAPPlugin.pm
-# volume_snapshot_delete 必須呼叫 _get_temp_clone_name
-grep -A 30 '^sub volume_snapshot_delete' "$P" | grep -c '_get_temp_clone_name'
+
+# 共用 helper _remove_temp_clone 必須存在(v0.2.14)
+grep -c '^sub _remove_temp_clone' "$P"
 # 預期:1
 
-# 必須用 clone_split(選擇此機制)而非單純 volume_delete
-grep -A 50 '^sub volume_snapshot_delete' "$P" | grep -c 'volume_clone_split'
+# Helper 必須使用 free_image 風格的清理流程
+grep -A 80 '^sub _remove_temp_clone' "$P" | grep -c 'cleanup_lun_devices'
+# 預期:>=1
+grep -A 80 '^sub _remove_temp_clone' "$P" | grep -c 'get_multipath_slaves'
+# 預期:>=1
+grep -A 80 '^sub _remove_temp_clone' "$P" | grep -c 'remove_scsi_device'
+# 預期:>=1
+grep -A 80 '^sub _remove_temp_clone' "$P" | grep -c 'multipath_reload'
+# 預期:>=1
+grep -A 80 '^sub _remove_temp_clone' "$P" | grep -c 'volume_clone_split'
+# 預期:1
+grep -A 80 '^sub _remove_temp_clone' "$P" | grep -c 'volume_wait_clone_split'
 # 預期:1
 
-# 必須等 split 完成
-grep -A 60 '^sub volume_snapshot_delete' "$P" | grep -c 'volume_wait_clone_split'
+# 兩個 call site 都必須走 helper(不再有 inline 清理)
+grep -A 30 '^sub volume_snapshot_delete' "$P" | grep -c '_remove_temp_clone'
+# 預期:1
+grep -A 30 '^sub _cleanup_temp_clones ' "$P" | grep -c '_remove_temp_clone'
 # 預期:1
 
 # 必須有本機 in-use 安全檢查
 grep -A 30 '^sub volume_snapshot_delete' "$P" | grep -c 'is_device_in_use'
 # 預期:1
+
+# v0.2.13 inline patch 區應該已不再有重複的清理 code
+grep -A 30 '^sub volume_snapshot_delete' "$P" | grep -c 'volume_clone_split'
+# 預期:0(split 現在在 helper 內,不再 inline)
 ```
 
 ---
@@ -1379,6 +1437,32 @@ pvesm list $STORAGE
 ## 發佈測試結果
 
 每次發佈前都必須通過上述所有測試。結果記錄如下。
+
+### v0.2.14-1 Temp Clone Host 端清理修正 Release (2026-05-14)
+
+**範圍:** 強化 Section 24 — 新增 host 端 device 殘留斷言(如果 v0.2.13 跑過這個斷言就會 catch 到 production regression)。修正手段:新增共用 helper `_remove_temp_clone()`,給 `volume_snapshot_delete` 和 `_cleanup_temp_clones` 兩個 call site 共用。
+
+**環境:** 單節點測試於 `pc-pve3`(PVE 9.1,部署 0.2.14-1),`netapp1` 儲存對接 ONTAP simulator。
+
+#### Section 24: Snapshot 刪除時清理依附的 Temp FlexClone(強化版)
+
+| # | 斷言 | 結果 |
+|---|------|------|
+| 24.1 Case A | snapshot_delete 含 temp clone | **PASS** 17.73s |
+| 24.1 Case A | [ONTAP] temp clone 已移除 | PASS(GONE) |
+| 24.1 Case A | [ONTAP] snapshot 已移除 | PASS(GONE) |
+| 24.1 Case A | **[HOST] temp WWID 對應的 dm-multipath 已移除** | **PASS**(GONE) ← 新 |
+| 24.1 Case A | **[HOST] sd* slave 裝置已移除** | **PASS**(GONE) ← 新 |
+| 24.1 Case A | **[HOST] /dev/mapper/<wwid> 已移除** | **PASS**(GONE) ← 新 |
+| 24.3 | 靜態 regression 守則(helper 存在、兩 call site 都用、不再有 inline cleanup) | PASS(計數全符合) |
+
+**Bug 修正價值:** v0.2.14 之前每一次 CT vzdump snapshot-mode 備份都會在 host 留下殘留 `dm-multipath` + 4 條 `sd*`。`multipathd` 之後每 2 秒就 log 一次「tur checker reports path is down」,且每次備份都多累積一組。v0.2.14 之後 host 端設備跟著 `volume_snapshot_delete` 同步拆掉。
+
+**教訓(已記入 CLAUDE.md):** 任何測試只要涵蓋「在 ONTAP 上刪 LUN/卷」的路徑,都必須包含 host 端 device 斷言。只測 ONTAP 不夠 — 清理類 bug 在 host 端的殘留會在幾秒內就被 operator 看到 syslog 訊息。適用於 `free_image`、`volume_snapshot_delete`、`deactivate_volume`、未來的 temp clone reaper、以及任何呼叫 `lun_delete` 或 `volume_delete` 的新程式碼。
+
+**結論:** Section 24 強化測試全部通過。v0.2.14-1 可發佈。
+
+---
 
 ### v0.2.13-1 Snapshot 刪除清理修正 Release (2026-05-13)
 

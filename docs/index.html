@@ -142,7 +142,7 @@
     <div class="hero__glow"></div>
     <div class="hero__glow-left"></div>
     <div class="hero__content">
-        <div class="hero__badge">v0.2.13 <span class="hero__badge-sep"></span> MIT License</div>
+        <div class="hero__badge">v0.2.14 <span class="hero__badge-sep"></span> MIT License</div>
         <h1 class="hero__title">jt-pve-storage-netapp</h1>
         <p class="hero__project-desc">
             <span class="lang-en">NetApp ONTAP SAN/iSCSI/FC Storage Plugin for Proxmox VE</span>
@@ -522,7 +522,7 @@
                 <span class="lang-en">Install the plugin package</span>
                 <span class="lang-zh">安裝 plugin 套件</span>
             </div>
-            <pre><span class="cmd">dpkg</span> <span class="flag">-i</span> jt-pve-storage-netapp_0.2.13-1_all.deb</pre>
+            <pre><span class="cmd">dpkg</span> <span class="flag">-i</span> jt-pve-storage-netapp_0.2.14-1_all.deb</pre>
             <p>
                 <span class="lang-en">The plugin automatically configures multipath and reloads Proxmox VE services (pvedaemon, pvestatd, pveproxy).</span>
                 <span class="lang-zh">Plugin 會自動設定 multipath 並重新載入 Proxmox VE 服務（pvedaemon、pvestatd、pveproxy）。</span>
@@ -596,7 +596,7 @@
                 <span class="lang-en">Install new package</span>
                 <span class="lang-zh">安裝新套件</span>
             </div>
-            <pre><span class="cmd">dpkg</span> <span class="flag">-i</span> jt-pve-storage-netapp_0.2.13-1_all.deb</pre>
+            <pre><span class="cmd">dpkg</span> <span class="flag">-i</span> jt-pve-storage-netapp_0.2.14-1_all.deb</pre>
         </div>
     </div>
     <div class="step">
@@ -1436,6 +1436,15 @@
         <span class="lang-en">Version history. For full details see <a href="https://github.com/jasoncheng7115/jt-pve-storage-netapp/blob/main/CHANGELOG.md">CHANGELOG.md</a>.</span>
         <span class="lang-zh">版本紀錄。完整內容請參閱 <a href="https://github.com/jasoncheng7115/jt-pve-storage-netapp/blob/main/CHANGELOG_zh-TW.md">CHANGELOG_zh-TW.md</a>。</span>
     </p>
+
+    <div class="changelog-entry">
+        <div class="changelog-version">v0.2.14 <span class="changelog-tag changelog-tag--fix">Fix</span></div>
+        <div class="changelog-date">2026-05-14</div>
+        <div class="changelog-summary">
+            <span class="lang-en">Temp Clone Host-side Cleanup (production regression in v0.2.13, found day 1). v0.2.13 fixed snapshot delete on ONTAP side but left host's dm-multipath + sd* paths orphaned. <code>multipathd</code> spammed "tur checker reports path is down" indefinitely after every backup. New shared helper <code>_remove_temp_clone()</code> mirrors <code>free_image()</code>'s 7-step pattern (capture slaves -> unmap -> cleanup_lun_devices -> remove sd* -> multipath_reload -> split -> wait -> delete). Both <code>volume_snapshot_delete</code> and <code>_cleanup_temp_clones</code> route through it. Section 24 hardened with mandatory host-side device residual assertions.</span>
+            <span class="lang-zh">Temp Clone Host 端清理修正(v0.2.13 deploy 後一天客戶現場發現的 regression)。v0.2.13 修了 ONTAP 端的 snapshot 刪除,但 host 端 dm-multipath + sd* 路徑沒清。<code>multipathd</code> 在每次備份後持續洗版「tur checker reports path is down」。新增共用 helper <code>_remove_temp_clone()</code>,流程對齊 <code>free_image()</code> 的 7 步模式(抓 slave → unmap → cleanup_lun_devices → 移除 sd* → multipath_reload → split → wait → delete)。<code>volume_snapshot_delete</code> 和 <code>_cleanup_temp_clones</code> 兩個 call site 都統一走 helper。Section 24 強化加上必須的 host 端 device 殘留斷言。</span>
+        </div>
+    </div>
 
     <div class="changelog-entry">
         <div class="changelog-version">v0.2.13 <span class="changelog-tag changelog-tag--fix">Fix</span></div>

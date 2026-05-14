@@ -2,6 +2,24 @@
 
 All notable changes to the NetApp ONTAP Storage Plugin for Proxmox VE are documented here.
 
+## [0.2.14] - 2026-05-14
+
+### Temp Clone Host-side Cleanup Release
+
+**Bug Fix (production regression in v0.2.13, found day 1 after deploy):**
+
+- **`volume_snapshot_delete()` and `_cleanup_temp_clones` now fully tear down the host's dm-multipath + sd* devices when removing a temporary FlexClone.** v0.2.13's fix only handled the ONTAP side (`volume_clone_split` + `volume_delete`). After the temp clone's LUN was deleted on ONTAP, the host's `/dev/mapper/<wwid>` and the underlying `sd*` paths were left orphaned. `multipathd` then logged `tur checker reports path is down` for the dead WWID every few seconds, indefinitely. Customer reported the symptom within 24 hours of v0.2.13 deploy: after one CT create + backup + remove cycle, four stale paths spammed syslog continuously. The same gap existed in the TTL-based `_cleanup_temp_clones` background reaper but was less visible (delayed by 1 hour).
+- New shared helper `_remove_temp_clone($api, $temp_clone_name)` mirrors `free_image()`'s 7-step pattern: capture slaves → unmap → `cleanup_lun_devices` → remove residual sd* → `multipath_reload` → `volume_clone_split` → wait → `volume_delete`. Both `volume_snapshot_delete` and `_cleanup_temp_clones` route through it.
+
+**Test hardening (response to user feedback "這種問題請加入測試清單"):**
+
+- Section 24 in TESTING.md / TESTING_zh-TW.md updated with explicit HOST-side device residual assertions: after `volume_snapshot_delete`, `get_device_by_wwid` must return undef, sd* slaves must be absent from `/sys/block`, `/dev/mapper/<wwid>` must not exist. These assertions would have caught the v0.2.13 regression in CI; the v0.2.13 test only checked ONTAP-side state. Permanent regression guard.
+- CLAUDE.md adds a release-SOP rule: **every test that exercises a delete-on-ONTAP path must include host-side device assertions**. ONTAP-only tests are insufficient for cleanup-class bugs.
+
+**Operational note for existing host-side residuals:**
+
+- Stale devices from backups taken BEFORE v0.2.14 will NOT be auto-cleaned (plugin policy: never auto-clean WWIDs not in tracking, to protect customer's manual storage). `_cleanup_orphaned_devices` will WARN about them via syslog with manual cleanup commands. Operators can sweep them with `multipath -f <wwid>` plus `echo 1 > /sys/block/sdX/device/delete` for each underlying sd path.
+
 ## [0.2.13] - 2026-05-13
 
 ### Snapshot Delete Cleanup Fix Release

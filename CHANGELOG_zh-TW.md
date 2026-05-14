@@ -2,6 +2,24 @@
 
 NetApp ONTAP Storage Plugin for Proxmox VE 的所有重要變更都記錄在此。
 
+## [0.2.14] - 2026-05-14
+
+### Temp Clone Host 端清理修正 Release
+
+**Bug 修正(v0.2.13 部署後一天客戶現場發現 regression):**
+
+- **`volume_snapshot_delete()` 與 `_cleanup_temp_clones` 現在會完整拆掉 host 端 dm-multipath + sd* 殘留設備。** v0.2.13 的 fix 只處理 ONTAP 那邊(`volume_clone_split` + `volume_delete`),temp clone 的 LUN 從 ONTAP 上刪掉後,host 端 `/dev/mapper/<wwid>` 跟底下 4 個 `sd*` 路徑沒清。`multipathd` 之後每隔幾秒就 log 一次 `tur checker reports path is down`,沒完沒了。客戶在 v0.2.13 部署後 24 小時內就回報:對一個 CT 做 create + backup + remove 之後,4 條殘留 path 持續洗版 syslog。同樣的缺漏也存在於 1 小時 TTL 背景清理 `_cleanup_temp_clones`,只是時間延遲讓問題不那麼明顯。
+- 新增共用 helper `_remove_temp_clone($api, $temp_clone_name)`,流程對齊 `free_image()` 的 7 步模式:抓 slave 清單 → unmap → `cleanup_lun_devices` → 移除殘留 sd* → `multipath_reload` → `volume_clone_split` → wait → `volume_delete`。兩個 call site(`volume_snapshot_delete` 和 `_cleanup_temp_clones`)都統一走這個 helper。
+
+**測試強化(回應客戶意見「這種問題請加入測試清單」):**
+
+- TESTING.md / TESTING_zh-TW.md 的 Section 24 加上明確的 HOST 端 device 殘留斷言:`volume_snapshot_delete` 跑完後 `get_device_by_wwid` 必須回 undef、sd* slave 不能存在於 `/sys/block`、`/dev/mapper/<wwid>` 必須不存在。這些斷言若在 v0.2.13 的 CI 跑過就會立刻 catch 到 regression;舊版測試只檢查 ONTAP 那層。長期 regression 守則。
+- CLAUDE.md 新增 release SOP 規則:**任何測試只要涵蓋「在 ONTAP 上刪 LUN/卷」的路徑,都必須包含 host 端 device 殘留斷言**。只測 ONTAP 不夠 — 清理類 bug 一定要兩邊都驗。
+
+**既存殘留處理建議:**
+
+- v0.2.14 之前備份留下的 host 殘留**不會自動清**(plugin 設計:不主動清不在 tracking 內的 WWID,避免誤動到客戶自己的儲存)。`_cleanup_orphaned_devices` 會在 syslog 警告並列出清理指令。手動清:對每一個殘留 WWID 跑 `multipath -f <wwid>`,然後 `echo 1 > /sys/block/sdX/device/delete` 移除底下的 sd*。
+
 ## [0.2.13] - 2026-05-13
 
 ### Snapshot 刪除清理修正 Release

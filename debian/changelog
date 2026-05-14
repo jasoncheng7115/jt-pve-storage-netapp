@@ -1,3 +1,30 @@
+jt-pve-storage-netapp (0.2.14-1) stable; urgency=high
+
+  * Temp Clone Host-side Cleanup Release
+  * Requirements: Proxmox VE 9.1 or later
+  * Bug Fix (production incident, found day 1 after v0.2.13 deploy):
+    - v0.2.13 added temp FlexClone cleanup inside volume_snapshot_delete()
+      but only handled the ONTAP side (split + delete). The host's
+      dm-multipath wrapper and underlying sd* devices were left orphaned
+      after the temp clone's LUN was deleted on ONTAP. multipathd then
+      logged "tur checker reports path is down" for the dead WWID every
+      few seconds indefinitely. The 1-hour TTL reaper in
+      _cleanup_temp_clones had the same gap (less visible because of
+      the time delay).
+    - Both paths now route through a new shared helper _remove_temp_clone()
+      that mirrors free_image()'s 7-step pattern:
+      capture slaves -> unmap -> cleanup_lun_devices -> remove sd* ->
+      multipath_reload -> clone_split -> wait -> volume_delete.
+  * Operational note:
+    - Existing host-side residual devices from backups taken before
+      v0.2.14 will NOT be auto-cleaned (plugin design: never auto-clean
+      WWIDs not in tracking, to protect customer's manual storage).
+      _cleanup_orphaned_devices() will WARN about them via syslog with
+      manual cleanup commands. Operators can sweep them with:
+        multipath -f <wwid> && echo 1 > /sys/block/sdX/device/delete
+
+ -- Jason Cheng <jason@jason.tools>  Thu, 14 May 2026 11:00:00 +0800
+
 jt-pve-storage-netapp (0.2.13-1) stable; urgency=high
 
   * Snapshot Delete Cleanup Fix Release

@@ -1612,13 +1612,20 @@ grep -c 'IO::Socket::INET' lib/PVE/Storage/Custom/NetAppONTAP/ISCSI.pm
 
 ---
 
-## 24. Snapshot Delete with Temp FlexClone Cleanup (v0.2.13)
+## 24. Snapshot Delete with Temp FlexClone Cleanup (v0.2.13, hardened in v0.2.14)
 
-Verifies that `volume_snapshot_delete()` detaches and removes the dependent temp FlexClone before deleting the snapshot. Customer field incident: `vzdump` CT snapshot-mode backups completed successfully but always failed at the cleanup step with "Snapshot ... has not expired or is locked" because `_get_snapshot_path()` had created a temp FlexClone (used for read-side access) that was still holding the snapshot owner reference.
+Verifies that `volume_snapshot_delete()` (and `_cleanup_temp_clones`) detach AND fully clean up the dependent temp FlexClone — **both ONTAP-side and host-side** — before deleting the snapshot.
+
+**History:**
+- v0.2.13 fixed the ONTAP side: snapshot delete no longer fails with "has not expired or is locked".
+- v0.2.13's test only asserted ONTAP-side cleanup. In production, customer saw a v0.2.13-introduced regression: every backup left `dm-multipath` + 4 stale `sd*` paths on the host. `multipathd` then spammed "tur checker reports path is down" indefinitely.
+- v0.2.14 added a shared `_remove_temp_clone()` helper that mirrors `free_image()`'s 7-step cleanup pattern (capture slaves → unmap → cleanup_lun_devices → remove sd* → multipath_reload → split → wait → delete). Section 24 below is the **hardened** test that explicitly asserts host-side cleanup — the assertion that would have caught the v0.2.13 bug.
+
+**Rule (from v0.2.14 incident, mirrored in CLAUDE.md):** Every test that covers a delete-on-ONTAP path MUST assert host-side device removal afterwards (`get_device_by_wwid` returns undef, sd* paths absent from `/sys/block`, `/dev/mapper/<wwid>` absent). ONTAP-only assertions are insufficient because they don't catch host-side orphans, which become user-visible noise within seconds.
 
 ### 24.1 End-to-end via direct plugin API (no PBS / vzdump required)
 
-This script exercises the full bug scenario WITHOUT requiring a CT, PBS server, or vzdump configuration -- it directly calls the storage plugin functions that vzdump triggers internally.
+This script exercises the full bug scenario WITHOUT requiring a CT, PBS server, or vzdump configuration -- it directly calls the storage plugin functions that vzdump triggers internally. **Includes host-side device residual assertions** (the assertions that would have caught the v0.2.13 bug — kept here permanently as a regression guard).
 
 ```bash
 cat > /tmp/test_section24.pl <<'EOF'
@@ -1630,18 +1637,20 @@ use PVE::Storage;
 use PVE::Storage::Custom::NetAppONTAPPlugin;
 use PVE::Storage::Custom::NetAppONTAP::API;
 use PVE::Storage::Custom::NetAppONTAP::Naming;
+use PVE::Storage::Custom::NetAppONTAP::Multipath qw(get_device_by_wwid get_multipath_slaves);
 
 my $storeid = "netapp1";
 my $cfg = PVE::Storage::config();
 my $scfg = $cfg->{ids}->{$storeid} or die "storage $storeid not configured\n";
 my $plugin = "PVE::Storage::Custom::NetAppONTAPPlugin";
-my $vmid = 9990;   # use a VMID not in use elsewhere
+my $vmid = 9991;
 my $volname = "vm-${vmid}-disk-0";
 my $exit_code = 0;
 
 sub api { PVE::Storage::Custom::NetAppONTAPPlugin::_get_api($scfg) }
 sub ontap_name { PVE::Storage::Custom::NetAppONTAP::Naming::pve_volname_to_ontap($storeid, $volname) }
 sub temp_name { PVE::Storage::Custom::NetAppONTAPPlugin::_get_temp_clone_name(ontap_name(), $_[0]) }
+sub basename { (my $b = $_[0]) =~ s{.*/}{}; $b }
 
 sub aggressive_cleanup {
     my $ontap_volname = ontap_name();
@@ -1669,37 +1678,68 @@ eval { $plugin->volume_snapshot_delete($scfg, $storeid, $volname, "testsnap-B", 
 if ($@) { print "FAIL B: $@\n"; $exit_code = 1; exit 1; }
 printf "PASS B: snapshot_delete OK in %.2fs (no temp clone)\n", time() - $t0;
 
-# Case A (bug fix): snapshot delete WITH temp clone
+# Case A (bug fix): snapshot delete WITH temp clone -- assert HOST + ONTAP cleanup
 $plugin->volume_snapshot($scfg, $storeid, $volname, "testsnap-A");
 my @p = $plugin->path($scfg, $volname, $storeid, "testsnap-A");
+my $temp_device = $p[0];
 my $tcn = temp_name("testsnap-A");
-my $tv = api()->volume_get($tcn);
-unless ($tv) { print "TEST INVALID: temp clone not created\n"; exit 1; }
+my $temp_lun_path = PVE::Storage::Custom::NetAppONTAP::Naming::encode_lun_path($tcn);
+my $temp_wwid = api()->lun_get_wwid($temp_lun_path);
+my @slaves_before = @{ get_multipath_slaves($temp_device) // [] };
+print "  temp clone wwid: $temp_wwid, slaves before: @slaves_before\n";
+
+unless (api()->volume_get($tcn)) { print "TEST INVALID: temp clone not created\n"; exit 1; }
 
 $t0 = time();
 eval { $plugin->volume_snapshot_delete($scfg, $storeid, $volname, "testsnap-A", 0); };
 if ($@) { print "FAIL A: $@\n"; $exit_code = 1; exit 1; }
-printf "PASS A: snapshot_delete OK in %.2fs (temp clone detached + deleted)\n", time() - $t0;
+printf "PASS A: snapshot_delete OK in %.2fs\n", time() - $t0;
 
-# Verify
-$tv = api()->volume_get($tcn);
-if ($tv) { print "FAIL: temp clone still exists\n"; $exit_code = 1; exit 1; }
+# ONTAP-side assertions
+if (api()->volume_get($tcn)) { print "FAIL ONTAP: temp clone still exists\n"; $exit_code = 1; exit 1; }
+print "  [ONTAP] temp clone: GONE\n";
 my $snaps = api()->snapshot_list(ontap_name());
 my $snapname = PVE::Storage::Custom::NetAppONTAP::Naming::encode_snapshot_name("testsnap-A");
 if (grep { $_->{name} eq $snapname } @$snaps) {
-    print "FAIL: snapshot still exists\n"; $exit_code = 1; exit 1;
+    print "FAIL ONTAP: snapshot still exists\n"; $exit_code = 1; exit 1;
 }
-print "ALL PASS\n";
+print "  [ONTAP] snapshot: GONE\n";
+
+# HOST-side assertions (the v0.2.13->v0.2.14 critical assertions)
+my $mp_after = get_device_by_wwid($temp_wwid);
+if ($mp_after) {
+    print "FAIL HOST: multipath device for temp WWID still exists ($mp_after).\n";
+    print "  multipathd will spam 'path is down'. v0.2.13 had this bug.\n";
+    $exit_code = 1; exit 1;
+}
+print "  [HOST]  multipath device: GONE\n";
+
+my @alive_slaves = grep { -e "/sys/block/" . basename($_) } @slaves_before;
+if (@alive_slaves) {
+    print "FAIL HOST: residual sd* still in /sys/block: @alive_slaves\n";
+    $exit_code = 1; exit 1;
+}
+print "  [HOST]  sd* slaves: GONE\n";
+
+if (-b "/dev/mapper/$temp_wwid") {
+    print "FAIL HOST: /dev/mapper/$temp_wwid still present\n";
+    $exit_code = 1; exit 1;
+}
+print "  [HOST]  /dev/mapper/<wwid>: GONE\n";
+
+print "ALL PASS (ONTAP + HOST cleanup verified)\n";
 EOF
 perl /tmp/test_section24.pl
 ```
 
 **Expected:**
-- Case B: `PASS B` in <3 seconds (snapshot_delete fast path, no temp clone work).
-- Case A: `PASS A` in <30 seconds. Time is dominated by `volume_clone_split` + `volume_wait_clone_split` (5s poll interval on the wait loop, plus the split itself). For larger temp clones (e.g. from `qm clone --full --snapname` against a heavily-modified clone), can take longer; bounded by the 300s timeout in `volume_snapshot_delete`.
-- Both `temp clone after delete: GONE` and `snapshot after delete: GONE`.
+- Case B: `PASS B` in <3 seconds.
+- Case A: `PASS A` in <30 seconds (split + wait + delete + snapshot_delete; capped by 300s split timeout for heavily-modified clones).
+- **All HOST-side assertions GONE** after `volume_snapshot_delete`. ANY assertion remaining after delete is a regression.
 
 **Why split-then-delete rather than just delete:** On real ONTAP FAS, deleting the FlexClone normally clears the parent snapshot's `volume_clone_dependent` owner shortly after. On ONTAP simulator (and possibly some real FAS versions), this owner reference is sticky — observed not to clear within 60 seconds. `volume_clone_split` is guaranteed by ONTAP to release the owner reference once split completes, on every platform. Cost is bounded by the clone's unique-block delta (small for vzdump temp clones, which are read-only).
+
+**Why HOST-side assertions are mandatory:** v0.2.13 passed the ONTAP-only version of this test and shipped to production, but every CT backup left a stale dm-multipath + 4 sd* paths on the host. multipathd spammed "tur checker reports path is down" indefinitely. The fix in v0.2.14 added the missing `cleanup_lun_devices` + `remove_scsi_device` + `multipath_reload` steps, and these test assertions are kept as a permanent regression guard.
 
 ### 24.2 Customer scenario reproduction (CT vzdump snapshot mode)
 
@@ -1730,21 +1770,38 @@ vzdump 9000 --mode snapshot --storage <pbs-or-dump> --notes-template '{{guestnam
 
 ```bash
 P=lib/PVE/Storage/Custom/NetAppONTAPPlugin.pm
-# volume_snapshot_delete must call _get_temp_clone_name
-grep -A 30 '^sub volume_snapshot_delete' "$P" | grep -c '_get_temp_clone_name'
+
+# Shared helper _remove_temp_clone must exist (v0.2.14)
+grep -c '^sub _remove_temp_clone' "$P"
 # Expected: 1
 
-# Must use clone_split (the chosen mechanism), not just volume_delete
-grep -A 50 '^sub volume_snapshot_delete' "$P" | grep -c 'volume_clone_split'
+# Helper must use the free_image-style cleanup pattern
+grep -A 80 '^sub _remove_temp_clone' "$P" | grep -c 'cleanup_lun_devices'
+# Expected: >=1
+grep -A 80 '^sub _remove_temp_clone' "$P" | grep -c 'get_multipath_slaves'
+# Expected: >=1
+grep -A 80 '^sub _remove_temp_clone' "$P" | grep -c 'remove_scsi_device'
+# Expected: >=1
+grep -A 80 '^sub _remove_temp_clone' "$P" | grep -c 'multipath_reload'
+# Expected: >=1
+grep -A 80 '^sub _remove_temp_clone' "$P" | grep -c 'volume_clone_split'
+# Expected: 1
+grep -A 80 '^sub _remove_temp_clone' "$P" | grep -c 'volume_wait_clone_split'
 # Expected: 1
 
-# Must wait for split to complete
-grep -A 60 '^sub volume_snapshot_delete' "$P" | grep -c 'volume_wait_clone_split'
+# Both call sites must route through the helper (not inline cleanup)
+grep -A 30 '^sub volume_snapshot_delete' "$P" | grep -c '_remove_temp_clone'
+# Expected: 1
+grep -A 30 '^sub _cleanup_temp_clones ' "$P" | grep -c '_remove_temp_clone'
 # Expected: 1
 
 # Must have local in-use safety check before tearing down
 grep -A 30 '^sub volume_snapshot_delete' "$P" | grep -c 'is_device_in_use'
 # Expected: 1
+
+# No inline duplicate cleanup left in the v0.2.13 patch site
+grep -A 30 '^sub volume_snapshot_delete' "$P" | grep -c 'volume_clone_split'
+# Expected: 0 (split is now done inside the helper, not inline)
 ```
 
 ---
@@ -1768,6 +1825,32 @@ pvesm list $STORAGE
 ## Release Test Results
 
 Each release must pass all tests above before publishing. Results are recorded below.
+
+### v0.2.14-1 Temp Clone Host-side Cleanup Release (2026-05-14)
+
+**Scope:** Section 24 hardened — added host-side device residual assertions (the assertions that would have caught the v0.2.13 production regression). Fix in `_remove_temp_clone()` helper used by both `volume_snapshot_delete` and `_cleanup_temp_clones`.
+
+**Environment:** Single-node test on `pc-pve3` (PVE 9.1, 0.2.14-1 deployed), `netapp1` storage on ONTAP simulator.
+
+#### Section 24: Snapshot Delete with Temp FlexClone Cleanup (hardened)
+
+| # | Assertion | Result |
+|---|-----------|--------|
+| 24.1 Case A | snapshot_delete with temp clone | **PASS** 17.73s |
+| 24.1 Case A | [ONTAP] temp clone removed | PASS (GONE) |
+| 24.1 Case A | [ONTAP] snapshot removed | PASS (GONE) |
+| 24.1 Case A | **[HOST] dm-multipath for temp WWID removed** | **PASS** (GONE) ← new |
+| 24.1 Case A | **[HOST] sd* slave devices removed** | **PASS** (GONE) ← new |
+| 24.1 Case A | **[HOST] /dev/mapper/<wwid> removed** | **PASS** (GONE) ← new |
+| 24.3 | Static regression guards (helper exists, both call sites use it, no inline cleanup) | PASS (all counts match expected) |
+
+**Bug fix value:** Before v0.2.14, every CT vzdump snapshot-mode backup left a stale `dm-multipath` + 4 `sd*` paths on the host. `multipathd` then logged "tur checker reports path is down" every ~2 seconds indefinitely for each dead WWID, accumulating across backups. After v0.2.14, host devices are torn down synchronously as part of `volume_snapshot_delete`.
+
+**Lesson (added to CLAUDE.md):** Every test that covers a delete-on-ONTAP path MUST include host-side device assertions. ONTAP-only assertions are insufficient — they don't catch host-side orphans, which are visible to operators within seconds via syslog. This applies to `free_image`, `volume_snapshot_delete`, `deactivate_volume`, future temp-clone reapers, and any new code that calls `lun_delete` or `volume_delete`.
+
+**Verdict:** Section 24 hardened tests all PASS. v0.2.14-1 ready for release.
+
+---
 
 ### v0.2.13-1 Snapshot Delete Cleanup Fix Release (2026-05-13)
 

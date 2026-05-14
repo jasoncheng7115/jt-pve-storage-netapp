@@ -1912,6 +1912,96 @@ sub _track_temp_clone {
     });
 }
 
+# Remove a temporary FlexClone: tears down host-side state (multipath
+# device, SCSI slaves, residual maps) AND removes the volume on ONTAP
+# via clone-split-then-delete. Mirrors the free_image() 7-step pattern.
+#
+# Reason for this helper: v0.2.13 introduced inline temp clone cleanup
+# in volume_snapshot_delete() that only handled the ONTAP side. After
+# delete, the host's dm-multipath + sd* devices were left orphaned --
+# multipathd then spammed "path is down" for the dead WWID indefinitely
+# (until manual `multipath -f`). The 1-hour TTL reaper in
+# _cleanup_temp_clones had the same gap. Both now route through here.
+#
+# Order matches free_image:
+#   1. Capture slave list BEFORE unmap (after unmap, multipath device
+#      may disappear and we lose the sd* names).
+#   2. unmap LUN from all igroups (prevents iSCSI rescan from
+#      re-discovering and re-creating devices).
+#   3. cleanup_lun_devices on the WWID (multipath flush + sd remove).
+#   4. Remove residual sd* using the captured list.
+#   5. multipath_reload to drop any stale maps.
+#   6. volume_clone_split on ONTAP (required: ONTAP only guarantees
+#      release of the parent snapshot's owner reference after split.
+#      Real FAS may clear it on plain volume_delete, simulator does
+#      not; split is the cross-platform-reliable mechanism).
+#   7. volume_wait_clone_split (bounded 300s timeout).
+#   8. volume_delete the now-independent volume.
+#
+# Dies on unrecoverable errors (split failure, wait timeout). Warns on
+# best-effort failures (lun_unmap, host cleanup, post-split delete).
+# Returns 1 on success.
+sub _remove_temp_clone {
+    my ($api, $temp_clone_name) = @_;
+
+    my $temp_lun_path = encode_lun_path($temp_clone_name);
+    my $temp_wwid = eval { $api->lun_get_wwid($temp_lun_path); };
+
+    # Step 1: capture slave list before any unmap (lose-able state)
+    my @scsi_slaves;
+    if ($temp_wwid) {
+        my $mpath = get_multipath_device($temp_wwid);
+        if ($mpath && -b $mpath) {
+            my $slaves = get_multipath_slaves($mpath);
+            @scsi_slaves = @$slaves if $slaves;
+        }
+    }
+
+    # Step 2: unmap from all igroups (cluster-wide, mirrors free_image)
+    eval { $api->lun_unmap_all($temp_lun_path); };
+    warn "lun_unmap_all on temp clone '$temp_clone_name' failed: $@" if $@;
+
+    # Steps 3-5: local kernel state cleanup
+    if ($temp_wwid) {
+        eval { cleanup_lun_devices($temp_wwid); };
+        warn "cleanup_lun_devices for temp clone '$temp_clone_name' failed: $@" if $@;
+
+        for my $slave (@scsi_slaves) {
+            if (-b $slave) {
+                eval { remove_scsi_device($slave); };
+            }
+        }
+
+        eval { multipath_reload(); };
+    }
+
+    # Step 6: split clone -- the ONTAP-guaranteed owner-release mechanism
+    eval { $api->volume_clone_split($temp_clone_name); };
+    if ($@) {
+        die "volume_clone_split on temp clone '$temp_clone_name' failed: $@";
+    }
+
+    # Step 7: bounded wait (300s is generous; vzdump temp clones with
+    # zero unique blocks split in seconds, qm-clone temp clones may take
+    # longer if heavily modified -- still bounded)
+    eval { $api->volume_wait_clone_split($temp_clone_name, timeout => 300); };
+    if ($@) {
+        die "Clone split for '$temp_clone_name' did not complete within 300s: $@";
+    }
+
+    # Step 8: delete the now-independent volume (no owner blocking)
+    eval { $api->volume_delete($temp_clone_name); };
+    if ($@) {
+        # Volume is already split -- snapshot owner is released so any
+        # snapshot_delete after this still works. Leave the orphan
+        # volume for next TTL pass; don't fail the caller.
+        warn "Post-split volume_delete of '$temp_clone_name' failed "
+           . "(orphan left behind, will be retried by TTL cleanup): $@";
+    }
+
+    return 1;
+}
+
 sub _cleanup_temp_clones {
     my ($api, $storeid) = @_;
 
@@ -1925,15 +2015,13 @@ sub _cleanup_temp_clones {
             my $created = $storage_clones->{$clone_name};
             if ($now - $created > $TEMP_CLONE_MAX_AGE) {
                 warn "Cleaning up old temporary FlexClone: $clone_name\n";
-                eval {
-                    # Unmap LUN and delete volume
-                    my $lun_path = encode_lun_path($clone_name);
-                    eval { $api->lun_unmap_all($lun_path); };
-                    $api->volume_delete($clone_name);
+                eval { _remove_temp_clone($api, $clone_name); };
+                if ($@) {
+                    warn "Failed to cleanup temp clone '$clone_name': $@\n";
+                } else {
                     delete $storage_clones->{$clone_name};
                     $cleaned++;
-                };
-                warn "Failed to cleanup temp clone '$clone_name': $@\n" if $@;
+                }
             }
         }
 
@@ -2189,52 +2277,18 @@ sub volume_snapshot_delete {
         warn "Detaching temporary FlexClone '$temp_clone_name' from "
            . "snapshot '$ontap_snapname' before snapshot delete\n";
 
-        # ONTAP snapshot deletion rejects when the snapshot has owners
-        # (the FlexClone). Two ways to release the owner reference:
-        #
-        # (1) `volume_delete` the clone. Real FAS clears the
-        #     `volume_clone_dependent` owner shortly after delete, but
-        #     the ONTAP simulator keeps the marker indefinitely. Field
-        #     behaviour varies by ONTAP version and platform.
-        # (2) `volume_clone_split` the clone. ONTAP guarantees the
-        #     parent snapshot's owner reference is released once the
-        #     split job completes, on every platform (real and sim).
-        #
-        # We use (2) for predictability. Cost: the split job copies the
-        # clone's unique blocks. For temp clones created in this same
-        # operation (vzdump read-only snapshot access) this is fast --
-        # the clone has no writes, only reads. For temp clones from
-        # `qm clone --full --snapname`, the cost is bounded by the
-        # delta written into the clone (usually small or zero by the
-        # time snapshot_delete is called).
-        if ($temp_wwid) {
-            eval { $api->lun_unmap_all($temp_lun_path); };
-            warn "lun_unmap_all on temp clone failed: $@" if $@;
-        }
-
-        eval { $api->volume_clone_split($temp_clone_name); };
+        # Route through the shared helper. _remove_temp_clone:
+        #  - Captures slave list BEFORE unmap (so we can clean sd*)
+        #  - Unmaps LUN from all igroups
+        #  - cleanup_lun_devices + remove_scsi_device + multipath_reload
+        #    (HOST-side cleanup; was missing in initial v0.2.13 patch
+        #    and produced "tur checker reports path is down" spam after
+        #    every backup -- fixed in v0.2.14)
+        #  - volume_clone_split + wait + volume_delete on ONTAP
+        # Dies on unrecoverable failure (split error / timeout).
+        eval { _remove_temp_clone($api, $temp_clone_name); };
         if ($@) {
-            die "Cannot delete snapshot '$snap': volume_clone_split on "
-              . "temp clone '$temp_clone_name' failed: $@";
-        }
-
-        # Bounded wait. 5 minutes is generous for any reasonable temp
-        # clone size; if it takes longer something is wrong with ONTAP.
-        eval { $api->volume_wait_clone_split($temp_clone_name, timeout => 300); };
-        if ($@) {
-            die "Cannot delete snapshot '$snap': clone split for "
-              . "'$temp_clone_name' did not complete within 300s: $@";
-        }
-
-        # Delete the now-independent volume.
-        eval { $api->volume_delete($temp_clone_name); };
-        if ($@) {
-            # Volume is split but delete failed -- log and continue.
-            # The orphan volume will be left for operator cleanup or
-            # next vzdump cycle. Don't fail the whole snapshot_delete
-            # since the lock has already been released by the split.
-            warn "Post-split volume_delete of '$temp_clone_name' failed "
-               . "(orphan left behind): $@";
+            die "Cannot delete snapshot '$snap': $@";
         }
 
         # Untrack from local state file (best effort; tmpfs may have

@@ -1420,6 +1420,134 @@ grep -A 30 '^sub volume_snapshot_delete' "$P" | grep -cE '\$api->volume_clone_sp
 
 ---
 
+## 25. 跨儲存孤兒偵測(v0.2.15)
+
+驗證 `_cleanup_orphaned_devices()` 的 second-pass 偵測不會把同類型(netappontap)的姊妹 storage 所持有的 WWID 誤判為孤兒。客戶現場事件(2026-05):同一台 PVE 節點同時掛了 `netappASA` + `netappFAS_Node2`,plugin 持續印 cluster-wide warning,建議對「健康的、姊妹 storage 持有的 LUN」執行 `multipathd disablequeueing map <wwid>` / `multipath -f <wwid>`。操作員若照做會拆掉跑著的 VM 磁碟。
+
+**規則(已記入 CLAUDE.md):** 任何「比對 host 上 NETAPP 多重路徑設備 vs 單一 storage tracking」的邏輯,**必須**同時排除同節點上其他 netappontap storage 所追蹤的 WWID。
+
+### 25.1 重現 + 驗證 fix(直接 API)
+
+前置:同一個 SVM(或不同 SVM 都可)上配置兩個 netappontap storage,各自有至少一個已配置的 LUN。
+
+```bash
+# (前置)加第二個 netappontap storage
+pvesm add netappontap netapp2 \
+    --ontap-portal <mgmt-ip> --ontap-svm <svm> --ontap-aggregate <aggr> \
+    --ontap-username admin --ontap-password '<pass>' \
+    --ontap-ssl-verify 0 --content images
+
+# (前置)兩邊各 alloc 一顆 disk,讓 host 上有對應 multipath device
+pvesm alloc netapp1 9001 vm-9001-disk-0 256M
+pvesm alloc netapp2 9998 vm-9998-disk-0 256M
+pvesm path netapp1:vm-9001-disk-0
+pvesm path netapp2:vm-9998-disk-0
+multipath -ll | grep -c NETAPP      # >= 2
+
+# (重置 cooldown)清掉 orphan-warn flag,讓 warning 能重新觸發
+rm -f /var/run/pve-storage-netapp/orphan-warn-*
+
+# (測試)pre-fix vs post-fix 對照
+cat > /tmp/test_section25.pl <<'EOF'
+#!/usr/bin/perl
+use strict; use warnings;
+use lib "/usr/share/perl5";
+use PVE::Storage;
+use PVE::Storage::Custom::NetAppONTAPPlugin;
+use PVE::Storage::Custom::NetAppONTAP::Multipath qw(list_netapp_multipath_devices);
+
+my $netapp_devs = list_netapp_multipath_devices();
+my $exit = 0;
+for my $storeid (qw(netapp1 netapp2)) {
+    my $scfg = PVE::Storage::config()->{ids}->{$storeid};
+    my $api = PVE::Storage::Custom::NetAppONTAPPlugin::_get_api($scfg);
+    my $san = $storeid; $san =~ s/-/_/g;
+    my $luns = $api->lun_list("/vol/pve_${san}_*/lun0");
+    my %alive;
+    for my $l (@$luns) {
+        my $w = $api->lun_get_wwid($l->{name});
+        $alive{lc $w} = 1 if $w;
+    }
+    my $tracked = PVE::Storage::Custom::NetAppONTAPPlugin::_read_wwid_state($storeid) // {};
+
+    # PRE-FIX 模擬
+    my @prefix_flagged = grep {
+        my $w = lc $_->{wwid};
+        !$alive{$w} && !$tracked->{$w};
+    } @$netapp_devs;
+
+    # POST-FIX 模擬(額外排除姊妹 storage)
+    my %other_plugin_wwid;
+    for my $other (keys %{PVE::Storage::config()->{ids}}) {
+        next if $other eq $storeid;
+        my $os = PVE::Storage::config()->{ids}->{$other};
+        next unless $os && ($os->{type} // "") eq "netappontap";
+        my $ot = PVE::Storage::Custom::NetAppONTAPPlugin::_read_wwid_state($other) // {};
+        $other_plugin_wwid{lc $_} = 1 for keys %$ot;
+    }
+    my @postfix_flagged = grep {
+        my $w = lc $_->{wwid};
+        !$alive{$w} && !$tracked->{$w} && !$other_plugin_wwid{$w};
+    } @$netapp_devs;
+
+    printf "%s: PRE-FIX would flag %d, POST-FIX flags %d\n",
+        $storeid, scalar(@prefix_flagged), scalar(@postfix_flagged);
+    if (@postfix_flagged) {
+        print "  FAIL: 此受控場景下 post-fix 應為 0\n";
+        $exit = 1;
+    }
+}
+exit $exit;
+EOF
+perl /tmp/test_section25.pl
+```
+
+**預期結果:**
+- `netapp1: PRE-FIX would flag 1, POST-FIX flags 0`(那 1 個就是 netapp2 的 LUN,被正確排除)
+- `netapp2: PRE-FIX would flag 3, POST-FIX flags 0`(那 3 個是 netapp1 的 LUN,被正確排除)
+- Exit code 0
+
+### 25.2 透過 plugin 實際程式碼路徑驗證
+
+```bash
+# 捕捉真實生產 code path 印出的 warning
+perl -I/usr/share/perl5 -e '
+use PVE::Storage; use PVE::Storage::Custom::NetAppONTAPPlugin;
+my @captured;
+local $SIG{__WARN__} = sub { push @captured, $_[0]; };
+for my $storeid (qw(netapp1 netapp2)) {
+    my $scfg = PVE::Storage::config()->{ids}->{$storeid} or next;
+    my $api = PVE::Storage::Custom::NetAppONTAPPlugin::_get_api($scfg);
+    @captured = ();
+    PVE::Storage::Custom::NetAppONTAPPlugin::_cleanup_orphaned_devices($api, $storeid);
+    my $orphan_warns = grep { /multipath -f/ } @captured;
+    printf "%s: %d 個孤兒警告\n", $storeid, $orphan_warns;
+}
+'
+```
+
+**預期結果:** 兩個 storage 都報 0 個孤兒警告(務必先清 cooldown flag,否則會被冷卻機制壓抑)。
+
+### 25.3 靜態 regression 守則
+
+```bash
+P=lib/PVE/Storage/Custom/NetAppONTAPPlugin.pm
+
+# 修正必須引用姊妹 storage WWID
+grep -A 80 '^sub _cleanup_orphaned_devices' "$P" | grep -c 'other_plugin_wwid'
+# 預期: >= 3(宣告 + 填充 + 檢查)
+
+# 必須遍歷 config 找姊妹 netappontap storage
+grep -A 80 '^sub _cleanup_orphaned_devices' "$P" | grep -c 'PVE::Storage::config'
+# 預期: >= 1
+
+# 必須對其他 storeid 呼叫 _read_wwid_state
+grep -A 80 '^sub _cleanup_orphaned_devices' "$P" | grep -c '_read_wwid_state.*other_storeid'
+# 預期: >= 1
+```
+
+---
+
 ## 清除
 
 ```bash
@@ -1439,6 +1567,42 @@ pvesm list $STORAGE
 ## 發佈測試結果
 
 每次發佈前都必須通過上述所有測試。結果記錄如下。
+
+### v0.2.15-1 跨儲存孤兒偵測修正 Release (2026-05-24)
+
+**範圍:** Section 25(新增:跨儲存孤兒偵測)+ Section 1 regression + Section 24 regression。
+
+**環境:** 單節點測試於 `pc-pve3`(PVE 9.1,部署 0.2.15-1)。ONTAP simulator。**配置兩個 netappontap storage(`netapp1` + 新加的 `netapp2`)**指向同一個 SVM,各自有 LUN — 忠實重現客戶的 multi-storage 情境。
+
+#### Section 25: 跨儲存孤兒偵測
+
+| 斷言 | 結果 |
+|---|---|
+| 25.1 PRE-FIX 模擬:netapp1 cleanup 會誤報 1 個 WWID(netapp2 的 d61) | PASS(false-positive 重現確認) |
+| 25.1 PRE-FIX 模擬:netapp2 cleanup 會誤報 3 個 WWID(netapp1 的 d58/d59/d5a) | PASS(false-positive 重現確認) |
+| 25.1 POST-FIX:netapp1 cleanup 0 個誤報 | **PASS**(fix 完全消除誤報) |
+| 25.1 POST-FIX:netapp2 cleanup 0 個誤報 | **PASS**(fix 完全消除誤報) |
+| 25.2 Plugin 實際程式碼路徑:每個 storage 0 個孤兒警告 | PASS |
+| 25.3 靜態守則(other_plugin_wwid、PVE::Storage::config、對 other_storeid 呼叫 _read_wwid_state) | PASS |
+
+**Bug 修正價值:** 客戶現場 cluster-wide 每小時對約 120 個 WWID 持續吐警告。每條都建議跑破壞性 `multipath -f <wwid>`。操作員若照做會拆掉跑著的 VM 磁碟。v0.2.15 之後在 multi-storage 情境下誤報歸零。
+
+#### Regression: 過往 Release Section 24(temp clone 清理,v0.2.14)+ Section 1(基本連線)
+
+| # | 測試 | 結果 |
+|---|------|------|
+| 1 | netapp1 在 pvesm status active | PASS |
+| 1 | netapp2 在 pvesm status active | PASS |
+| 1 | iSCSI sessions ≥ 2 | PASS |
+| 24 | snapshot_delete with temp clone(ONTAP + host 清理) | PASS(無 regression) |
+
+**備註:**
+- Simulator 上殘留的 `tmpclone_pve_netapp1_9997_disk0_pve_snap_splittest` 仍會讓 v0.2.14 背景 reaper 持續印「Failed to cleanup」警告(因為對應的 parent volume 已不在了,helper 在 volume_clone_split 時 die)。與 v0.2.15 無關;`/var/run` 在下次重開機後會自動清。**不在本次 fix 範圍**。
+- ONTAP simulator 的 stale clone metadata quirk 從先前測試留下,不影響 v0.2.15 驗證。
+
+**結論:** Section 25 全部通過,Section 1 與 Section 24 regression 也通過。v0.2.15-1 可發佈。
+
+---
 
 ### v0.2.14-1 Temp Clone Host 端清理修正 Release (2026-05-14)
 

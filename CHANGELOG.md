@@ -2,6 +2,36 @@
 
 All notable changes to the NetApp ONTAP Storage Plugin for Proxmox VE are documented here.
 
+## [0.2.15] - 2026-05-24
+
+### Cross-Storage Orphan Detection Fix Release
+
+**Bug Fix (production incident, customer report 2026-05-21~23):**
+
+- **`_cleanup_orphaned_devices()` no longer false-positive flags sibling netappontap storages' WWIDs as orphans.** Customer's `pvestatd` journal showed repeated cluster-wide warnings on every node:
+  ```
+  Orphan cleanup: detected N untracked NETAPP multipath device(s) that may be stale.
+  Plugin will NOT auto-clean these (risk of touching manually-managed storage).
+  If you confirm they are NOT in use, clean manually:
+    multipathd disablequeueing map <wwid>
+    dmsetup message <wwid> 0 fail_if_no_path
+    multipath -f <wwid>
+  (This warning repeats at most once per hour per device.)
+  ```
+  But running the full plugin/ONTAP audit revealed all flagged WWIDs were healthy plugin-managed LUNs in the customer's OTHER netappontap storage (customer had `netappASA` + `netappFAS_Node2` on the same PVE nodes). If the operator followed the suggested manual cleanup, they would have torn down active VM disks from the sibling storage.
+- Root cause: `list_netapp_multipath_devices()` returns ALL devices with vendor=NETAPP on the host — no per-storage filter. `_cleanup_orphaned_devices()` is called per-storage by `status()`. The second-pass detection compared host-wide NETAPP devices against ONE storage's tracking + ONTAP alive set; sibling storages' WWIDs satisfied "in neither" and got flagged.
+- Fix: before flagging, build a union of WWIDs tracked by ANY OTHER netappontap storage (iterates `PVE::Storage::config()` to find sibling netappontap storeids and reads their tracking JSON). WWIDs found there are skipped — they belong to a sibling storage whose own cleanup handles its own orphans.
+
+**Affected scenarios** (when bug manifested):
+
+- Any PVE node with two or more configured `netappontap` storages — extremely common in production (customer separates VM disks across ASA and FAS for tiered performance).
+- Warnings rate-limited to once per WWID per hour per node, but with 100+ WWIDs spread across both storages the journal still accumulated dozens of false alarms per hour cluster-wide.
+
+**Not changed** (preserved by the fix):
+
+- Real orphan detection still works: a WWID that is NOT in ANY plugin storage's tracking AND has all paths failed will still be flagged for manual cleanup.
+- Per-storage cleanup runs independently — each storage still handles its own orphans via the first-pass tracked-vs-alive comparison.
+
 ## [0.2.14] - 2026-05-14
 
 ### Temp Clone Host-side Cleanup Release

@@ -1808,6 +1808,134 @@ grep -A 30 '^sub volume_snapshot_delete' "$P" | grep -cE '\$api->volume_clone_sp
 
 ---
 
+## 25. Cross-Storage Orphan Detection (v0.2.15)
+
+Verifies that `_cleanup_orphaned_devices()`'s second-pass detection does NOT falsely flag WWIDs owned by sibling netappontap storages as orphans. Customer field incident (2026-05): customer had `netappASA` + `netappFAS_Node2` on the same PVE node. Plugin's orphan cleanup printed cooldown-rate-limited cluster-wide warnings suggesting `multipathd disablequeueing map <wwid>` / `multipath -f <wwid>` for WWIDs that were perfectly healthy plugin-managed LUNs in the SIBLING storage. If the operator followed those suggestions, they would tear down active VM disks.
+
+**Rule (added to CLAUDE.md):** any logic that compares "host-wide NETAPP multipath devices" against a single storage's tracking MUST also exclude WWIDs tracked by sibling netappontap storages on the same node.
+
+### 25.1 Reproduce + verify fix (direct API)
+
+Setup: two netappontap storages on the same SVM (or different SVMs, doesn't matter), each with at least one allocated LUN.
+
+```bash
+# (Setup) Add a second netappontap storage pointing to the same SVM
+pvesm add netappontap netapp2 \
+    --ontap-portal <mgmt-ip> --ontap-svm <svm> --ontap-aggregate <aggr> \
+    --ontap-username admin --ontap-password '<pass>' \
+    --ontap-ssl-verify 0 --content images
+
+# (Setup) Alloc one disk in each storage to materialise multipath devices
+pvesm alloc netapp1 9001 vm-9001-disk-0 256M
+pvesm alloc netapp2 9998 vm-9998-disk-0 256M
+pvesm path netapp1:vm-9001-disk-0   # triggers activation
+pvesm path netapp2:vm-9998-disk-0
+multipath -ll | grep -c NETAPP      # >= 2
+
+# (Reset cooldown) Clear orphan-warn flag files so warnings would fire fresh
+rm -f /var/run/pve-storage-netapp/orphan-warn-*
+
+# (Test) Run pre-fix vs post-fix comparison
+cat > /tmp/test_section25.pl <<'EOF'
+#!/usr/bin/perl
+use strict; use warnings;
+use lib "/usr/share/perl5";
+use PVE::Storage;
+use PVE::Storage::Custom::NetAppONTAPPlugin;
+use PVE::Storage::Custom::NetAppONTAP::Multipath qw(list_netapp_multipath_devices);
+
+my $netapp_devs = list_netapp_multipath_devices();
+my $exit = 0;
+for my $storeid (qw(netapp1 netapp2)) {
+    my $scfg = PVE::Storage::config()->{ids}->{$storeid};
+    my $api = PVE::Storage::Custom::NetAppONTAPPlugin::_get_api($scfg);
+    my $san = $storeid; $san =~ s/-/_/g;
+    my $luns = $api->lun_list("/vol/pve_${san}_*/lun0");
+    my %alive;
+    for my $l (@$luns) {
+        my $w = $api->lun_get_wwid($l->{name});
+        $alive{lc $w} = 1 if $w;
+    }
+    my $tracked = PVE::Storage::Custom::NetAppONTAPPlugin::_read_wwid_state($storeid) // {};
+
+    # PRE-FIX simulation
+    my @prefix_flagged = grep {
+        my $w = lc $_->{wwid};
+        !$alive{$w} && !$tracked->{$w};
+    } @$netapp_devs;
+
+    # POST-FIX simulation (also excludes siblings)
+    my %other_plugin_wwid;
+    for my $other (keys %{PVE::Storage::config()->{ids}}) {
+        next if $other eq $storeid;
+        my $os = PVE::Storage::config()->{ids}->{$other};
+        next unless $os && ($os->{type} // "") eq "netappontap";
+        my $ot = PVE::Storage::Custom::NetAppONTAPPlugin::_read_wwid_state($other) // {};
+        $other_plugin_wwid{lc $_} = 1 for keys %$ot;
+    }
+    my @postfix_flagged = grep {
+        my $w = lc $_->{wwid};
+        !$alive{$w} && !$tracked->{$w} && !$other_plugin_wwid{$w};
+    } @$netapp_devs;
+
+    printf "%s: PRE-FIX would flag %d, POST-FIX flags %d\n",
+        $storeid, scalar(@prefix_flagged), scalar(@postfix_flagged);
+    if (@postfix_flagged) {
+        print "  FAIL: post-fix should be 0 in this controlled scenario\n";
+        $exit = 1;
+    }
+}
+exit $exit;
+EOF
+perl /tmp/test_section25.pl
+```
+
+**Expected:**
+- `netapp1: PRE-FIX would flag 1, POST-FIX flags 0` (the 1 is netapp2's LUN, now correctly filtered)
+- `netapp2: PRE-FIX would flag 3, POST-FIX flags 0` (the 3 are netapp1's LUNs, now correctly filtered)
+- Exit code 0
+
+### 25.2 Live verification via plugin's own cleanup
+
+```bash
+# Capture warnings emitted by the actual production code path
+perl -I/usr/share/perl5 -e '
+use PVE::Storage; use PVE::Storage::Custom::NetAppONTAPPlugin;
+my @captured;
+local $SIG{__WARN__} = sub { push @captured, $_[0]; };
+for my $storeid (qw(netapp1 netapp2)) {
+    my $scfg = PVE::Storage::config()->{ids}->{$storeid} or next;
+    my $api = PVE::Storage::Custom::NetAppONTAPPlugin::_get_api($scfg);
+    @captured = ();
+    PVE::Storage::Custom::NetAppONTAPPlugin::_cleanup_orphaned_devices($api, $storeid);
+    my $orphan_warns = grep { /multipath -f/ } @captured;
+    printf "%s: %d orphan warning(s)\n", $storeid, $orphan_warns;
+}
+'
+```
+
+**Expected:** both storages report 0 orphan warnings (the orphan-warn cooldown flags must be cleared before running, otherwise warnings may be suppressed by cooldown).
+
+### 25.3 Static regression guards
+
+```bash
+P=lib/PVE/Storage/Custom/NetAppONTAPPlugin.pm
+
+# The fix must reference sibling-storage WWIDs
+grep -A 80 '^sub _cleanup_orphaned_devices' "$P" | grep -c 'other_plugin_wwid'
+# Expected: >= 3 (declare + populate + check)
+
+# Must iterate config to find sibling netappontap storages
+grep -A 80 '^sub _cleanup_orphaned_devices' "$P" | grep -c 'PVE::Storage::config'
+# Expected: >= 1
+
+# Must call _read_wwid_state on the OTHER storeid
+grep -A 80 '^sub _cleanup_orphaned_devices' "$P" | grep -c '_read_wwid_state.*other_storeid'
+# Expected: >= 1
+```
+
+---
+
 ## Cleanup
 
 ```bash
@@ -1827,6 +1955,42 @@ pvesm list $STORAGE
 ## Release Test Results
 
 Each release must pass all tests above before publishing. Results are recorded below.
+
+### v0.2.15-1 Cross-Storage Orphan Detection Fix Release (2026-05-24)
+
+**Scope:** Section 25 (new: cross-storage orphan detection) + Section 1 regression + Section 24 regression.
+
+**Environment:** Single-node test on `pc-pve3` (PVE 9.1, 0.2.15-1 deployed). ONTAP simulator. **Two netappontap storages configured (`netapp1` + newly-added `netapp2`)** both pointing to the same SVM, each with allocated LUNs — to faithfully reproduce the customer's multi-storage scenario.
+
+#### Section 25: Cross-storage orphan detection
+
+| Assertion | Result |
+|-----------|--------|
+| 25.1 PRE-FIX simulation: netapp1 cleanup would flag 1 WWID (netapp2's d61) | PASS (false-positive confirmed reproducible) |
+| 25.1 PRE-FIX simulation: netapp2 cleanup would flag 3 WWIDs (netapp1's d58/d59/d5a) | PASS (false-positive confirmed reproducible) |
+| 25.1 POST-FIX: netapp1 cleanup flags 0 | **PASS** (fix eliminates false positives) |
+| 25.1 POST-FIX: netapp2 cleanup flags 0 | **PASS** (fix eliminates false positives) |
+| 25.2 Live plugin cleanup: 0 orphan warnings per storage | PASS |
+| 25.3 Static guards (other_plugin_wwid, PVE::Storage::config, _read_wwid_state on other_storeid) | PASS |
+
+**Bug fix value:** Customer reported cluster-wide repeating warnings every hour for ~120 WWIDs (combined). Each warning suggested destructive `multipath -f <wwid>` commands. Operator following the suggestions would have torn down active VM disks. After v0.2.15, false-positive warnings drop to zero in the multi-storage scenario.
+
+#### Regression: prior releases' Section 24 (temp clone cleanup, v0.2.14) + Section 1 (basic connectivity)
+
+| # | Test | Result |
+|---|------|--------|
+| 1 | netapp1 active in pvesm status | PASS |
+| 1 | netapp2 active in pvesm status | PASS |
+| 1 | iSCSI sessions ≥ 2 | PASS |
+| 24 | snapshot_delete with temp clone (ONTAP + host cleanup) | PASS (no regression) |
+
+**Notes:**
+- Pre-existing leftover state on simulator: an old `tmpclone_pve_netapp1_9997_disk0_pve_snap_splittest` entry in tracking file kept generating "Failed to cleanup" warnings (from the v0.2.14 background reaper, which dies on missing parent volume). Unrelated to v0.2.15; will be cleaned at next reboot when tmpfs `/var/run` wipes. Not a fix scope.
+- ONTAP simulator's stale-clone-metadata quirk persists from earlier testing; doesn't affect v0.2.15 verification.
+
+**Verdict:** All Section 25 tests PASS, Section 1 and Section 24 regression PASS. v0.2.15-1 ready for release.
+
+---
 
 ### v0.2.14-1 Temp Clone Host-side Cleanup Release (2026-05-14)
 

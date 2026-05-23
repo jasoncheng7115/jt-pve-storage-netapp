@@ -2,6 +2,36 @@
 
 NetApp ONTAP Storage Plugin for Proxmox VE 的所有重要變更都記錄在此。
 
+## [0.2.15] - 2026-05-24
+
+### 跨儲存孤兒偵測修正 Release
+
+**Bug 修正(正式環境事件,2026-05-21~23 客戶回報):**
+
+- **`_cleanup_orphaned_devices()` 不再把姊妹 netappontap storage 的 WWID 誤判為孤兒。** 客戶現場每個 cluster 節點的 pvestatd journal 都出現重複的 cluster-wide 警告:
+  ```
+  Orphan cleanup: detected N untracked NETAPP multipath device(s) that may be stale.
+  Plugin will NOT auto-clean these (risk of touching manually-managed storage).
+  If you confirm they are NOT in use, clean manually:
+    multipathd disablequeueing map <wwid>
+    dmsetup message <wwid> 0 fail_if_no_path
+    multipath -f <wwid>
+  (This warning repeats at most once per hour per device.)
+  ```
+  但跑完整 plugin/ONTAP audit 證實:警告列出的 WWID **全部都是健康的、被 plugin 正常管理的 LUN**,只是它們屬於客戶**另一個** netappontap storage(客戶同節點同時掛了 `netappASA` + `netappFAS_Node2`)。如果操作員照警告手動清,會直接拆掉姊妹 storage 上跑著的 VM 磁碟。
+- 根本原因:`list_netapp_multipath_devices()` 回傳 host 上**所有** vendor=NETAPP 的設備,沒按 storage 過濾。`_cleanup_orphaned_devices()` 是 per-storage 跑的,second-pass 偵測在比對「host 全體 NETAPP 設備 vs 單一 storage 的 tracking + ONTAP alive 清單」,姊妹 storage 的 WWID 既不在 alive 也不在 tracking,就被誤判為孤兒。
+- 修法:旗標前,先建一份「**其他任何** netappontap storage 所追蹤的 WWID 聯集」(透過 `PVE::Storage::config()` 找出其他 netappontap storeid,讀它們的 tracking JSON),命中聯集的 WWID 跳過 — 屬於姊妹 storage,由它自己的 cleanup 負責。
+
+**會中招的情境**(這 bug 顯現的條件):
+
+- 任一 PVE 節點掛了兩個以上 netappontap storage — **正式環境很常見**(客戶會分 ASA + FAS 做分層儲存)。
+- 警告本身有「同 WWID 每節點每小時最多一次」的冷卻,但客戶兩邊加起來 100+ WWID,每小時叢集仍累積幾十條雜訊。
+
+**未改動**(被 fix 保留的正確行為):
+
+- 真正的孤兒偵測仍然有效:一個 WWID 若**不在任何** plugin storage 的 tracking 中,且所有 path 都失效,依然會被標示提示手動清。
+- 每個 storage 的 cleanup 仍各自獨立跑 — 各 storage 仍由自己的 first-pass(tracked vs alive 比對)處理自己的孤兒。
+
 ## [0.2.14] - 2026-05-14
 
 ### Temp Clone Host 端清理修正 Release

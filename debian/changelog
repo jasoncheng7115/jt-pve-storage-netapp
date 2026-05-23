@@ -1,3 +1,31 @@
+jt-pve-storage-netapp (0.2.15-1) stable; urgency=high
+
+  * Cross-Storage Orphan Detection Fix Release
+  * Requirements: Proxmox VE 9.1 or later
+  * Bug Fix (production incident, customer report 2026-05-21..23):
+    - _cleanup_orphaned_devices()'s second-pass scan used
+      list_netapp_multipath_devices() which returns ALL NETAPP vendor
+      multipath devices on the host with no per-storage filter. When
+      multiple netappontap storages are configured on the same PVE node
+      (e.g. customer with both netappASA and netappFAS_Node2 on the
+      same ONTAP cluster -- legitimate setup), each storage's cleanup
+      would falsely flag the OTHER storage's healthy LUNs as
+      "untracked orphans" and print suggested cleanup commands:
+        multipathd disablequeueing map <wwid>
+        dmsetup message <wwid> 0 fail_if_no_path
+        multipath -f <wwid>
+      An operator following those suggestions would tear down active
+      VM disks belonging to the sibling storage. Symptom: cluster-wide
+      cooldown-rate-limited warnings (one per WWID per hour per node)
+      that all referenced perfectly healthy plugin-managed LUNs.
+    - Fix: before flagging an untracked NETAPP device as orphan, build
+      a union of WWIDs tracked by any OTHER netappontap storage. If
+      the device's WWID is found there, skip with no warning -- it
+      belongs to a sibling storage and that storage's own cleanup
+      handles its own orphans.
+
+ -- Jason Cheng <jason@jason.tools>  Sat, 24 May 2026 16:00:00 +0800
+
 jt-pve-storage-netapp (0.2.14-1) stable; urgency=high
 
   * Temp Clone Host-side Cleanup Release

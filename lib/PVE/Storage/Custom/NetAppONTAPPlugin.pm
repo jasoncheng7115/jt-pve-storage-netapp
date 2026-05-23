@@ -935,13 +935,44 @@ sub _cleanup_orphaned_devices {
     # These could be pre-upgrade leftovers OR customer's manual storage that
     # happens to be in failed state. We do NOT auto-clean to avoid touching
     # customer's manual storage. Instead we list them with cleanup commands.
+    #
+    # Cross-storage cross-talk fix (v0.2.15): list_netapp_multipath_devices()
+    # returns ALL NETAPP vendor devices on host with no storage filter. When
+    # multiple netappontap storages are configured (e.g. customer with both
+    # netappASA and netappFAS_Node2 on the same PVE node), the per-storage
+    # cleanup loop would falsely flag the OTHER storage's legitimate LUNs as
+    # "untracked orphans". Symptoms: false-positive warnings like
+    # "multipathd disablequeueing map <wwid>" / "multipath -f <wwid>" for
+    # WWIDs that are perfectly healthy plugin-managed LUNs in a sibling
+    # storage. If the operator follows the suggested commands, they would
+    # tear down active VM disks. Fix: build a union of WWIDs tracked by any
+    # OTHER netappontap storage and treat them as "owned by another sibling
+    # storage; not our concern". Each storage's own cleanup still runs
+    # independently to handle its own orphans.
     eval {
+        my %other_plugin_wwid;
+        my $cfg = eval { PVE::Storage::config(); };
+        if ($cfg && $cfg->{ids}) {
+            for my $other_storeid (keys %{$cfg->{ids}}) {
+                next if $other_storeid eq $storeid;
+                my $other_scfg = $cfg->{ids}{$other_storeid};
+                next unless $other_scfg && ($other_scfg->{type} // '') eq 'netappontap';
+                # Read-only access to the sibling storage's tracking file.
+                # _read_wwid_state() does atomic-rename-aware reads so we
+                # don't need to hold the sibling's lock for a consistent
+                # snapshot.
+                my $other_tracked = eval { _read_wwid_state($other_storeid); } // {};
+                $other_plugin_wwid{lc($_)} = 1 for keys %$other_tracked;
+            }
+        }
+
         my $netapp_devs = list_netapp_multipath_devices();
         my @untracked;
         for my $dev (@$netapp_devs) {
             my $wwid = lc($dev->{wwid});
             next if $alive_wwids{$wwid};       # alive on ONTAP, leave alone
             next if $tracked->{$wwid};         # already handled in first pass
+            next if $other_plugin_wwid{$wwid}; # owned by sibling plugin storage
             push @untracked, $dev;
         }
         if (@untracked) {

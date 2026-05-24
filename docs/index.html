@@ -142,7 +142,7 @@
     <div class="hero__glow"></div>
     <div class="hero__glow-left"></div>
     <div class="hero__content">
-        <div class="hero__badge">v0.2.15 <span class="hero__badge-sep"></span> MIT License</div>
+        <div class="hero__badge">v0.2.16 <span class="hero__badge-sep"></span> MIT License</div>
         <h1 class="hero__title">jt-pve-storage-netapp</h1>
         <p class="hero__project-desc">
             <span class="lang-en">NetApp ONTAP SAN/iSCSI/FC Storage Plugin for Proxmox VE</span>
@@ -522,7 +522,7 @@
                 <span class="lang-en">Install the plugin package</span>
                 <span class="lang-zh">安裝 plugin 套件</span>
             </div>
-            <pre><span class="cmd">dpkg</span> <span class="flag">-i</span> jt-pve-storage-netapp_0.2.15-1_all.deb</pre>
+            <pre><span class="cmd">dpkg</span> <span class="flag">-i</span> jt-pve-storage-netapp_0.2.16-1_all.deb</pre>
             <p>
                 <span class="lang-en">The plugin automatically configures multipath and reloads Proxmox VE services (pvedaemon, pvestatd, pveproxy).</span>
                 <span class="lang-zh">Plugin 會自動設定 multipath 並重新載入 Proxmox VE 服務（pvedaemon、pvestatd、pveproxy）。</span>
@@ -596,7 +596,7 @@
                 <span class="lang-en">Install new package</span>
                 <span class="lang-zh">安裝新套件</span>
             </div>
-            <pre><span class="cmd">dpkg</span> <span class="flag">-i</span> jt-pve-storage-netapp_0.2.15-1_all.deb</pre>
+            <pre><span class="cmd">dpkg</span> <span class="flag">-i</span> jt-pve-storage-netapp_0.2.16-1_all.deb</pre>
         </div>
     </div>
     <div class="step">
@@ -1436,6 +1436,15 @@
         <span class="lang-en">Version history. For full details see <a href="https://github.com/jasoncheng7115/jt-pve-storage-netapp/blob/main/CHANGELOG.md">CHANGELOG.md</a>.</span>
         <span class="lang-zh">版本紀錄。完整內容請參閱 <a href="https://github.com/jasoncheng7115/jt-pve-storage-netapp/blob/main/CHANGELOG_zh-TW.md">CHANGELOG_zh-TW.md</a>。</span>
     </p>
+
+    <div class="changelog-entry">
+        <div class="changelog-version">v0.2.16 <span class="changelog-tag changelog-tag--fix">Fix</span></div>
+        <div class="changelog-date">2026-05-24</div>
+        <div class="changelog-summary">
+            <span class="lang-en">Temp Clone Reaper Idempotency. <code>_remove_temp_clone()</code> now returns success when the ONTAP volume is already absent at entry, instead of dying at <code>volume_clone_split</code>. Without this, a stale tracking entry would cause the TTL background reaper to retry every 10s and spam the journal forever with "Failed to cleanup temp clone ...: Volume not found". Stale entries get untracked on the first poll after upgrade; noise stops on the next cycle.</span>
+            <span class="lang-zh">Temp Clone 背景清理 idempotency 修正。<code>_remove_temp_clone()</code> 進入時若 ONTAP volume 已不存在,直接回成功而不在 <code>volume_clone_split</code> 階段 die。修正前,殘留 tracking entry 會讓 TTL 背景 reaper 每 10 秒重試一次到天荒地老,journal 持續吐「Failed to cleanup temp clone ...: Volume not found」。升級後第一次 poll 殘留 entry 就會被清掉,下個 cycle 起完全安靜。</span>
+        </div>
+    </div>
 
     <div class="changelog-entry">
         <div class="changelog-version">v0.2.15 <span class="changelog-tag changelog-tag--fix">Fix</span></div>

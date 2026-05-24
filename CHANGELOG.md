@@ -2,6 +2,32 @@
 
 All notable changes to the NetApp ONTAP Storage Plugin for Proxmox VE are documented here.
 
+## [0.2.16] - 2026-05-24
+
+### Temp Clone Reaper Idempotency Fix Release
+
+**Bug Fix (operational noise, found during v0.2.15 testing):**
+
+- **`_remove_temp_clone()` now detects "volume already absent on ONTAP" at entry and returns success**, instead of dying at the subsequent `volume_clone_split` call. Previously, a stale tracking entry whose ONTAP volume had been deleted out-of-band would cause the TTL background reaper (`_cleanup_temp_clones`) to retry every 10-second `status()` poll forever, spamming the journal with:
+  ```
+  Cleaning up old temporary FlexClone: tmpclone_<name>
+  Failed to cleanup temp clone '...': volume_clone_split on temp clone '...' failed:
+    Volume '...' not found at .../NetAppONTAPPlugin.pm line N.
+  ```
+  Without auto-recovery — the caller's `eval` caught the die but did NOT delete the state file entry (because cleanup hadn't actually completed), so the next poll retried with the same result. With the v0.2.16 fix, the helper returns success on the FIRST poll, the caller untracks the stale entry, and the noise stops on the next cycle.
+
+**How this scenario arises in production:**
+
+- Interrupted previous cleanup: `volume_delete` succeeded on ONTAP but the state-file untrack write didn't happen (crash, reboot mid-flight, etc.)
+- Cross-node race: another cluster node deleted the temp clone between our state read and our action
+- Manual ONTAP admin cleanup: someone removed the temp FlexClone out-of-band
+- Post-reboot weirdness: tmpfs `/var/run` survived but ONTAP-side cleanup completed before
+
+**Safety:**
+
+- Distinguishes confirmed "not found" (`volume_get` returns undef without error) from transient API errors (`volume_get` dies). Only the former triggers the skip; the latter propagates as `die` so we retry next cycle rather than silently leak a real clone.
+- Worst-case (impossible-but-considered): if `volume_get` returns undef erroneously while the volume actually exists, we'd skip cleanup and untrack — leaving an ONTAP orphan. But: temp clones are FlexClones with minimal unique blocks, and `_cleanup_orphaned_devices` would still flag any orphan multipath device on the host. Mitigated by `volume_get`'s clear contract (undef = no records returned by SVM).
+
 ## [0.2.15] - 2026-05-24
 
 ### Cross-Storage Orphan Detection Fix Release

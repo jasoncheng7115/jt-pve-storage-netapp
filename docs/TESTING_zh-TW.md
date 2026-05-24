@@ -1378,7 +1378,52 @@ vzdump 9000 --mode snapshot --storage <pbs-or-dump>
 # 0.2.13 之後:不應該再看到上述錯誤。確認 ONTAP 上沒有殘留 tmpclone_*。
 ```
 
-### 24.3 靜態 regression 守則
+### 24.3 ONTAP volume 已不存在時的 idempotent reaper(v0.2.16)
+
+驗證 `_remove_temp_clone()` 能處理「tracking entry 還在但 ONTAP volume 已不在」的情境,不會 die、不會 loop。正式環境會發生的情況:上次清理被中斷、跨節點 race、人工管理動作、重開機後狀態錯位等。
+
+```bash
+# 前置:手動植入一筆殘留 entry 到 state file,指向 ONTAP 上不存在的 volume
+echo '{"netapp1":{"tmpclone_pve_netapp1_doesnotexist_pve_snap_x":1000000000}}' \
+    > /var/run/pve-storage-netapp-temp-clones.json
+
+# 觸發一次 status() poll
+timeout 20 pvesm status 2>&1 | head -3
+
+# 預期輸出應有恰好一行:
+#   Temp clone 'tmpclone_pve_netapp1_doesnotexist_pve_snap_x' already absent
+#   on ONTAP; skipping ONTAP-side cleanup. Caller may untrack the stale entry.
+
+# 等背景 fork 完成
+sleep 5
+
+# 確認 state file 已清空(entry 已 untrack)
+cat /var/run/pve-storage-netapp-temp-clones.json
+# 預期: {"netapp1":{}}
+
+# 再跑一次 status() — 應該完全安靜,無警告
+timeout 20 pvesm status 2>&1 | grep -i "tmpclone\|cleanup" && echo FAIL || echo PASS
+```
+
+### 24.4 v0.2.16 靜態 regression 守則
+
+```bash
+P=lib/PVE/Storage/Custom/NetAppONTAPPlugin.pm
+
+# _remove_temp_clone 必須先檢查 volume 是否存在
+grep -A 30 '^sub _remove_temp_clone' "$P" | grep -c 'volume_get'
+# 預期:>= 1
+
+# 必須區分「not found」與 API 錯誤
+grep -A 30 '^sub _remove_temp_clone' "$P" | grep -c 'volume_get on temp clone'
+# 預期:1(transient error 的 die 訊息)
+
+# 確認 not-found 路徑回成功
+grep -A 35 '^sub _remove_temp_clone' "$P" | grep -c 'already absent on ONTAP'
+# 預期:1
+```
+
+### 24.5 既有靜態 regression 守則(v0.2.13/v0.2.14 守則)
 
 ```bash
 P=lib/PVE/Storage/Custom/NetAppONTAPPlugin.pm
@@ -1567,6 +1612,35 @@ pvesm list $STORAGE
 ## 發佈測試結果
 
 每次發佈前都必須通過上述所有測試。結果記錄如下。
+
+### v0.2.16-1 Temp Clone 背景清理 idempotency 修正 Release (2026-05-24)
+
+**範圍:** Section 24.3(新 idempotent reaper 測試)+ Section 24.4(新靜態守則)+ 完整 Tier 1 + Tier 2 regression + Section 25 regression。
+
+**環境:** `pc-pve3`(PVE 9.1,部署 0.2.16-1)。ONTAP simulator。兩個 netappontap storage(`netapp1` + `netapp2`)。
+
+#### Section 24.3(用 simulator 殘留實際觸發):
+
+Simulator 上有先前 v0.2.13 開發測試留下的真實殘留 entry:`tmpclone_pve_netapp1_9997_disk0_pve_snap_splittest` 在 state file 內,ONTAP 上 volume 早已被刪。v0.2.16 之前每次 `pvesm status` 都會印:
+```
+Cleaning up old temporary FlexClone: tmpclone_pve_netapp1_9997_disk0_pve_snap_splittest
+Failed to cleanup temp clone '...': volume_clone_split on temp clone '...' failed:
+  Volume '...' not found at .../NetAppONTAPPlugin.pm line N.
+```
+v0.2.16 部署後:
+1. 第一次 `pvesm status`:**唯一一行**「Temp clone '...' already absent on ONTAP; skipping ONTAP-side cleanup.」
+2. State file 已 untrack:`{"netapp1":{}}`(entry 消失)
+3. 第二次 `pvesm status`:**完全安靜**(沒有任何 temp clone 警告)
+
+**結論:** PASS — fix 如預期。
+
+#### 完整 Tier 1 + Tier 2 regression: 43/43 PASS(0 FAIL)
+
+Section 1 / 2 / 3 / 12 / 19.6 / 24(snapshot delete + temp clone cleanup)/ 靜態守則皆無 regression。
+
+**結論:** v0.2.16-1 可發佈。
+
+---
 
 ### v0.2.15-1 跨儲存孤兒偵測修正 Release (2026-05-24)
 

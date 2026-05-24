@@ -1975,6 +1975,40 @@ sub _track_temp_clone {
 sub _remove_temp_clone {
     my ($api, $temp_clone_name) = @_;
 
+    # Idempotency check (v0.2.16): if the volume is already absent on
+    # ONTAP, skip the ONTAP-side steps (which would die at
+    # volume_clone_split with "Volume not found") and return success so
+    # the caller can untrack the stale entry from local state.
+    #
+    # When this scenario arises:
+    #  - Interrupted previous cleanup (volume_delete succeeded but
+    #    state file write didn't happen)
+    #  - Cross-node race: another node deleted the clone between our
+    #    state read and our action
+    #  - Manual ONTAP cleanup by an admin
+    #  - Post-reboot state where tmpfs survived but ONTAP had already
+    #    been pruned
+    #
+    # Without this check the TTL background reaper retries every cycle
+    # and spams the journal -- one repeating "Failed to cleanup temp
+    # clone ...: Volume not found" line per dead entry per status()
+    # poll. Observed on the v0.2.14/v0.2.15 simulator after the v0.2.13
+    # development testing left a stale 9997_splittest entry.
+    #
+    # IMPORTANT: distinguish "confirmed not found" (volume_get returns
+    # undef, no error) from "transient API failure" (volume_get dies).
+    # Only the former should skip; the latter must propagate so we
+    # retry next cycle rather than silently leak a real clone.
+    my $exists = eval { $api->volume_get($temp_clone_name); };
+    if ($@) {
+        die "volume_get on temp clone '$temp_clone_name' failed: $@";
+    }
+    if (!$exists) {
+        warn "Temp clone '$temp_clone_name' already absent on ONTAP; "
+           . "skipping ONTAP-side cleanup. Caller may untrack the stale entry.\n";
+        return 1;
+    }
+
     my $temp_lun_path = encode_lun_path($temp_clone_name);
     my $temp_wwid = eval { $api->lun_get_wwid($temp_lun_path); };
 

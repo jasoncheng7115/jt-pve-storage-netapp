@@ -1,3 +1,24 @@
+jt-pve-storage-netapp (0.2.16-1) stable; urgency=medium
+
+  * Temp Clone Reaper Idempotency Fix Release
+  * Requirements: Proxmox VE 9.1 or later
+  * Bug Fix (operational noise, found during v0.2.15 testing):
+    - _remove_temp_clone() now detects "volume already absent on ONTAP"
+      at entry and returns success, instead of dying at the subsequent
+      volume_clone_split call. Previously, a stale tracking entry whose
+      ONTAP volume had been deleted out-of-band (interrupted cleanup,
+      cross-node race, manual admin action) would cause the TTL
+      background reaper to retry every status() poll forever and spam
+      the journal with "Failed to cleanup temp clone ...: Volume not
+      found" lines. With the fix, the helper returns success on the
+      first poll after the issue, the caller untracks the stale entry,
+      and the noise stops on the next cycle.
+    - Distinguishes confirmed "not found" (volume_get returns undef)
+      from transient API errors (volume_get dies) so real failures
+      still propagate for retry.
+
+ -- Jason Cheng <jason@jason.tools>  Sat, 24 May 2026 22:00:00 +0800
+
 jt-pve-storage-netapp (0.2.15-1) stable; urgency=high
 
   * Cross-Storage Orphan Detection Fix Release

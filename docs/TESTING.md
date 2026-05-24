@@ -1766,7 +1766,53 @@ vzdump 9000 --mode snapshot --storage <pbs-or-dump> --notes-template '{{guestnam
 # After v0.2.13: no such error. Verify no leftover tmpclone_* on ONTAP.
 ```
 
-### 24.3 Static regression guards
+### 24.3 Idempotent reaper on missing ONTAP volume (v0.2.16)
+
+Verifies that `_remove_temp_clone()` handles the "ONTAP volume already gone but tracking entry stale" scenario without dying / looping. Production scenarios: interrupted previous cleanup, cross-node race, manual admin cleanup, post-reboot inconsistency.
+
+```bash
+# Setup: manually inject a stale entry into the temp-clone state file
+# pointing at a volume that does NOT exist on ONTAP.
+echo '{"netapp1":{"tmpclone_pve_netapp1_doesnotexist_pve_snap_x":1000000000}}' \
+    > /var/run/pve-storage-netapp-temp-clones.json
+
+# Trigger one status() poll
+timeout 20 pvesm status 2>&1 | head -3
+
+# Expected output should include exactly ONE line like:
+#   Temp clone 'tmpclone_pve_netapp1_doesnotexist_pve_snap_x' already absent
+#   on ONTAP; skipping ONTAP-side cleanup. Caller may untrack the stale entry.
+
+# Wait for background fork to complete
+sleep 5
+
+# Verify state file is now empty (entry was untracked)
+cat /var/run/pve-storage-netapp-temp-clones.json
+# Expected: {"netapp1":{}}
+
+# Run status() again — should be COMPLETELY QUIET, no warnings
+timeout 20 pvesm status 2>&1 | grep -i "tmpclone\|cleanup" && echo FAIL || echo PASS
+```
+
+### 24.4 Static regression guards for v0.2.16
+
+```bash
+P=lib/PVE/Storage/Custom/NetAppONTAPPlugin.pm
+
+# _remove_temp_clone must check volume existence first
+grep -A 30 '^sub _remove_temp_clone' "$P" | grep -c 'volume_get'
+# Expected: >= 1
+
+# Must distinguish "not found" from API errors
+grep -A 30 '^sub _remove_temp_clone' "$P" | grep -c 'volume_get on temp clone'
+# Expected: 1 (the die message for transient errors)
+
+# Must return success on confirmed not-found path
+grep -A 35 '^sub _remove_temp_clone' "$P" | grep -c 'already absent on ONTAP'
+# Expected: 1
+```
+
+### 24.5 Static regression guards (original v0.2.13/v0.2.14 guards)
 
 ```bash
 P=lib/PVE/Storage/Custom/NetAppONTAPPlugin.pm
@@ -1955,6 +2001,35 @@ pvesm list $STORAGE
 ## Release Test Results
 
 Each release must pass all tests above before publishing. Results are recorded below.
+
+### v0.2.16-1 Temp Clone Reaper Idempotency Fix Release (2026-05-24)
+
+**Scope:** Section 24.3 (new idempotent reaper test) + Section 24.4 (new static guards) + full Tier 1 + Tier 2 regression + Section 25 regression.
+
+**Environment:** `pc-pve3` (PVE 9.1, 0.2.16-1 deployed). ONTAP simulator. Two netappontap storages (`netapp1` + `netapp2`).
+
+#### Section 24.3 (live trigger via leftover state):
+
+Simulator had a real stale entry from prior v0.2.13 development testing: `tmpclone_pve_netapp1_9997_disk0_pve_snap_splittest` in state file, ONTAP volume long since gone. Pre-v0.2.16 every `pvesm status` printed:
+```
+Cleaning up old temporary FlexClone: tmpclone_pve_netapp1_9997_disk0_pve_snap_splittest
+Failed to cleanup temp clone '...': volume_clone_split on temp clone '...' failed:
+  Volume '...' not found at .../NetAppONTAPPlugin.pm line N.
+```
+Post-v0.2.16 deploy:
+1. First `pvesm status` after install: ONE line "Temp clone '...' already absent on ONTAP; skipping ONTAP-side cleanup."
+2. State file untracked: `{"netapp1":{}}` (entry gone)
+3. Second `pvesm status`: COMPLETELY QUIET (no temp clone warnings at all)
+
+**Verdict:** PASS — fix works as designed.
+
+#### Full Tier 1 + Tier 2 regression: 43/43 PASS (0 FAIL)
+
+No regression in Section 1 / 2 / 3 / 12 / 19.6 / 24 (snapshot delete + temp clone cleanup) / static guards.
+
+**Verdict:** v0.2.16-1 ready for release.
+
+---
 
 ### v0.2.15-1 Cross-Storage Orphan Detection Fix Release (2026-05-24)
 

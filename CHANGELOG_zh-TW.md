@@ -2,6 +2,32 @@
 
 NetApp ONTAP Storage Plugin for Proxmox VE 的所有重要變更都記錄在此。
 
+## [0.2.16] - 2026-05-24
+
+### Temp Clone 背景清理 Idempotency 修正 Release
+
+**Bug 修正(操作雜訊,v0.2.15 測試期間發現):**
+
+- **`_remove_temp_clone()` 現在會在進入時偵測「ONTAP 上 volume 已不存在」並直接回成功**,而不會在後續 `volume_clone_split` 階段 die。先前的行為:tracking 內若有殘留 entry 而對應 ONTAP volume 已被 out-of-band 刪掉(被中斷的清理、跨節點 race、人工管理動作等),TTL 背景 reaper(`_cleanup_temp_clones`)會每 10 秒一次 `status()` poll 重試到天荒地老,journal 持續吐:
+  ```
+  Cleaning up old temporary FlexClone: tmpclone_<name>
+  Failed to cleanup temp clone '...': volume_clone_split on temp clone '...' failed:
+    Volume '...' not found at .../NetAppONTAPPlugin.pm line N.
+  ```
+  且不會自我修復 — 呼叫端的 `eval` 雖然攔住 die,但**不會**刪掉 state file 內的 entry(因為「清理」其實沒成功),所以下次 poll 又重試,結果一樣。v0.2.16 修正後,helper 在**第一次** poll 就直接回成功,呼叫端順利把殘留 entry 從 tracking 移除,下一個 cycle 起就完全安靜。
+
+**正式環境下這種情境怎麼發生:**
+
+- 上次清理中斷:`volume_delete` 在 ONTAP 上成功,但 state file 的 untrack 寫入沒發生(當機、重開機卡在半路等)
+- 跨節點 race:另一個叢集節點在我們讀 state 與動作之間把 temp clone 砍了
+- ONTAP 管理員手動清:有人在 ONTAP 上 out-of-band 砍掉 temp FlexClone
+- 重開機後狀態錯位:tmpfs `/var/run` 沒清,但 ONTAP 側的清理早就完成
+
+**安全性:**
+
+- 區分「確認 not found」(`volume_get` 回 undef 且不 die)與「API transient 失敗」(`volume_get` die)。只有前者觸發 skip 路徑;後者照樣 die 傳遞,讓下次 cycle 重試,不會悄悄漏掉真實的 clone。
+- 最壞情境(理論上不會發生但仍納入考量):若 `volume_get` 在 volume 實際存在時錯誤地回 undef,我們會略過清理並 untrack — 留下 ONTAP 端孤兒。但:temp clone 是 FlexClone,實際 unique block 極少;且 `_cleanup_orphaned_devices` 仍會偵測到 host 上殘留的 multipath device。`volume_get` 的契約清楚(undef = SVM 內無 records),不太會出這種 corner case。
+
 ## [0.2.15] - 2026-05-24
 
 ### 跨儲存孤兒偵測修正 Release

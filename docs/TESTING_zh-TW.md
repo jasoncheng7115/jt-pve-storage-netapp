@@ -1774,6 +1774,76 @@ grep -A 120 '^sub _cleanup_orphaned_devices' lib/PVE/Storage/Custom/NetAppONTAPP
 
 ---
 
+## 27. 清理時殘留 SCSI 路徑掃除（v0.2.18）
+
+處理 v0.2.17 事故 log 中那個獨立的 NetApp/Linux 行為:
+```
+sd X:0:0:51: LUN assignments on this target have changed.
+The Linux SCSI layer does not automatically remap LUN assignments.
+```
+
+當 plugin（或 ONTAP `lun_map` 自動配號）釋放一個 SCSI LUN-ID,而 ONTAP 之後把它重用給**不同**的 LUN 時,host 上任何仍綁在該 `H:C:T:L` 的殘留 `sd` 裝置就會觸發這行 kernel 訊息,且新 LUN 在該路徑上無法使用。`cleanup_lun_devices()` 先前只移除**目前還在 multipath map 內**的路徑（且 map 已不在時整段跳過,完全 no-op）,把孤兒單一 `sd` 路徑留在原地。v0.2.18 新增 `Multipath::get_scsi_paths_for_wwid()` 與 `cleanup_lun_devices()` 內的 Step 8 掃除,移除該 WWID 的**所有** NETAPP `sd` 路徑,即使 map 已不在也會掃。掃除限定 NETAPP 廠商、以 WWID 比對,並以 wall-clock 預算（預設 30s）界定上限,讓擁有數百個 `sd` 裝置且路徑正在失效的 host 不會卡住拆除流程。
+
+### 27.1 `get_scsi_paths_for_wwid()` 比對（真實裝置）
+
+```bash
+pvesm alloc netapp1 9000 vm-9000-disk-0 1G
+W=$(pvesm path netapp1:vm-9000-disk-0 | grep -oE '3600a[0-9a-f]+')
+multipath -ll "$W" | grep -oE 'sd[a-z]+' | sort   # 基準路徑
+perl -I/usr/share/perl5 -e '
+use PVE::Storage::Custom::NetAppONTAP::Multipath qw(get_scsi_paths_for_wwid);
+my $W = shift;
+my $p = get_scsi_paths_for_wwid($W);
+print "real WWID paths: @{[sort @$p]}\n";
+print scalar(@$p) >= 1 ? "PASS: paths found\n" : "FAIL\n";
+my $none = get_scsi_paths_for_wwid("3600a0980deadbeefdeadbeefdeadbeef");
+print @$none ? "FAIL: bogus WWID matched\n" : "PASS: bogus WWID -> empty\n";
+my @w; local $SIG{__WARN__}=sub{push @w,$_[0]};
+get_scsi_paths_for_wwid($W, budget=>0);
+print( (grep{/budget exceeded/}@w) ? "PASS: budget=0 bails with warning\n"
+                                   : "NOTE: no warn (0 NETAPP devices present)\n" );
+' "$W"
+```
+
+**預期:** 比對到的路徑等於 multipath slaves;bogus WWID 回傳空（無誤判）;`budget => 0` 安全退出並警告。
+
+### 27.2 map 已不在時 Step 8 掃除孤兒 sd 路徑（核心）
+
+```bash
+# （承接 27.1;$W 仍設定,LUN 仍在 ONTAP 上）
+SLAVES=$(multipath -ll "$W" | grep -oE 'sd[a-z]+' | sort -u)
+multipath -f "$W"                       # 只移除 map -> sd 路徑變孤兒
+multipath -ll "$W" | grep -q . && echo "map still present" || echo "map gone (sd orphaned)"
+for s in $SLAVES; do test -e /sys/block/$s && echo "orphan $s present"; done
+
+# 舊的 cleanup_lun_devices() 會 no-op（無 map）。新的 Step 8 必須掃除:
+perl -I/usr/share/perl5 -e '
+use PVE::Storage::Custom::NetAppONTAP::Multipath qw(cleanup_lun_devices);
+cleanup_lun_devices(shift);' "$W"
+sleep 2
+for s in $SLAVES; do test -e /sys/block/$s && echo "FAIL: $s residual" || echo "PASS: $s swept"; done
+
+pvesm free netapp1:vm-9000-disk-0       # 清理
+```
+
+**預期:** `multipath -f` 後 `sd` 路徑仍為孤兒;`cleanup_lun_devices()` 後每個孤兒 `sd` 路徑都消失（Step 8 生效）。模擬器（pc-pve1）已驗證:`sdc`/`sdd` 被 `multipath -f` 變孤兒,兩者皆被 Step 8 掃除。
+
+### 27.3 靜態 regression 守則
+
+```bash
+M=lib/PVE/Storage/Custom/NetAppONTAP/Multipath.pm
+grep -c 'sub get_scsi_paths_for_wwid' "$M"                 # 預期: 1
+grep -c 'get_scsi_paths_for_wwid' "$M"                     # export + 定義 + 使用: >= 3
+# Step 8 掃除已接入 cleanup_lun_devices,且在 `if ($mpath)` 區塊之外執行
+grep -A 95 '^sub cleanup_lun_devices' "$M" | grep -c 'get_scsi_paths_for_wwid'   # 預期: 1
+# wall-clock 預算存在（累積時間界定,v0.2.12 教訓）
+grep -A 60 '^sub get_scsi_paths_for_wwid' "$M" | grep -c 'deadline\|budget'      # 預期: >= 2
+# 限定 NETAPP 廠商（絕不碰其他儲存）
+grep -A 60 '^sub get_scsi_paths_for_wwid' "$M" | grep -c 'NETAPP'                # 預期: >= 1
+```
+
+---
+
 ## 清除
 
 ```bash
@@ -1793,6 +1863,19 @@ pvesm list $STORAGE
 ## 發佈測試結果
 
 每次發佈前都必須通過上述所有測試。結果記錄如下。
+
+### v0.2.18-1 清理時殘留 SCSI 路徑掃除 Release (2026-05-29)
+
+**範圍:** Section 27（新增）—— `get_scsi_paths_for_wwid()` + `cleanup_lun_devices()` Step 8 孤兒掃除。
+
+**環境:** `pc-pve1`（PVE 9.1,透過 `make install` 部署 0.2.18 原始碼）。ONTAP 模擬器。儲存 `netapp1`（iSCSI）。
+
+- **27.1 helper 比對（真實裝置）:** `get_scsi_paths_for_wwid()` 回傳的正好是該裝置的 multipath slaves（`/dev/sdc /dev/sdd`）;bogus WWID 回傳空（無誤判）;`budget => 0` 安全退出並印「scan budget exceeded」警告。PASS。
+- **27.2 Step 8 孤兒掃除（核心）:** 僅移除 multipath map（`multipath -f`）,讓 `sdc`/`sdd` 在 `/sys/block` 變孤兒;舊的 `cleanup_lun_devices()` 會 no-op（無 map）;新的 Step 8 掃除了兩個孤兒 `sd` 路徑。PASS。
+- **27.3 靜態守則:** 全部相符（helper 已定義+export+使用、Step 8 已接入 `cleanup_lun_devices`、wall-clock 預算存在、NETAPP 廠商閘門存在）。
+- `make test` 語法:全模組 OK。
+
+**結果:PASS。** 環境已還原為乾淨狀態。
 
 ### v0.2.17-1 孤兒清理路徑健康閘門 + LUN 清單分頁 Release (2026-05-29)
 

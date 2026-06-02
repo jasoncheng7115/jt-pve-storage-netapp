@@ -2,6 +2,23 @@
 
 All notable changes to the NetApp ONTAP Storage Plugin for Proxmox VE are documented here.
 
+## [0.2.18] - 2026-05-29
+
+### Stale SCSI Path Sweep on Cleanup Release
+
+**Hardening (independent issue surfaced in the v0.2.17 incident log):**
+
+The kernel logged `LUN assignments on this target have changed. The Linux SCSI layer does not automatically remap LUN assignments.` ONTAP auto-assigns SCSI LUN-IDs on `lun_map` and reuses a freed LUN-ID for a different LUN after unmap. If a stale host `sd` device is still bound to that `H:C:T:L`, the new LUN is not usable on that path and the kernel refuses to remap.
+
+- **Root gap:** `cleanup_lun_devices()` removed only the paths currently in the multipath map, and was a complete no-op when the map was already gone — leaving orphaned single `sd` paths that later collide with reused LUN-IDs.
+
+- **Fix:** new `Multipath::get_scsi_paths_for_wwid()` enumerates ALL NETAPP `sd` paths for a WWID (including paths no longer in the map, matched via the device's SCSI `wwid`/VPD identifiers). `cleanup_lun_devices()` gains a Step 8 sweep that removes them even when the map is gone. The sweep is vendor-gated to NETAPP (never touches other storage), WWID-matched (no false positives), and bounded by a wall-clock budget (default 30s) so a host with hundreds of `sd` devices and failing paths cannot stall teardown (the v0.2.12 lesson: per-read timeouts do not bound cumulative time).
+
+**Testing:**
+
+- `docs/TESTING.md` Section 27 added (helper matching, the Step 8 orphan sweep, static guards), EN + zh-TW.
+- Verified on the simulator (pc-pve1): `get_scsi_paths_for_wwid()` matches a real device's paths and returns empty for a bogus WWID; Step 8 sweeps `sd` paths orphaned by a bare `multipath -f` (the case the old code no-op'd on); `budget => 0` bails safely with a warning.
+
 ## [0.2.17] - 2026-05-29
 
 ### Orphan Reaper Path-Health Gate + LUN List Pagination Release

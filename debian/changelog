@@ -1,3 +1,32 @@
+jt-pve-storage-netapp (0.2.18-1) stable; urgency=medium
+
+  * Stale SCSI Path Sweep on Cleanup Release
+  * Requirements: Proxmox VE 9.1 or later
+  * Hardening (independent issue from v0.2.17 incident log):
+    - Kernel logged "LUN assignments on this target have changed. The
+      Linux SCSI layer does not automatically remap LUN assignments."
+      ONTAP auto-assigns SCSI LUN-IDs on lun_map and reuses a freed
+      LUN-ID for a different LUN after unmap. If a stale host sd device
+      is still bound to that H:C:T:L, the new LUN is not usable on that
+      path and the kernel refuses to remap.
+    - Root gap: cleanup_lun_devices() removed only the paths CURRENTLY
+      in the multipath map, and was a no-op entirely when the map was
+      already gone -- leaving orphaned single sd paths that later
+      collide with reused LUN-IDs.
+    - Fix: new Multipath::get_scsi_paths_for_wwid() enumerates ALL
+      NETAPP sd paths for a WWID (incl. paths no longer in the map);
+      cleanup_lun_devices() Step 8 sweeps them even when the map is
+      gone. Vendor-gated to NETAPP, WWID-matched, and bounded by a
+      wall-clock budget (default 30s) so a host with hundreds of sd
+      devices and failing paths cannot stall teardown (v0.2.12 lesson:
+      per-read timeouts do not bound cumulative time).
+  * Testing: docs/TESTING.md Section 27 added (helper matching, Step 8
+    orphan sweep, static guards). Verified on simulator pc-pve1:
+    get_scsi_paths_for_wwid matches real paths and rejects bogus WWIDs;
+    Step 8 sweeps sd paths orphaned by a bare multipath -f.
+
+ -- Jason Cheng <jason@jason.tools>  Thu, 29 May 2026 20:00:00 +0800
+
 jt-pve-storage-netapp (0.2.17-1) stable; urgency=high
 
   * Orphan Reaper Path-Health Gate + LUN List Pagination Release

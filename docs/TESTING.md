@@ -2163,6 +2163,76 @@ grep -A 120 '^sub _cleanup_orphaned_devices' lib/PVE/Storage/Custom/NetAppONTAPP
 
 ---
 
+## 27. Stale SCSI Path Sweep on Cleanup (v0.2.18)
+
+Addresses the independent NetApp/Linux behavior seen in the v0.2.17 incident log:
+```
+sd X:0:0:51: LUN assignments on this target have changed.
+The Linux SCSI layer does not automatically remap LUN assignments.
+```
+
+When the plugin (or ONTAP `lun_map` auto-assignment) frees a SCSI LUN-ID and ONTAP later reuses it for a DIFFERENT LUN, any stale `sd` device still bound to that `H:C:T:L` on the host triggers this kernel message and the new LUN is not usable on that path. `cleanup_lun_devices()` previously removed only the paths CURRENTLY in the multipath map (and did nothing at all if the map was already gone), leaving orphaned single `sd` paths behind. v0.2.18 adds `Multipath::get_scsi_paths_for_wwid()` and a Step 8 sweep in `cleanup_lun_devices()` that removes ALL NETAPP `sd` paths for the WWID, even when the map is gone. The sweep is vendor-gated (NETAPP only), WWID-matched, and bounded by a wall-clock budget (default 30s) so a host with hundreds of `sd` devices and failing paths cannot stall teardown.
+
+### 27.1 `get_scsi_paths_for_wwid()` matching (real device)
+
+```bash
+pvesm alloc netapp1 9000 vm-9000-disk-0 1G
+W=$(pvesm path netapp1:vm-9000-disk-0 | grep -oE '3600a[0-9a-f]+')
+multipath -ll "$W" | grep -oE 'sd[a-z]+' | sort   # ground-truth paths
+perl -I/usr/share/perl5 -e '
+use PVE::Storage::Custom::NetAppONTAP::Multipath qw(get_scsi_paths_for_wwid);
+my $W = shift;
+my $p = get_scsi_paths_for_wwid($W);
+print "real WWID paths: @{[sort @$p]}\n";
+print scalar(@$p) >= 1 ? "PASS: paths found\n" : "FAIL\n";
+my $none = get_scsi_paths_for_wwid("3600a0980deadbeefdeadbeefdeadbeef");
+print @$none ? "FAIL: bogus WWID matched\n" : "PASS: bogus WWID -> empty\n";
+my @w; local $SIG{__WARN__}=sub{push @w,$_[0]};
+get_scsi_paths_for_wwid($W, budget=>0);
+print( (grep{/budget exceeded/}@w) ? "PASS: budget=0 bails with warning\n"
+                                   : "NOTE: no warn (0 NETAPP devices present)\n" );
+' "$W"
+```
+
+**Expected:** matched paths equal the multipath slaves; bogus WWID returns empty (no false positives); `budget => 0` bails safely with a warning.
+
+### 27.2 Step 8 sweeps orphaned sd paths when the map is already gone (CORE)
+
+```bash
+# (continues from 27.1; $W still set, LUN still on ONTAP)
+SLAVES=$(multipath -ll "$W" | grep -oE 'sd[a-z]+' | sort -u)
+multipath -f "$W"                       # remove ONLY the map -> sd paths orphaned
+multipath -ll "$W" | grep -q . && echo "map still present" || echo "map gone (sd orphaned)"
+for s in $SLAVES; do test -e /sys/block/$s && echo "orphan $s present"; done
+
+# OLD cleanup_lun_devices() would no-op (no map). NEW Step 8 must sweep:
+perl -I/usr/share/perl5 -e '
+use PVE::Storage::Custom::NetAppONTAP::Multipath qw(cleanup_lun_devices);
+cleanup_lun_devices(shift);' "$W"
+sleep 2
+for s in $SLAVES; do test -e /sys/block/$s && echo "FAIL: $s residual" || echo "PASS: $s swept"; done
+
+pvesm free netapp1:vm-9000-disk-0       # cleanup
+```
+
+**Expected:** after `multipath -f` the `sd` paths remain orphaned; after `cleanup_lun_devices()` every orphaned `sd` path is gone (Step 8 worked). Verified on simulator (pc-pve1): `sdc`/`sdd` orphaned by `multipath -f`, both swept by Step 8.
+
+### 27.3 Static regression guards
+
+```bash
+M=lib/PVE/Storage/Custom/NetAppONTAP/Multipath.pm
+grep -c 'sub get_scsi_paths_for_wwid' "$M"                 # Expected: 1
+grep -c 'get_scsi_paths_for_wwid' "$M"                     # exported + defined + used: >= 3
+# Step 8 sweep wired into cleanup_lun_devices, runs OUTSIDE the `if ($mpath)` block
+grep -A 95 '^sub cleanup_lun_devices' "$M" | grep -c 'get_scsi_paths_for_wwid'   # Expected: 1
+# wall-clock budget present (cumulative-time bound, v0.2.12 lesson)
+grep -A 60 '^sub get_scsi_paths_for_wwid' "$M" | grep -c 'deadline\|budget'      # Expected: >= 2
+# vendor-gated to NETAPP (never touch other storage)
+grep -A 60 '^sub get_scsi_paths_for_wwid' "$M" | grep -c 'NETAPP'                # Expected: >= 1
+```
+
+---
+
 ## Cleanup
 
 ```bash
@@ -2182,6 +2252,19 @@ pvesm list $STORAGE
 ## Release Test Results
 
 Each release must pass all tests above before publishing. Results are recorded below.
+
+### v0.2.18-1 Stale SCSI Path Sweep on Cleanup Release (2026-05-29)
+
+**Scope:** Section 27 (new) — `get_scsi_paths_for_wwid()` + `cleanup_lun_devices()` Step 8 orphan sweep.
+
+**Environment:** `pc-pve1` (PVE 9.1, 0.2.18 source via `make install`). ONTAP simulator. Storage `netapp1` (iSCSI).
+
+- **27.1 helper matching (real device):** `get_scsi_paths_for_wwid()` returned exactly the device's multipath slaves (`/dev/sdc /dev/sdd`); a bogus WWID returned empty (no false positives); `budget => 0` bailed safely with the "scan budget exceeded" warning. PASS.
+- **27.2 Step 8 orphan sweep (CORE):** removed the multipath map only (`multipath -f`), leaving `sdc`/`sdd` orphaned in `/sys/block`; the old `cleanup_lun_devices()` would no-op (no map); the new Step 8 swept both orphaned `sd` paths. PASS.
+- **27.3 static guards:** all match (helper defined+exported+used, Step 8 wired into `cleanup_lun_devices`, wall-clock budget present, NETAPP vendor gate present).
+- `make test` syntax: all modules OK.
+
+**Result: PASS.** Environment restored to clean state.
 
 ### v0.2.17-1 Orphan Reaper Path-Health Gate + LUN List Pagination Release (2026-05-29)
 

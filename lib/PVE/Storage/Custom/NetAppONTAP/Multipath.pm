@@ -20,6 +20,7 @@ our @EXPORT_OK = qw(
     multipath_remove
     get_multipath_device
     multipath_path_health
+    get_scsi_paths_for_wwid
     get_device_by_wwid
     wait_for_multipath_device
     get_scsi_devices_by_serial
@@ -534,6 +535,87 @@ sub multipath_path_health {
     return $saw_path ? 0 : -1;
 }
 
+# Enumerate ALL local SCSI (sd*) devices that belong to a given NetApp WWID,
+# including stale/orphaned paths that are NO LONGER part of the multipath map.
+#
+# Why (v0.2.17): when a LUN is unmapped/deleted, every sd path for it must be
+# removed from the host. Otherwise ONTAP can reuse that LUN's now-free SCSI
+# LUN-ID for a DIFFERENT LUN while the host still has the stale sd bound to the
+# same H:C:T:L. The kernel then logs:
+#   "LUN assignments on this target have changed. The Linux SCSI layer does
+#    not automatically remap LUN assignments."
+# and the new LUN is not usable on that path (and the stale sd is a hazard).
+# get_multipath_slaves() only returns paths CURRENTLY in the map; a path that
+# already failed out of the map (or a map that was already flushed) leaves an
+# orphaned sd that this function still finds, by matching the WWID against the
+# device's SCSI identifiers.
+#
+# Vendor-gated to NETAPP so we never touch another vendor's devices. All sysfs
+# reads are timeout-bounded (anti-hang rule).
+sub get_scsi_paths_for_wwid {
+    my ($wwid, %opts) = @_;
+
+    croak "wwid is required" unless $wwid;
+
+    # NetApp dm-multipath WWID is "3" + NAA registered designator. The NAA
+    # (without the leading "3") is what appears in the device's wwid/vpd_pg83.
+    (my $naa = lc($wwid)) =~ s/^3//;
+    return [] unless $naa =~ /^[0-9a-f]{8,}$/;
+
+    # Overall wall-clock budget for the whole scan. At scale (a customer with
+    # 70+ LUNs x 4 paths has ~300 sd devices) iterating every device and doing
+    # bounded reads can still add up -- and this function runs precisely during
+    # teardown when some paths are failing (slow reads). A per-read timeout
+    # alone does NOT bound cumulative time (the v0.2.12 lesson: eval/per-call
+    # timeouts don't enforce a wall clock across a loop). So we cap the total
+    # and warn if we bail early rather than risk a multi-minute stall.
+    my $deadline   = time() + ($opts{budget} // 30);
+    my $read_to    = $opts{read_timeout} // 3;
+
+    my @devs;
+    opendir(my $dh, '/sys/block') or return \@devs;
+    my @blocks = grep { /^sd[a-z]+$/ } readdir($dh);
+    closedir($dh);
+
+    my $bailed = 0;
+    for my $b (@blocks) {
+        if (time() >= $deadline) { $bailed = 1; last; }
+
+        ($b) = $b =~ /^(sd[a-z]+)$/;   # untaint
+        next unless $b;
+
+        # Only consider NETAPP devices -- never touch other vendors' storage.
+        my $vendor = sysfs_read_with_timeout("/sys/block/$b/device/vendor", $read_to) // '';
+        next unless $vendor =~ /NETAPP/i;
+
+        my $match = 0;
+
+        # Primary: the kernel-maintained scsi_id wwid attribute (e.g.
+        # "naa.600a0980..."). Reading it is the documented hang risk, hence
+        # the timeout-bounded read.
+        my $wwid_attr = sysfs_read_with_timeout("/sys/block/$b/device/wwid", $read_to) // '';
+        $match = 1 if $wwid_attr && lc($wwid_attr) =~ /\Q$naa\E/;
+
+        # Fallback: raw VPD page 0x83 (binary -> hex) in case the wwid
+        # attribute is absent on older kernels.
+        if (!$match) {
+            my $pg83 = sysfs_read_with_timeout("/sys/block/$b/device/vpd_pg83", $read_to);
+            if (defined $pg83 && length $pg83) {
+                my $hex = unpack("H*", $pg83);
+                $match = 1 if $hex =~ /\Q$naa\E/i;
+            }
+        }
+
+        push @devs, "/dev/$b" if $match;
+    }
+
+    warn "get_scsi_paths_for_wwid: scan budget exceeded for WWID $wwid; "
+       . "result may be incomplete (some stale sd paths not swept this pass)\n"
+        if $bailed;
+
+    return \@devs;
+}
+
 # Get multipath device name by WWID
 sub get_multipath_device {
     my ($wwid, %opts) = @_;
@@ -828,6 +910,18 @@ sub cleanup_lun_devices {
 
         # Step 7: Brief pause for cleanup to complete
         sleep(1);
+    }
+
+    # Step 8 (v0.2.17): sweep any remaining sd* paths for this WWID that were
+    # NOT part of the multipath map -- orphaned single paths, or the case where
+    # the map was already flushed (the block above is skipped) but stale sd
+    # devices still linger. Leaving these behind is exactly what causes the
+    # kernel "LUN assignments on this target have changed" message when ONTAP
+    # later reuses this LUN's freed SCSI LUN-ID for a different LUN. Vendor-
+    # gated to NETAPP inside the helper, so this never touches other storage.
+    my $stale = eval { get_scsi_paths_for_wwid($wwid); } // [];
+    for my $dev (@$stale) {
+        eval { remove_scsi_device($dev); };
     }
 
     return 1;

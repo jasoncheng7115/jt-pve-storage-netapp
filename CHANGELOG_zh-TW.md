@@ -2,6 +2,23 @@
 
 NetApp ONTAP Storage Plugin for Proxmox VE 的所有重要變更都記錄在此。
 
+## [0.2.18] - 2026-05-29
+
+### 清理時殘留 SCSI 路徑掃除 Release
+
+**強化（v0.2.17 事故 log 中浮現的獨立議題）:**
+
+kernel 印出 `LUN assignments on this target have changed. The Linux SCSI layer does not automatically remap LUN assignments.`。ONTAP 在 `lun_map` 時自動配 SCSI LUN-ID,unmap 後會把釋放的 LUN-ID 重用給不同的 LUN。若 host 上仍有殘留 `sd` 裝置綁在該 `H:C:T:L`,新 LUN 在該路徑上便無法使用,kernel 也拒絕自動 remap。
+
+- **根本缺口:** `cleanup_lun_devices()` 只移除目前還在 multipath map 內的路徑,且 map 已不在時整段完全 no-op——把孤兒單一 `sd` 路徑留在原地,日後與重用的 LUN-ID 撞號。
+
+- **修正:** 新增 `Multipath::get_scsi_paths_for_wwid()`,列舉該 WWID 的**所有** NETAPP `sd` 路徑（含已脫離 map 的路徑,以裝置的 SCSI `wwid`／VPD 識別碼比對）;`cleanup_lun_devices()` 新增 Step 8 掃除,即使 map 已不在也會移除它們。掃除限定 NETAPP 廠商（絕不碰其他儲存）、以 WWID 比對（無誤判）,並以 wall-clock 預算（預設 30s）界定上限,讓擁有數百個 `sd` 裝置且路徑正在失效的 host 不會卡住拆除（v0.2.12 教訓:per-read timeout 不會界定累積時間）。
+
+**測試:**
+
+- `docs/TESTING.md` 與 zh-TW 版新增 Section 27（helper 比對、Step 8 孤兒掃除、靜態守則）。
+- 模擬器（pc-pve1）已驗證:`get_scsi_paths_for_wwid()` 比對到真實裝置路徑、對 bogus WWID 回傳空;Step 8 掃除被 `multipath -f` 變孤兒的 `sd` 路徑（舊版這情況 no-op）;`budget => 0` 安全退出並警告。
+
 ## [0.2.17] - 2026-05-29
 
 ### 孤兒清理路徑健康閘門 + LUN 清單分頁 Release

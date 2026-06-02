@@ -2,6 +2,29 @@
 
 NetApp ONTAP Storage Plugin for Proxmox VE 的所有重要變更都記錄在此。
 
+## [0.2.17] - 2026-05-29
+
+### 孤兒清理路徑健康閘門 + LUN 清單分頁 Release
+
+**Bug 修正(正式環境事故,客戶回報 2026-05,節點 pve15):**
+
+在**執行中**的 VM 熱加一顆硬碟,可能讓這顆全新硬碟立刻出現 I/O error（`I/O error, dev dm-NN`）。把 VM 關機再開機就「恢復」。
+
+- **根因(兩個缺陷):**
+  1. `_cleanup_orphaned_devices()` 以單一 `lun_list()` 快照建立「存活集合」,並清除任何不在集合內的已追蹤 WWID。但剛建立的 LUN 可能有一段時間查不到（ONTAP read-after-write／傳播延遲——與 v0.2.9 ASA 最終一致性同類,如今餵給了 reaper 的存活集合）。LUN 數量龐大時該查詢還可能被截斷。
+  2. reaper 呼叫 `cleanup_lun_devices()` 前**完全不檢查 multipath 路徑健康狀態**,因此有 active 路徑的活裝置與真正的殘留無法區分。由於 VM 在執行中,QEMU 開著該裝置:`multipath -f` 失敗,退回的 `dmsetup remove --force` 把 map 從 QEMU 底下強制抽掉,於是產生 I/O error。（注意:QEMU 的開啟檔案描述子不是 sysfs holder,所以 `is_device_in_use()` 偵測不到它——路徑健康閘門才是真正的防線。）
+
+- **修正 1 —— 路徑健康閘門(`Multipath::multipath_path_health()`):** reaper 絕不移除仍有 active 路徑（或狀態無法判定）的裝置。真正的殘留所有路徑都會 failed／faulty。同時套用於第一輪拆除與第二輪「untracked stale」操作者警告,因此 plugin 也不會再對健康裝置建議 `multipath -f`。
+
+- **修正 2 —— 寬限期:** 在過去 300 秒內才被追蹤的 WWID 不拆,涵蓋 read-after-write 窗口。沿用既有的首次追蹤時間戳,不新增任何狀態檔。
+
+- **修正 3 —— LUN 清單分頁(`API::_get_all_records()`):** `lun_list()` 現在會追隨 ONTAP REST 的 `_links.next`,讓超過 1000 顆 LUN 的 SVM 不會被靜默截斷存活集合。同樣的分頁套用於 `volume_list`、`volume_get_clone_children`、`igroup_list`、`snapshot_list`。
+
+**測試:**
+
+- `docs/TESTING.md` 與 zh-TW 版新增 Section 26:路徑健康邏輯（7 案）、分頁完整性、靜態 regression 守則、執行中 VM 功能性重現（含強制 host-side 裝置斷言,v0.2.14 守則）、寬限期守則。
+- 模擬器完整測試 PASS:兩道 reaper 防線皆驗證、真正的殘留（ONTAP 上 LUN 已刪、路徑全失效）仍會被清除且 host-side 乾淨拆除、5 個分頁函式對真實 ONTAP 正常回傳、完整硬碟生命週期（alloc／snapshot／rollback／resize／full clone／free）乾淨且零 I/O error。
+
 ## [0.2.16] - 2026-05-24
 
 ### Temp Clone 背景清理 Idempotency 修正 Release

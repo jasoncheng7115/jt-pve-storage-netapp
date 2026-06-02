@@ -1,3 +1,40 @@
+jt-pve-storage-netapp (0.2.17-1) stable; urgency=high
+
+  * Orphan Reaper Path-Health Gate + LUN List Pagination Release
+  * Requirements: Proxmox VE 9.1 or later
+  * Bug Fix (production incident, customer report 2026-05, node pve15):
+    - Hot-adding a disk to a RUNNING VM could cause immediate I/O
+      errors on that brand-new disk. _cleanup_orphaned_devices()
+      built its "alive set" from a single lun_list() snapshot and
+      reaped any tracked WWID missing from it -- but a freshly-created
+      LUN can be absent from that bulk query for a window (ONTAP
+      read-after-write / propagation lag, same class as v0.2.9 ASA).
+      The reaper then tore down the live multipath device with NO
+      check of path health. Because the VM was running, QEMU held the
+      device open, so multipath -f failed and the dmsetup remove
+      --force fallback ripped the map out from under QEMU -> I/O error.
+      Power-cycling the VM "fixed" it (multipath re-acquired on next
+      activate, by which time lun_list no longer lagged).
+    - Fix 1 (path-health gate): new Multipath::multipath_path_health()
+      -- the reaper NEVER removes a device that still has an active
+      path (or whose state is indeterminate). A genuine orphan has ALL
+      paths failed. Applied to both the first-pass reap and the
+      second-pass "untracked stale" operator warning.
+    - Fix 2 (grace period): a WWID tracked within the last 300s is not
+      reaped, covering the read-after-write window. Reuses the existing
+      first-tracked timestamp; no new state file.
+    - Fix 3 (LUN list pagination): API::lun_list() now follows ONTAP
+      REST _links.next so an SVM with 1000+ LUNs never silently
+      truncates the alive set. Same pagination applied to volume_list,
+      volume_get_clone_children, igroup_list, snapshot_list.
+  * Testing: docs/TESTING.md Section 26 added (path-health logic,
+    pagination, static guards, RUNNING-VM functional reproduce with
+    host-side assertions, grace-period guard). Full simulator test
+    PASS incl. both reaper defenses, real-orphan still reaped, and
+    full disk lifecycle with clean host-side teardown.
+
+ -- Jason Cheng <jason@jason.tools>  Thu, 29 May 2026 18:00:00 +0800
+
 jt-pve-storage-netapp (0.2.16-1) stable; urgency=medium
 
   * Temp Clone Reaper Idempotency Fix Release

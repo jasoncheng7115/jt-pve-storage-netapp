@@ -19,6 +19,7 @@ our @EXPORT_OK = qw(
     multipath_add
     multipath_remove
     get_multipath_device
+    multipath_path_health
     get_device_by_wwid
     wait_for_multipath_device
     get_scsi_devices_by_serial
@@ -448,6 +449,89 @@ sub list_netapp_multipath_devices {
         push @devices, { name => $name, wwid => $wwid, vps => $vps };
     }
     return \@devices;
+}
+
+# Determine whether the multipath map for $wwid currently has at least one
+# usable (device-mapper "active") path.
+#
+# Rationale (v0.2.17): a genuinely orphaned LUN -- one deleted on ONTAP -- has
+# ALL of its paths failed/faulty, because the backing storage is gone. A live,
+# in-use LUN (for example a freshly added VM disk that the bulk LUN list has
+# not caught up to yet, due to ONTAP read-after-write lag) still has active
+# paths serving I/O. The orphan reaper MUST consult this before tearing a
+# device down so it never removes a device that is actively in use -- doing so
+# destroys a live VM disk and causes immediate I/O errors.
+#
+# Returns:
+#   1  -> the map has at least one active path (device is live -- DO NOT reap)
+#   0  -> the map exists but every path is failed/faulty (orphan candidate)
+#  -1  -> state could not be determined (multipathd unreachable, output
+#         unparseable, or wildcard unsupported). Callers MUST treat -1 exactly
+#         like 1 (do not reap): a false "it's dead" here causes data-
+#         availability loss, which is far worse than leaving a stale device.
+#
+# Alias-safe: resolves the WWID to its dm map name first, then inspects that
+# map's paths (the map "name" may differ from the WWID when an alias is set).
+sub multipath_path_health {
+    my ($wwid) = @_;
+
+    croak "wwid is required" unless $wwid;
+
+    # Step 1: resolve WWID -> map name.
+    my ($maps) = _run_cmd(
+        [MULTIPATHD, 'show', 'maps', 'raw', 'format', '%n %w'],
+        allow_nonzero => 1,
+        ignore_errors => 1,
+        timeout       => 10,
+    );
+    return -1 unless defined $maps;
+
+    my $lc_wwid = lc($wwid);
+    my $map_name;
+    for my $line (split /\n/, $maps) {
+        $line =~ s/^\s+|\s+$//g;
+        my ($name, $mw) = split /\s+/, $line, 2;
+        next unless $name && $mw;
+        if (lc($mw) eq $lc_wwid) {
+            $map_name = $name;
+            last;
+        }
+    }
+    # No dm map for this WWID -> there is nothing live to protect. Report 0
+    # so the caller may proceed with its (idempotent) device cleanup.
+    return 0 unless defined $map_name;
+
+    # Step 2: inspect the paths belonging to that map.
+    #   %m = map name the path belongs to
+    #   %t = device-mapper path state ("active" / "failed")
+    #   %o = device state ("running" / "offline")
+    my ($paths) = _run_cmd(
+        [MULTIPATHD, 'show', 'paths', 'raw', 'format', '%m %t %o'],
+        allow_nonzero => 1,
+        ignore_errors => 1,
+        timeout       => 10,
+    );
+    return -1 unless defined $paths;
+
+    my $saw_path = 0;
+    for my $line (split /\n/, $paths) {
+        $line =~ s/^\s+|\s+$//g;
+        next unless $line;
+        my ($m, $dm_st, $dev_st) = split /\s+/, $line;
+        next unless defined $m && $m eq $map_name;
+        $saw_path = 1;
+        # device-mapper considers this path active -> the kernel will route
+        # I/O to it -> the device is live. (A path whose checker reports
+        # faulty is failed by multipathd, so its dm state is no longer
+        # "active".) Treat an offline device node as not usable.
+        my $dev_ok = !defined $dev_st || $dev_st ne 'offline';
+        return 1 if defined $dm_st && $dm_st eq 'active' && $dev_ok;
+    }
+
+    # Map exists. If we saw its path rows and none were active -> orphan (0).
+    # If we could not see ANY path rows for it, we cannot prove it is dead;
+    # be conservative and report indeterminate (-1).
+    return $saw_path ? 0 : -1;
 }
 
 # Get multipath device name by WWID

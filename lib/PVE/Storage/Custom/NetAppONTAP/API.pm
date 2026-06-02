@@ -159,6 +159,53 @@ sub get {
     return $self->_request('GET', $endpoint);
 }
 
+# Fetch ALL records for a collection GET, following ONTAP REST pagination.
+#
+# ONTAP caps a single response at `max_records` (and applies its own
+# server-side ceiling). When more rows exist than fit in one page it returns a
+# `_links.next.href` pointing at the next page. A plain get() that ignores this
+# silently TRUNCATES the result. That is dangerous for any caller that treats
+# the list as authoritative -- most critically the orphan reaper's "alive set":
+# a truncated alive set makes live LUNs look deleted on ONTAP, and the reaper
+# would tear down their (live) devices. This helper walks every page and
+# concatenates the records so the caller always sees the complete collection.
+#
+# Returns an arrayref of all records (possibly empty).
+sub _get_all_records {
+    my ($self, $endpoint, $params) = @_;
+
+    $params //= {};
+    # Ask for a large page to minimise round-trips; ONTAP may still return
+    # fewer and paginate, which we follow regardless.
+    $params->{max_records} //= 1000;
+
+    my @records;
+    my $resp = $self->get($endpoint, $params);
+    push @records, @{$resp->{records}} if $resp->{records};
+
+    # Follow _links.next until exhausted. Bounded to avoid an infinite loop if
+    # ONTAP ever returns a self-referential link (safety cap: 1000 pages).
+    my $next = $resp->{_links} && $resp->{_links}{next} && $resp->{_links}{next}{href};
+    my $pages = 0;
+    while ($next && ++$pages <= 1000) {
+        # href is an absolute API path like
+        # "/api/storage/luns?fields=...&start.tag=XXXX". _build_url() prepends
+        # ".../api/", so strip the leading "/api/" to avoid a doubled
+        # "/api/api/". The href already carries all query params (including the
+        # continuation token), so we pass it straight to _request().
+        (my $next_ep = $next) =~ s{^/?api/}{/};
+        $resp = $self->_request('GET', $next_ep);
+        push @records, @{$resp->{records}} if $resp->{records};
+        $next = $resp->{_links} && $resp->{_links}{next} && $resp->{_links}{next}{href};
+    }
+    if ($next) {
+        warn "_get_all_records: pagination safety cap reached for '$endpoint'; "
+           . "result may be truncated\n";
+    }
+
+    return \@records;
+}
+
 # POST request (with async job handling)
 sub post {
     my ($self, $endpoint, $data, %opts) = @_;
@@ -376,8 +423,8 @@ sub volume_list {
         $params->{name} = $filter;
     }
 
-    my $resp = $self->get('/storage/volumes', $params);
-    return $resp->{records} // [];
+    # Paginated: large deployments can have 1000+ pve_* volumes in one SVM.
+    return $self->_get_all_records('/storage/volumes', $params);
 }
 
 #
@@ -486,14 +533,12 @@ sub volume_get_clone_children {
     my ($self, $parent_name) = @_;
 
     my $svm_uuid = $self->get_svm_uuid();
-    my $resp = $self->get('/storage/volumes', {
+    return $self->_get_all_records('/storage/volumes', {
         'svm.uuid'            => $svm_uuid,
         'clone.is_flexclone'  => 'true',
         'clone.parent_volume.name' => $parent_name,
         fields => 'name,uuid,clone',
     });
-
-    return $resp->{records} // [];
 }
 
 # Split a FlexClone (make it independent from parent)
@@ -630,14 +675,13 @@ sub lun_list {
     my ($self, $pattern) = @_;
 
     my $svm_uuid = $self->get_svm_uuid();
-    my $resp = $self->get('/storage/luns', {
+    # Paginated: a large LUN count (1000+ in one SVM) MUST NOT silently
+    # truncate -- the orphan reaper relies on this being the complete set.
+    return $self->_get_all_records('/storage/luns', {
         name       => $pattern // '*',
         'svm.uuid' => $svm_uuid,
         fields     => 'uuid,name,serial_number,space',
-        max_records => 1000,
     });
-
-    return $resp->{records} // [];
 }
 
 # Get LUN UUID by path
@@ -769,12 +813,10 @@ sub igroup_list {
     my ($self) = @_;
 
     my $svm_uuid = $self->get_svm_uuid();
-    my $resp = $self->get('/protocols/san/igroups', {
+    return $self->_get_all_records('/protocols/san/igroups', {
         'svm.uuid' => $svm_uuid,
         fields     => 'name,uuid,protocol,os_type',
     });
-
-    return $resp->{records} // [];
 }
 
 # Add initiator to igroup
@@ -939,8 +981,7 @@ sub snapshot_list {
         $params->{name} = $filter;
     }
 
-    my $resp = $self->get("/storage/volumes/$vol_uuid/snapshots", $params);
-    return $resp->{records} // [];
+    return $self->_get_all_records("/storage/volumes/$vol_uuid/snapshots", $params);
 }
 
 # Delete a snapshot

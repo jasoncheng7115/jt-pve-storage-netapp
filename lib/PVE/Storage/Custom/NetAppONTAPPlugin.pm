@@ -39,6 +39,7 @@ use PVE::Storage::Custom::NetAppONTAP::Multipath qw(
     rescan_scsi_hosts
     multipath_reload
     get_multipath_device
+    multipath_path_health
     get_device_by_wwid
     get_scsi_devices_by_serial
     get_multipath_slaves
@@ -902,15 +903,47 @@ sub _cleanup_orphaned_devices {
     my $tracked = _read_wwid_state($storeid);
 
     # Phase 2: Find orphans = tracked WWIDs that are no longer on ONTAP
+    #
+    # Grace window (v0.2.17): the bulk lun_list() snapshot used to build the
+    # alive set can lag behind a freshly-created LUN (ONTAP read-after-write /
+    # propagation delay -- same class as the v0.2.9 ASA eventual-consistency
+    # issue, but here it feeds the reaper's "alive" set). A LUN tracked only
+    # seconds ago that appears "missing" from the bulk query is almost always
+    # a brand-new disk the query has not caught up to, NOT a deleted one.
+    # $tracked->{$wwid} is the first-tracked epoch; skip reaping until the WWID
+    # has been continuously absent past this window.
+    my $ORPHAN_GRACE_SECS = 300;
     my $cleaned = 0;
     for my $wwid (keys %$tracked) {
         next if $alive_wwids{$wwid};
+
+        my $tracked_at = $tracked->{$wwid};
+        if ($tracked_at && $tracked_at =~ /^\d+$/
+            && (time() - $tracked_at) < $ORPHAN_GRACE_SECS) {
+            next;  # recently tracked: assume bulk list just hasn't caught up
+        }
 
         # WWID is no longer on ONTAP. Check if there's a local multipath device
         # to clean up. cleanup_lun_devices is idempotent and safe.
         my $mpath = get_multipath_device($wwid);
         if ($mpath) {
-            warn "Orphan cleanup: removing stale device for WWID $wwid (LUN deleted on ONTAP)\n";
+            # Path-health gate (v0.2.17, CRITICAL): a genuinely orphaned LUN
+            # (deleted on ONTAP) has ALL paths failed/faulty. A live, in-use
+            # device -- e.g. a just-added VM disk -- still has active paths.
+            # NEVER tear down a device that has an active path: that destroys a
+            # live VM disk and causes immediate I/O errors (exactly the field
+            # incident this guard was added for). If health is indeterminate
+            # (-1) we also refuse, erring on the side of preserving I/O.
+            my $health = multipath_path_health($wwid);
+            if ($health != 0) {
+                warn "Orphan cleanup: WWID $wwid is absent from the ONTAP LUN " .
+                     "list but its multipath device still has active path(s) " .
+                     "(or path state is indeterminate). Refusing to remove a " .
+                     "live device; keeping tracked for re-evaluation.\n";
+                next;
+            }
+
+            warn "Orphan cleanup: removing stale device for WWID $wwid (LUN deleted on ONTAP, all paths failed)\n";
             eval { cleanup_lun_devices($wwid); };
             warn "Orphan cleanup error for $wwid: $@\n" if $@;
         }
@@ -973,6 +1006,13 @@ sub _cleanup_orphaned_devices {
             next if $alive_wwids{$wwid};       # alive on ONTAP, leave alone
             next if $tracked->{$wwid};         # already handled in first pass
             next if $other_plugin_wwid{$wwid}; # owned by sibling plugin storage
+            # Path-health gate (v0.2.17): only flag devices whose paths are ALL
+            # failed (genuine stale residue). A device with active paths is in
+            # use -- suggesting `multipath -f` on it would tear down live I/O.
+            # health: 1 = active paths, -1 = indeterminate -> skip warning in
+            # both cases; only 0 (all paths failed) is a real stale candidate.
+            my $health = eval { multipath_path_health($dev->{wwid}); };
+            next unless defined $health && $health == 0;
             push @untracked, $dev;
         }
         if (@untracked) {

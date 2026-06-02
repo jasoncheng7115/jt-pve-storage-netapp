@@ -1982,6 +1982,187 @@ grep -A 80 '^sub _cleanup_orphaned_devices' "$P" | grep -c '_read_wwid_state.*ot
 
 ---
 
+## 26. Orphan Reaper Path-Health Gate + LUN List Pagination (v0.2.17)
+
+Customer field incident (2026-05, node pve15, storage `netappFAS_Node2`): immediately after adding a VM disk (`update VM 608103: -scsi1 netappFAS_Node2:32`), the brand-new LUN's multipath device (WWID `...626b70`, 4 healthy paths) was torn down by `_cleanup_orphaned_devices()` ("removing stale device ... LUN deleted on ONTAP"), causing `I/O error, dev dm-68` on the live VM disk. VM reboot "fixed" it because the race no longer aligned.
+
+**Root cause (two defects):**
+1. The reaper built its "alive set" from a single `lun_list()` snapshot and reaped any tracked WWID missing from it -- but a freshly-created LUN can be absent from that bulk query for a window (ONTAP read-after-write / propagation lag; same class as v0.2.9 ASA). With many LUNs the query could also be truncated.
+2. The reaper called `cleanup_lun_devices()` with NO check of multipath path health. A device with active paths (live, in-use) was indistinguishable from a genuine orphan (all paths failed).
+
+**Fixes:**
+- **Path-health gate (`multipath_path_health()`):** never reap a device that has an active path (or whose state is indeterminate). A genuine orphan has ALL paths failed.
+- **Grace period:** do not reap a WWID tracked within the last 300s (reuses the existing first-tracked timestamp; no new state file).
+- **Second-pass gate:** the "untracked stale" operator warning only fires for path-dead devices, so it never suggests `multipath -f` on a healthy device.
+- **`lun_list()` pagination (`_get_all_records()`):** follows ONTAP REST `_links.next.href` so a 1000+ LUN SVM never silently truncates the alive set. Also applied to `volume_list`, `volume_get_clone_children`, `igroup_list`, `snapshot_list`.
+
+### 26.1 Path-health gate logic (offline, no ONTAP/multipath needed)
+
+```bash
+cat > /tmp/test_section26_health.pl <<'EOF'
+#!/usr/bin/perl
+use strict; use warnings;
+use lib "/usr/share/perl5";
+use PVE::Storage::Custom::NetAppONTAP::Multipath;
+my @responses; my $exit = 0;
+no warnings 'redefine';
+*PVE::Storage::Custom::NetAppONTAP::Multipath::_run_cmd = sub {
+    my $out = shift @responses; return wantarray ? ($out,'',0) : $out;
+};
+sub c {
+    my ($name,$maps,$paths,$wwid,$want)=@_;
+    @responses=($maps,$paths);
+    my $got = PVE::Storage::Custom::NetAppONTAP::Multipath::multipath_path_health($wwid);
+    my $ok = (defined $got && $got==$want);
+    printf "%-45s got=%-3s want=%-3s %s\n",$name,$got//'undef',$want,$ok?'PASS':'FAIL';
+    $exit=1 unless $ok;
+}
+my $W='3600a098038314239552b577063626b70';
+my $maps="$W $W\nother otherwwid\n";
+c('incident: 4 active paths -> live',  $maps, "$W active running\n$W active running\n$W active running\n$W active running\n", $W, 1);
+c('orphan: all paths failed -> reap',  $maps, "$W failed running\n$W failed faulty\n", $W, 0);
+c('1 active among failed -> live',     $maps, "$W failed running\n$W active running\n", $W, 1);
+c('active but offline dev -> orphan',  $maps, "$W active offline\n", $W, 0);
+c('no map for wwid -> 0',              "other otherwwid\n", "other active running\n", $W, 0);
+c('map but no path rows -> -1',        $maps, "other active running\n", $W, -1);
+@responses=(undef,undef);
+{ my $g=PVE::Storage::Custom::NetAppONTAP::Multipath::multipath_path_health($W);
+  my $ok=(defined $g && $g==-1); printf "%-45s got=%-3s want=-1  %s\n",'multipathd unreachable -> -1',$g//'undef',$ok?'PASS':'FAIL'; $exit=1 unless $ok; }
+print $exit?"\nSOME FAILED\n":"\nALL PASS\n"; exit $exit;
+EOF
+perl /tmp/test_section26_health.pl
+```
+
+**Expected:** all 7 cases PASS, exit 0. The first case (`4 active paths -> live` returns 1) is the exact incident condition: a live device must report "do not reap".
+
+### 26.2 LUN list pagination completeness (offline)
+
+```bash
+cat > /tmp/test_section26_paginate.pl <<'EOF'
+#!/usr/bin/perl
+use strict; use warnings;
+use lib "/usr/share/perl5";
+use PVE::Storage::Custom::NetAppONTAP::API;
+my $self = bless {}, 'PVE::Storage::Custom::NetAppONTAP::API';
+my @eps; my $exit = 0;
+no warnings 'redefine';
+*PVE::Storage::Custom::NetAppONTAP::API::get = sub {
+    return { records => [{name=>'lun0'},{name=>'lun1'}],
+             _links => { next => { href => '/api/storage/luns?fields=name&start.tag=P2' } } };
+};
+*PVE::Storage::Custom::NetAppONTAP::API::_request = sub {
+    my ($s,$m,$ep)=@_; push @eps,$ep;
+    return { records=>[{name=>'lun2'},{name=>'lun3'}], _links=>{next=>{href=>'/api/storage/luns?fields=name&start.tag=P3'}} } if $ep=~/P2/;
+    return { records=>[{name=>'lun4'}] } if $ep=~/P3/;
+    return { records=>[] };
+};
+my $all = $self->_get_all_records('/storage/luns', { name=>'pve_*' });
+my @n = map { $_->{name} } @$all;
+my $ok = (@n==5 && join(',',@n) eq 'lun0,lun1,lun2,lun3,lun4'
+          && $eps[0] eq '/storage/luns?fields=name&start.tag=P2'   # /api stripped, no /api/api
+          && $eps[1] eq '/storage/luns?fields=name&start.tag=P3');
+printf "records=%d names=[%s]\npage2=%s\npage3=%s\n", scalar(@n), join(',',@n), $eps[0], $eps[1];
+print $ok?"\nPAGINATION PASS\n":"\nPAGINATION FAIL\n"; exit($ok?0:1);
+EOF
+perl /tmp/test_section26_paginate.pl
+```
+
+**Expected:** 5 records `lun0..lun4` across 3 pages; next-page endpoints have the leading `/api` stripped (no doubled `/api/api`); `PAGINATION PASS`, exit 0.
+
+### 26.3 Static regression guards
+
+```bash
+P=lib/PVE/Storage/Custom/NetAppONTAPPlugin.pm
+M=lib/PVE/Storage/Custom/NetAppONTAP/Multipath.pm
+A=lib/PVE/Storage/Custom/NetAppONTAP/API.pm
+
+# Path-health gate is consulted before reaping in the first pass
+grep -A 180 '^sub _cleanup_orphaned_devices' "$P" | grep -c 'multipath_path_health'
+# Expected: >= 2 (first-pass reap gate + second-pass warning gate)
+
+# Grace period present
+grep -A 180 '^sub _cleanup_orphaned_devices' "$P" | grep -c 'ORPHAN_GRACE_SECS'
+# Expected: >= 2 (declare + compare)
+
+# Helper exists and is exported
+grep -c 'sub multipath_path_health' "$M"            # Expected: 1
+grep -c 'multipath_path_health' "$M"                # exported + defined: >= 2
+
+# Pagination helper exists and lun_list uses it (no naked max_records=1000 cap)
+grep -c 'sub _get_all_records' "$A"                 # Expected: 1
+grep -A 8 '^sub lun_list' "$A" | grep -c '_get_all_records'   # Expected: 1
+grep -A 8 '^sub lun_list' "$A" | grep -c 'max_records => 1000' # Expected: 0 (no longer hard-capped)
+
+# next-link /api stripping present in the helper
+grep -A 40 '^sub _get_all_records' "$A" | grep -c 'next_ep'  # Expected: >= 2 (strip + use)
+```
+
+### 26.4 Functional reproduce on simulator (MANDATORY host-side assertions, v0.2.14 rule)
+
+Reproduces the EXACT customer trigger: **hot-add a disk to a RUNNING VM**, then force the reaper to run while the LUN is "missing" from the alive set, and assert the live device SURVIVES. The running-VM condition is essential: QEMU holds the block device open, so the pre-fix reaper's `multipath -f` failed and fell back to `dmsetup remove --force`, ripping the map out from under QEMU and causing I/O errors. (With the VM stopped the teardown is silent and only resurfaces as a rebuild on next start -- which is why "power-cycle the VM" appeared to fix it.) NOTE: QEMU's open fd is NOT a sysfs holder, so `is_device_in_use()` does NOT detect it -- the path-health gate is the load-bearing protection here, not an in-use check.
+
+```bash
+# 1. VM 9000 must be RUNNING. Hot-add a disk on the plugin storage.
+qm status 9000                            # ensure: status: running
+qm set 9000 --scsi1 netappFAS_Node2:1     # 1 GiB, hot-plug into running guest
+# Identify the new WWID (e.g. via the volume's LUN serial or fresh multipath map)
+W=$(multipath -ll | awk '/NETAPP/{print prev} {prev=$1}' | tail -1)   # newest NETAPP map
+echo "new WWID = $W"
+
+# 2. Confirm the device is healthy (active paths) and in use by QEMU
+multipath -ll "$W"        # expect: paths in 'active ready running'
+fuser -v "/dev/mapper/$W" 2>&1 | grep -q qemu && echo "in use by QEMU (expected)"
+
+# 3. Force the reaper with an alive set that OMITS the new LUN (simulate lag).
+dmesg -C   # clear kernel ring buffer so we can detect any NEW I/O error
+perl -I/usr/share/perl5 -e '
+use PVE::Storage;
+use PVE::Storage::Custom::NetAppONTAPPlugin;
+my $W = shift;
+# Monkeypatch lun_list to return EMPTY (worst-case truncation/lag)
+no warnings "redefine";
+*PVE::Storage::Custom::NetAppONTAP::API::lun_list = sub { return []; };
+my $scfg = PVE::Storage::config()->{ids}{netappFAS_Node2};
+my $api  = PVE::Storage::Custom::NetAppONTAPPlugin::_get_api($scfg);
+PVE::Storage::Custom::NetAppONTAPPlugin::_cleanup_orphaned_devices($api, "netappFAS_Node2");
+' "$W"
+
+# 4. ASSERT the live device SURVIVED the reaper (the bug would have removed it)
+multipath -ll "$W" | grep -q . && echo "PASS: live device survived reaper" \
+                               || echo "FAIL: reaper removed a live device (REGRESSION)"
+test -b "/dev/mapper/$W" && echo "PASS: /dev/mapper/$W still present" \
+                         || echo "FAIL: block device gone"
+# 4a. No new kernel I/O error on the device, VM still running
+dmesg | grep -q "I/O error.*dm-" && echo "FAIL: I/O error appeared (REGRESSION)" \
+                                 || echo "PASS: no new I/O error"
+qm status 9000 | grep -q running && echo "PASS: VM still running" || echo "FAIL: VM not running"
+
+# 5. Now delete for real and assert HOST-SIDE teardown (v0.2.14 rule)
+SLAVES=$(ls "/sys/block/$(basename $(readlink -f /dev/mapper/$W))/slaves/" 2>/dev/null)
+qm set 9000 --delete scsi1
+sleep 5
+# 5a. multipath device gone
+multipath -ll "$W" 2>/dev/null | grep -q . && echo "FAIL: dm-multipath residual" || echo "PASS: multipath gone"
+# 5b. /dev/mapper gone
+test -e "/dev/mapper/$W" && echo "FAIL: /dev/mapper residual" || echo "PASS: /dev/mapper gone"
+# 5c. each sd* slave removed from /sys/block
+for s in $SLAVES; do test -e "/sys/block/$s" && echo "FAIL: slave $s residual" || echo "PASS: slave $s gone"; done
+```
+
+**Expected:** step 4 -> both PASS (the central regression: a live device with active paths is NOT reaped even when `lun_list` returns nothing). Step 5 -> all PASS (clean host-side teardown). On the ONTAP simulator note that a single-controller sim still satisfies this test; the alive-set omission is forced via monkeypatch so no real LUN deletion timing is needed.
+
+### 26.5 Grace-period guard (offline logic)
+
+```bash
+# A WWID tracked < 300s ago must be skipped by the reaper even when absent
+# from the alive set. Verify the guard exists and uses the tracked timestamp.
+grep -A 120 '^sub _cleanup_orphaned_devices' lib/PVE/Storage/Custom/NetAppONTAPPlugin.pm \
+  | grep -E 'time\(\) - \$tracked_at|ORPHAN_GRACE_SECS'
+# Expected: shows the `(time() - $tracked_at) < $ORPHAN_GRACE_SECS` skip guard
+```
+
+---
+
 ## Cleanup
 
 ```bash
@@ -2001,6 +2182,34 @@ pvesm list $STORAGE
 ## Release Test Results
 
 Each release must pass all tests above before publishing. Results are recorded below.
+
+### v0.2.17-1 Orphan Reaper Path-Health Gate + LUN List Pagination Release (2026-05-29)
+
+**Scope:** Section 26 (new) + paginated API functions against real ONTAP + full disk lifecycle regression.
+
+**Environment:** `pc-pve1` (PVE 9.1, 0.2.17-1 deployed via `make install`). ONTAP simulator (192.168.1.194, restored after an outage during this session). Storage `netapp1` (iSCSI).
+
+**Section 26.1 — path-health gate logic (offline mock):** 7/7 PASS. Incident condition (`4 active paths -> live` returns 1), `all paths failed -> 0`, `1 active among failed -> 1`, `active+offline -> 0`, `no map -> 0`, `map but no path rows -> -1`, `multipathd unreachable -> -1`.
+
+**Section 26.2 — LUN list pagination (offline mock):** PASS. 5 records assembled across 3 pages; leading `/api` stripped from `_links.next.href` (no doubled `/api/api`).
+
+**Section 26.3 — static regression guards:** all match (path-health gate referenced in both reap passes, grace period present, helper exported, `lun_list` uses `_get_all_records` with no hard `max_records => 1000` cap, `/api` stripping present).
+
+**Section 26.4 — RUNNING-VM functional reproduce (real ONTAP + multipathd):**
+- Hot-added scsi1 to running VM 9000; new device had 2 `active ready running` paths, held open by QEMU.
+- Forced reaper with `lun_list` returning empty (worst-case lag/truncation):
+  - Grace period (WWID tracked seconds ago): reaper skipped silently — device survived, VM running, 0 I/O error. PASS.
+  - Grace expired (ancient timestamp injected): path-health gate fired — "Refusing to remove a live device" — device survived, 0 I/O error. PASS.
+- `multipath_path_health()` called directly against real multipathd returned **1** (active paths correctly detected; the `%m %t %o` wildcards parse on this multipath-tools version — not a `-1` fallback).
+- Real free (`qm set --delete unused0`): host-side teardown clean — multipath gone, `/dev/mapper` gone, both sd slaves gone, volume deleted on ONTAP, scsi0 untouched, 0 I/O error. PASS.
+
+**Real-orphan reap (reverse direction, real ONTAP):** deleted a LUN+volume directly via API (bypassing `free_image`) to create a genuine orphan; paths failed within ~15s; `multipath_path_health()` returned **0**; reaper reaped it ("removing stale device ... all paths failed") with both sd slaves removed. PASS — legitimate orphan cleanup is NOT broken.
+
+**Paginated API functions (real ONTAP):** `lun_list`, `volume_list`, `igroup_list`, `snapshot_list`, `volume_get_clone_children` all returned correctly.
+
+**Full disk lifecycle (real ONTAP):** alloc + activate (scsi0/scsi1), snapshot (dual-disk), rollback, snapshot delete, resize (1G -> 2G, block device confirmed), full clone (9000 -> 9001), destroy --purge of both VMs — all PASS; final state clean (0 multipath maps, 0 test volumes, tracking file `{}`, 0 I/O errors).
+
+**Result: PASS.** Environment restored to clean state.
 
 ### v0.2.16-1 Temp Clone Reaper Idempotency Fix Release (2026-05-24)
 

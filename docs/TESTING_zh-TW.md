@@ -1593,6 +1593,187 @@ grep -A 80 '^sub _cleanup_orphaned_devices' "$P" | grep -c '_read_wwid_state.*ot
 
 ---
 
+## 26. 孤兒清理路徑健康閘門 + LUN 清單分頁（v0.2.17）
+
+客戶正式環境事故（2026-05，節點 pve15，儲存 `netappFAS_Node2`）：在執行中的 VM 熱加一顆硬碟後（`update VM 608103: -scsi1 netappFAS_Node2:32`），這顆全新 LUN 的 multipath 裝置（WWID `...626b70`，4 條健康路徑）被 `_cleanup_orphaned_devices()` 拆除（「removing stale device ... LUN deleted on ONTAP」），導致執行中的 VM 磁碟出現 `I/O error, dev dm-68`。VM 關機重開即「恢復」，是因為下次 activate 會重新探索 multipath，而此時 `lun_list` 已不再延遲。
+
+**根因（兩個缺陷）：**
+1. reaper 以單一 `lun_list()` 快照建立「存活集合」，並把不在集合內的已追蹤 WWID 一律清除；但剛建立的 LUN 可能在一段時間內查不到（ONTAP read-after-write／傳播延遲，與 v0.2.9 ASA 同類）。LUN 數量過多時該查詢還可能被截斷。
+2. reaper 呼叫 `cleanup_lun_devices()` 前完全不檢查 multipath 路徑健康狀態。有 active 路徑（使用中、活著）的裝置，和真正的殘留（所有路徑都 failed）長得一模一樣。
+
+**修正：**
+- **路徑健康閘門（`multipath_path_health()`）：** 絕不拆除仍有 active 路徑（或狀態無法判定）的裝置。真正的殘留所有路徑都會 failed。
+- **寬限期：** 在過去 300 秒內才被追蹤的 WWID 不拆（沿用既有的首次追蹤時間戳，不新增任何狀態檔）。
+- **第二輪閘門：** 「untracked stale」操作者警告只對路徑全失效的裝置發出，因此絕不會對健康裝置建議 `multipath -f`。
+- **`lun_list()` 分頁（`_get_all_records()`）：** 追隨 ONTAP REST 的 `_links.next.href`，讓超過 1000 顆 LUN 的 SVM 不會被靜默截斷。同時套用於 `volume_list`、`volume_get_clone_children`、`igroup_list`、`snapshot_list`。
+
+### 26.1 路徑健康閘門邏輯（離線，不需 ONTAP／multipath）
+
+```bash
+cat > /tmp/test_section26_health.pl <<'EOF'
+#!/usr/bin/perl
+use strict; use warnings;
+use lib "/usr/share/perl5";
+use PVE::Storage::Custom::NetAppONTAP::Multipath;
+my @responses; my $exit = 0;
+no warnings 'redefine';
+*PVE::Storage::Custom::NetAppONTAP::Multipath::_run_cmd = sub {
+    my $out = shift @responses; return wantarray ? ($out,'',0) : $out;
+};
+sub c {
+    my ($name,$maps,$paths,$wwid,$want)=@_;
+    @responses=($maps,$paths);
+    my $got = PVE::Storage::Custom::NetAppONTAP::Multipath::multipath_path_health($wwid);
+    my $ok = (defined $got && $got==$want);
+    printf "%-45s got=%-3s want=%-3s %s\n",$name,$got//'undef',$want,$ok?'PASS':'FAIL';
+    $exit=1 unless $ok;
+}
+my $W='3600a098038314239552b577063626b70';
+my $maps="$W $W\nother otherwwid\n";
+c('incident: 4 active paths -> live',  $maps, "$W active running\n$W active running\n$W active running\n$W active running\n", $W, 1);
+c('orphan: all paths failed -> reap',  $maps, "$W failed running\n$W failed faulty\n", $W, 0);
+c('1 active among failed -> live',     $maps, "$W failed running\n$W active running\n", $W, 1);
+c('active but offline dev -> orphan',  $maps, "$W active offline\n", $W, 0);
+c('no map for wwid -> 0',              "other otherwwid\n", "other active running\n", $W, 0);
+c('map but no path rows -> -1',        $maps, "other active running\n", $W, -1);
+@responses=(undef,undef);
+{ my $g=PVE::Storage::Custom::NetAppONTAP::Multipath::multipath_path_health($W);
+  my $ok=(defined $g && $g==-1); printf "%-45s got=%-3s want=-1  %s\n",'multipathd unreachable -> -1',$g//'undef',$ok?'PASS':'FAIL'; $exit=1 unless $ok; }
+print $exit?"\nSOME FAILED\n":"\nALL PASS\n"; exit $exit;
+EOF
+perl /tmp/test_section26_health.pl
+```
+
+**預期：** 7 個案例全 PASS，exit 0。第一個案例（`4 active paths -> live` 回傳 1）就是事故的確切條件：活著的裝置必須回報「不可拆」。
+
+### 26.2 LUN 清單分頁完整性（離線）
+
+```bash
+cat > /tmp/test_section26_paginate.pl <<'EOF'
+#!/usr/bin/perl
+use strict; use warnings;
+use lib "/usr/share/perl5";
+use PVE::Storage::Custom::NetAppONTAP::API;
+my $self = bless {}, 'PVE::Storage::Custom::NetAppONTAP::API';
+my @eps; my $exit = 0;
+no warnings 'redefine';
+*PVE::Storage::Custom::NetAppONTAP::API::get = sub {
+    return { records => [{name=>'lun0'},{name=>'lun1'}],
+             _links => { next => { href => '/api/storage/luns?fields=name&start.tag=P2' } } };
+};
+*PVE::Storage::Custom::NetAppONTAP::API::_request = sub {
+    my ($s,$m,$ep)=@_; push @eps,$ep;
+    return { records=>[{name=>'lun2'},{name=>'lun3'}], _links=>{next=>{href=>'/api/storage/luns?fields=name&start.tag=P3'}} } if $ep=~/P2/;
+    return { records=>[{name=>'lun4'}] } if $ep=~/P3/;
+    return { records=>[] };
+};
+my $all = $self->_get_all_records('/storage/luns', { name=>'pve_*' });
+my @n = map { $_->{name} } @$all;
+my $ok = (@n==5 && join(',',@n) eq 'lun0,lun1,lun2,lun3,lun4'
+          && $eps[0] eq '/storage/luns?fields=name&start.tag=P2'   # /api 已剝除，無 /api/api
+          && $eps[1] eq '/storage/luns?fields=name&start.tag=P3');
+printf "records=%d names=[%s]\npage2=%s\npage3=%s\n", scalar(@n), join(',',@n), $eps[0], $eps[1];
+print $ok?"\nPAGINATION PASS\n":"\nPAGINATION FAIL\n"; exit($ok?0:1);
+EOF
+perl /tmp/test_section26_paginate.pl
+```
+
+**預期：** 跨 3 頁取得 5 筆 `lun0..lun4`；下一頁端點的開頭 `/api` 已被剝除（無重複的 `/api/api`）；`PAGINATION PASS`，exit 0。
+
+### 26.3 靜態 regression 守則
+
+```bash
+P=lib/PVE/Storage/Custom/NetAppONTAPPlugin.pm
+M=lib/PVE/Storage/Custom/NetAppONTAP/Multipath.pm
+A=lib/PVE/Storage/Custom/NetAppONTAP/API.pm
+
+# 第一輪拆除前必須先諮詢路徑健康閘門
+grep -A 180 '^sub _cleanup_orphaned_devices' "$P" | grep -c 'multipath_path_health'
+# 預期: >= 2（第一輪拆除閘門 + 第二輪警告閘門）
+
+# 寬限期存在
+grep -A 180 '^sub _cleanup_orphaned_devices' "$P" | grep -c 'ORPHAN_GRACE_SECS'
+# 預期: >= 2（宣告 + 比較）
+
+# helper 存在且已 export
+grep -c 'sub multipath_path_health' "$M"            # 預期: 1
+grep -c 'multipath_path_health' "$M"                # export + 定義: >= 2
+
+# 分頁 helper 存在且 lun_list 有使用（不再有寫死的 max_records=1000 上限）
+grep -c 'sub _get_all_records' "$A"                 # 預期: 1
+grep -A 8 '^sub lun_list' "$A" | grep -c '_get_all_records'   # 預期: 1
+grep -A 8 '^sub lun_list' "$A" | grep -c 'max_records => 1000' # 預期: 0（不再寫死上限）
+
+# helper 內有處理下一頁連結的 /api 前綴剝除
+grep -A 40 '^sub _get_all_records' "$A" | grep -c 'next_ep'  # 預期: >= 2（剝除 + 使用）
+```
+
+### 26.4 模擬器功能性重現（強制 host-side 斷言，v0.2.14 守則）
+
+重現客戶的確切觸發條件：**在執行中的 VM 熱加硬碟**，接著在該 LUN 從存活集合中「消失」時強制執行 reaper，並斷言活裝置存活。執行中這個條件是關鍵：QEMU 開著該 block device，所以修正前 reaper 的 `multipath -f` 會失敗、退回 `dmsetup remove --force`，把 map 從 QEMU 底下強制抽掉而造成 I/O error。（VM 關機時拆除是靜默的，只會在下次開機重建時浮現——這正是「關機重開就好」的原因。）注意：QEMU 的開啟檔案描述子不是 sysfs holder，所以 `is_device_in_use()` 偵測不到它——路徑健康閘門才是這裡真正的防線，而非 in-use 檢查。
+
+```bash
+# 1. VM 9000 必須在執行中。在 plugin 儲存上熱加一顆硬碟。
+qm status 9000                            # 確認: status: running
+qm set 9000 --scsi1 netappFAS_Node2:1     # 1 GiB，熱插入執行中的 guest
+# 找出新 WWID（例如透過 volume 的 LUN serial 或新出現的 multipath map）
+W=$(multipath -ll | awk '/NETAPP/{print prev} {prev=$1}' | tail -1)   # 最新的 NETAPP map
+echo "new WWID = $W"
+
+# 2. 確認裝置健康（active 路徑）且正被 QEMU 使用
+multipath -ll "$W"        # 預期: 路徑為 'active ready running'
+fuser -v "/dev/mapper/$W" 2>&1 | grep -q qemu && echo "in use by QEMU (expected)"
+
+# 3. 用一個「省略該新 LUN」的存活集合強制執行 reaper（模擬延遲）。
+dmesg -C   # 清空 kernel ring buffer 以偵測任何新的 I/O error
+perl -I/usr/share/perl5 -e '
+use PVE::Storage;
+use PVE::Storage::Custom::NetAppONTAPPlugin;
+my $W = shift;
+# Monkeypatch lun_list 回傳空集合（最壞情況: 截斷/延遲）
+no warnings "redefine";
+*PVE::Storage::Custom::NetAppONTAP::API::lun_list = sub { return []; };
+my $scfg = PVE::Storage::config()->{ids}{netappFAS_Node2};
+my $api  = PVE::Storage::Custom::NetAppONTAPPlugin::_get_api($scfg);
+PVE::Storage::Custom::NetAppONTAPPlugin::_cleanup_orphaned_devices($api, "netappFAS_Node2");
+' "$W"
+
+# 4. 斷言活裝置在 reaper 之後存活（修正前的 bug 會把它拆掉）
+multipath -ll "$W" | grep -q . && echo "PASS: live device survived reaper" \
+                               || echo "FAIL: reaper removed a live device (REGRESSION)"
+test -b "/dev/mapper/$W" && echo "PASS: /dev/mapper/$W still present" \
+                         || echo "FAIL: block device gone"
+# 4a. 裝置上沒有新的 kernel I/O error，VM 仍在執行
+dmesg | grep -q "I/O error.*dm-" && echo "FAIL: I/O error appeared (REGRESSION)" \
+                                 || echo "PASS: no new I/O error"
+qm status 9000 | grep -q running && echo "PASS: VM still running" || echo "FAIL: VM not running"
+
+# 5. 接著真正刪除，斷言 host-side 清理（v0.2.14 守則）
+SLAVES=$(ls "/sys/block/$(basename $(readlink -f /dev/mapper/$W))/slaves/" 2>/dev/null)
+qm set 9000 --delete scsi1
+sleep 5
+# 5a. multipath 裝置消失
+multipath -ll "$W" 2>/dev/null | grep -q . && echo "FAIL: dm-multipath residual" || echo "PASS: multipath gone"
+# 5b. /dev/mapper 消失
+test -e "/dev/mapper/$W" && echo "FAIL: /dev/mapper residual" || echo "PASS: /dev/mapper gone"
+# 5c. 每個 sd* slave 已從 /sys/block 移除
+for s in $SLAVES; do test -e "/sys/block/$s" && echo "FAIL: slave $s residual" || echo "PASS: slave $s gone"; done
+```
+
+**預期：** 步驟 4 → 兩項皆 PASS（核心 regression：即使 `lun_list` 回傳空集合，有 active 路徑的活裝置也不會被拆）。步驟 5 → 全 PASS（host-side 乾淨清理）。注意 ONTAP 模擬器即使只有單一控制器仍可通過本測試；存活集合的省略是用 monkeypatch 強制達成，因此不需要真實的 LUN 刪除時序。
+
+### 26.5 寬限期守則（離線邏輯）
+
+```bash
+# 在過去 300 秒內被追蹤的 WWID，即使不在存活集合中，reaper 也必須跳過。
+# 驗證守則存在且使用了追蹤時間戳。
+grep -A 120 '^sub _cleanup_orphaned_devices' lib/PVE/Storage/Custom/NetAppONTAPPlugin.pm \
+  | grep -E 'time\(\) - \$tracked_at|ORPHAN_GRACE_SECS'
+# 預期: 顯示 `(time() - $tracked_at) < $ORPHAN_GRACE_SECS` 跳過守則
+```
+
+---
+
 ## 清除
 
 ```bash
@@ -1612,6 +1793,34 @@ pvesm list $STORAGE
 ## 發佈測試結果
 
 每次發佈前都必須通過上述所有測試。結果記錄如下。
+
+### v0.2.17-1 孤兒清理路徑健康閘門 + LUN 清單分頁 Release (2026-05-29)
+
+**範圍:** Section 26（新增）+ 分頁 API 函式對真實 ONTAP + 完整硬碟生命週期回歸。
+
+**環境:** `pc-pve1`（PVE 9.1,透過 `make install` 部署 0.2.17-1）。ONTAP 模擬器（192.168.1.194,本次作業期間曾斷線後修復）。儲存 `netapp1`（iSCSI）。
+
+**Section 26.1 —— 路徑健康閘門邏輯（離線 mock）:** 7/7 PASS。事故條件（`4 active paths -> live` 回傳 1）、`all paths failed -> 0`、`1 active among failed -> 1`、`active+offline -> 0`、`no map -> 0`、`map but no path rows -> -1`、`multipathd unreachable -> -1`。
+
+**Section 26.2 —— LUN 清單分頁（離線 mock）:** PASS。跨 3 頁組出 5 筆;`_links.next.href` 開頭的 `/api` 已剝除（無重複 `/api/api`）。
+
+**Section 26.3 —— 靜態 regression 守則:** 全部相符（兩輪拆除皆引用路徑健康閘門、寬限期存在、helper 已 export、`lun_list` 使用 `_get_all_records` 且無寫死的 `max_records => 1000` 上限、`/api` 剝除存在）。
+
+**Section 26.4 —— 執行中 VM 功能性重現（真實 ONTAP + multipathd）:**
+- 對執行中的 VM 9000 熱加 scsi1;新裝置有 2 條 `active ready running` 路徑,且被 QEMU 開著。
+- 用 `lun_list` 回空集合（最壞情況延遲／截斷）強制 reaper:
+  - 寬限期內（WWID 剛追蹤幾秒）:reaper 靜默跳過——裝置存活、VM 續跑、0 I/O error。PASS。
+  - 寬限期失效（注入舊時間戳）:路徑健康閘門觸發——「Refusing to remove a live device」——裝置存活、0 I/O error。PASS。
+- 直接對真實 multipathd 呼叫 `multipath_path_health()` 回傳 **1**（正確偵測 active 路徑;本機 multipath-tools 版本支援 `%m %t %o` 格式,並非 `-1` 保險退路）。
+- 真正釋放（`qm set --delete unused0`）:host-side 乾淨拆除——multipath 消失、`/dev/mapper` 消失、兩個 sd slave 消失、ONTAP volume 已刪、scsi0 不受影響、0 I/O error。PASS。
+
+**真殘留清除（反方向,真實 ONTAP）:** 透過 API 直接刪除 LUN+volume（繞過 `free_image`）製造真實殘留;路徑於 ~15s 內失效;`multipath_path_health()` 回傳 **0**;reaper 確實清除（「removing stale device ... all paths failed」）且兩個 sd slave 移除。PASS——正常的殘留清理功能未被破壞。
+
+**分頁 API 函式（真實 ONTAP）:** `lun_list`、`volume_list`、`igroup_list`、`snapshot_list`、`volume_get_clone_children` 全部正常回傳。
+
+**完整硬碟生命週期（真實 ONTAP）:** alloc + activate（scsi0/scsi1）、snapshot（雙碟）、rollback、snapshot 刪除、resize（1G -> 2G,確認 block device）、full clone（9000 -> 9001）、兩台 VM destroy --purge——全 PASS;最終狀態乾淨（0 個 multipath map、0 個測試 volume、tracking 檔 `{}`、0 I/O error）。
+
+**結果:PASS。** 環境已還原為乾淨狀態。
 
 ### v0.2.16-1 Temp Clone 背景清理 idempotency 修正 Release (2026-05-24)
 

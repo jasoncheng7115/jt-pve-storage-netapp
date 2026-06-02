@@ -2,6 +2,29 @@
 
 All notable changes to the NetApp ONTAP Storage Plugin for Proxmox VE are documented here.
 
+## [0.2.17] - 2026-05-29
+
+### Orphan Reaper Path-Health Gate + LUN List Pagination Release
+
+**Bug Fix (production incident, customer report 2026-05, node pve15):**
+
+Hot-adding a disk to a **running** VM could cause immediate I/O errors on that brand-new disk (`I/O error, dev dm-NN`). Shutting the VM down and starting it again "fixed" it.
+
+- **Root cause (two defects):**
+  1. `_cleanup_orphaned_devices()` built its "alive set" from a single `lun_list()` snapshot and reaped any tracked WWID missing from it. A freshly-created LUN can be absent from that bulk query for a window (ONTAP read-after-write / propagation lag — the same class as the v0.2.9 ASA eventual-consistency issue, now feeding the reaper's alive set). With a large LUN count the query could also be truncated.
+  2. The reaper called `cleanup_lun_devices()` with **no check of multipath path health**, so a live device with active paths was indistinguishable from a genuine orphan. Because the VM was running, QEMU held the device open: `multipath -f` failed and the `dmsetup remove --force` fallback ripped the map out from under QEMU, producing the I/O errors. (Note: QEMU's open fd is not a sysfs holder, so `is_device_in_use()` does not detect it — the path-health gate is the load-bearing protection.)
+
+- **Fix 1 — path-health gate (`Multipath::multipath_path_health()`):** the reaper NEVER removes a device that still has an active path (or whose state is indeterminate). A genuine orphan has ALL paths failed/faulty. Applied to both the first-pass reap and the second-pass "untracked stale" operator warning, so the plugin no longer suggests `multipath -f` on a healthy device either.
+
+- **Fix 2 — grace period:** a WWID tracked within the last 300 seconds is not reaped, covering the read-after-write window. Reuses the existing first-tracked timestamp; no new state file.
+
+- **Fix 3 — LUN list pagination (`API::_get_all_records()`):** `lun_list()` now follows ONTAP REST `_links.next` so an SVM with 1000+ LUNs never silently truncates the alive set. The same pagination is applied to `volume_list`, `volume_get_clone_children`, `igroup_list`, and `snapshot_list`.
+
+**Testing:**
+
+- `docs/TESTING.md` Section 26 added: path-health logic (7 cases), pagination completeness, static regression guards, a RUNNING-VM functional reproduce with mandatory host-side device assertions (v0.2.14 rule), and the grace-period guard.
+- Full simulator test PASS: both reaper defenses verified live; a genuine orphan (LUN deleted on ONTAP, all paths failed) is still reaped with clean host-side teardown; all five paginated API functions return correctly against real ONTAP; full disk lifecycle (alloc / snapshot / rollback / resize / full clone / free) clean with zero I/O errors.
+
 ## [0.2.16] - 2026-05-24
 
 ### Temp Clone Reaper Idempotency Fix Release

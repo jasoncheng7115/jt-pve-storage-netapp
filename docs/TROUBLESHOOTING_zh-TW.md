@@ -127,20 +127,20 @@ journalctl -xeu pvedaemon | grep -i "netapp\|ontap" | tail -20
    vserver iscsi show -vserver <svm-name>
    ```
 
-### ONTAP 升級或重載時,儲存短暫顯示「inactive」
+### ONTAP 升級或重載時，儲存短暫顯示「inactive」
 
 **症狀：**
-- 某 netappontap 儲存在 Web UI 短暫變成 `inactive`、幾秒後又恢復,尤其在 ONTAP／韌體升級(控制器 takeover/giveback)期間,或 ONTAP 重載時。
-- `journalctl -u pvestatd` 出現短暫的 `unreachable ... Reason: ... read timeout`,會自己消失。
+- 某 netappontap 儲存在 Web UI 短暫變成 `inactive`、幾秒後又恢復，尤其在 ONTAP／韌體升級(控制器 takeover/giveback)期間，或 ONTAP 重載時。
+- `journalctl -u pvestatd` 出現短暫的 `unreachable ... Reason: ... read timeout`，會自己消失。
 
-**這是 v0.2.19+ 的預期設計行為,而且不影響執行中的 VM。**
+**這是 v0.2.19+ 的預期設計行為，而且不影響執行中的 VM。**
 
-- pvestatd 健康路徑(`activate_storage`／`status`)採用短逾時且不重試(`ontap-status-timeout`,預設 5s)。ONTAP 一時變慢時,外掛快速失敗、下一輪約 10s 的輪詢就恢復,而不會拖住 pvestatd、也不會把同節點**其他**儲存一起拖成 `inactive`。
-- 全程**執行中的 VM I/O 不中斷**——`inactive` 只影響狀態顯示與新操作,不影響已啟用的裝置。可用 `multipath -ll` 確認(該 LUN 的路徑維持 `active ready running`)。
+- pvestatd 健康路徑(`activate_storage`／`status`)採用短逾時且不重試(`ontap-status-timeout`，預設 5s)。ONTAP 一時變慢時，外掛快速失敗、下一輪約 10s 的輪詢就恢復，而不會拖住 pvestatd、也不會把同節點**其他**儲存一起拖成 `inactive`。
+- 全程**執行中的 VM I/O 不中斷**——`inactive` 只影響狀態顯示與新操作，不影響已啟用的裝置。可用 `multipath -ll` 確認(該 LUN 的路徑維持 `active ready running`)。
 
 **該怎麼做：**
-- 若一兩輪內就恢復,不必處理——這就是預期的 fast-fail 行為。
-- 若是**重載但健康**的 ONTAP 經常閃爍,把健康路徑逾時調大:
+- 若一兩輪內就恢復，不必處理——這就是預期的 fast-fail 行為。
+- 若是**重載但健康**的 ONTAP 經常閃爍，把健康路徑逾時調大：
   ```bash
   pvesm set <storeid> --ontap-status-timeout 10   # 預設 5,範圍 1-30
   ```
@@ -148,7 +148,7 @@ journalctl -xeu pvedaemon | grep -i "netapp\|ontap" | tail -20
 
 ### 重新啟用「在 ONTAP 故障期間被停用」的儲存
 
-若你曾用 `pvesm set <storeid> --disable 1` 停用儲存以度過 ONTAP 故障,**重新啟用前,請先把所有叢集節點的外掛升級到最新版**,再啟用。若在某些節點還跑舊版外掛時就先啟用,可能會再次觸發原本的問題(請求風暴打爆 ONTAP 管理閘道)。
+若你曾用 `pvesm set <storeid> --disable 1` 停用儲存以度過 ONTAP 故障，**重新啟用前，請先把所有叢集節點的外掛升級到最新版**，再啟用。若在某些節點還跑舊版外掛時就先啟用，可能會再次觸發原本的問題(請求風暴打爆 ONTAP 管理閘道)。
 
 ```bash
 # 在每個有掛這個儲存的節點上:

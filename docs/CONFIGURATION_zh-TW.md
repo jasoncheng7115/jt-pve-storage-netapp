@@ -234,7 +234,7 @@ netappontap: <storage-id>
 
 **型別：** integer（0-30）
 **預設：** 2
-**說明：** 在 `iscsiadm` discovery/login 之前,先做 TCP 預檢以跳過連不到的 iSCSI portal 的逾時(秒)。設為 `0` 可停用預檢(舊行為)。
+**說明：** 在 `iscsiadm` discovery/login 之前，先做 TCP 預檢以跳過連不到的 iSCSI portal 的逾時(秒)。設為 `0` 可停用預檢(舊行為)。
 
 ```bash
 --ontap-portal-probe-timeout 2   # 預設
@@ -242,14 +242,14 @@ netappontap: <storage-id>
 ```
 
 **備註：**
-- 若無此預檢,一個連不到的 LIF 每個會吃掉最多 30s discovery + 60s login,拖住 `activate_storage`／`status`。
+- 若無此預檢，一個連不到的 LIF 每個會吃掉最多 30s discovery + 60s login，拖住 `activate_storage`／`status`。
 - 高延遲或壅塞的儲存網路可加大。
 
 ### ontap-status-timeout
 
 **型別：** integer（1-30）
 **預設：** 5
-**說明：** 僅供 pvestatd 健康路徑(`activate_storage`／`status`)使用的每次 ONTAP REST 逾時,且不重試。讓退化的 ONTAP(例如 ONTAP／韌體升級時某控制器離線)不會拖住 pvestatd、也不會把同節點其他 netappontap 儲存拖成 `inactive`。
+**說明：** 僅供 pvestatd 健康路徑(`activate_storage`／`status`)使用的每次 ONTAP REST 逾時，且不重試。讓退化的 ONTAP(例如 ONTAP／韌體升級時某控制器離線)不會拖住 pvestatd、也不會把同節點其他 netappontap 儲存拖成 `inactive`。
 
 ```bash
 --ontap-status-timeout 5    # 預設
@@ -257,14 +257,14 @@ netappontap: <storage-id>
 ```
 
 **備註：**
-- 資料路徑(alloc／free／clone)不受影響,維持原本較長的逾時 + 重試。下一輪約 10s 的 pvestatd 輪詢就是重試,所以這裡不重試不會損失什麼。
-- 在重載但健康的 ONTAP 上,若 metadata 查詢偶爾超過此值,儲存可能短暫顯示 `inactive`、下一輪恢復。**執行中的 VM 不受影響**(裝置仍 map 著)。若看到這種閃爍,把此值調大即可。
+- 資料路徑(alloc／free／clone)不受影響，維持原本較長的逾時 + 重試。下一輪約 10s 的 pvestatd 輪詢就是重試，所以這裡不重試不會損失什麼。
+- 在重載但健康的 ONTAP 上，若 metadata 查詢偶爾超過此值，儲存可能短暫顯示 `inactive`、下一輪恢復。**執行中的 VM 不受影響**(裝置仍 map 著)。若看到這種閃爍，把此值調大即可。
 
 ### ontap-activate-deadline
 
 **型別：** integer（5-120）
 **預設：** 30
-**說明：** `activate_storage` 中 iSCSI discover/login 迴圈的 wall-clock 預算(秒)。一旦超過且已有至少一個 portal 登入成功,剩餘 portal 就延到下次 activation。界定 iSCSI 登入的累積時間,讓單一「連得到卻在登入時 hang」的 portal 不會拖住 pvestatd。
+**說明：** `activate_storage` 中 iSCSI discover/login 迴圈的 wall-clock 預算(秒)。一旦超過且已有至少一個 portal 登入成功，剩餘 portal 就延到下次 activation。界定 iSCSI 登入的累積時間，讓單一「連得到卻在登入時 hang」的 portal 不會拖住 pvestatd。
 
 ```bash
 --ontap-activate-deadline 30   # 預設
@@ -272,8 +272,8 @@ netappontap: <storage-id>
 ```
 
 **備註：**
-- 進行中的 login 絕不中斷,且在尚未有任何路徑時絕不跳過(必須取得至少一條路徑,否則誠實失敗)——所以不會把「慢但連得到」的儲存誤判成 inactive。
-- 被跳過的 portal 會在下次 activation 補上;multipath 備援會自我修復。
+- 進行中的 login 絕不中斷，且在尚未有任何路徑時絕不跳過(必須取得至少一條路徑，否則誠實失敗)——所以不會把「慢但連得到」的儲存誤判成 inactive。
+- 被跳過的 portal 會在下次 activation 補上；multipath 備援會自我修復。
 
 ## 標準 PVE 選項
 

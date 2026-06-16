@@ -6,138 +6,138 @@ NetApp ONTAP Storage Plugin for Proxmox VE 的所有重要變更都記錄在此�
 
 ### 殘留清理 N+1 REST 風暴修正(ONTAP 管理閘道負載）
 
-**Bug 修正(正式環境事故,客戶 2026-06-16——FAS 在 ONTAP 9.15.1P19;同叢集、同 plugin 的相關 ASA 9.14.1 沒事):**
+**Bug 修正(正式環境事故，客戶 2026-06-16——FAS 在 ONTAP 9.15.1P19；同叢集、同 plugin 的相關 ASA 9.14.1 沒事):**
 
-韌體升級後,FAS 管理 REST 變慢(~4s／請求)且間歇拒連;pvestatd 把該儲存反覆標成 `inactive`。全叢集停用該儲存後,積壓**緩慢**排空(19s → 14s → 12s …),證明負載來自 PVE 輪詢、而非 FAS 故障——且 `cluster show` 兩節點皆健康。
+韌體升級後，FAS 管理 REST 變慢(~4s／請求)且間歇拒連；pvestatd 把該儲存反覆標成 `inactive`。全叢集停用該儲存後，積壓**緩慢**消退(19s → 14s → 12s …)，證明負載來自 PVE 輪詢、而非 FAS 故障——且 `cluster show` 兩節點皆健康。
 
-- **根因:** `_cleanup_orphaned_devices()`——它在 `status()` 背景清理中、**每個節點每 ~10s 輪詢都會跑一次**——為了建立 alive-set,**對每顆 LUN 各打一次** `lun_get_wwid($lun->{name})`。這是 N+1 REST 風暴(`lun_get_serial` → `lun_get` → 每顆 LUN 一個 GET)。75 顆 LUN × N 個節點 = 每 10s ~75·N 個 REST 呼叫,足以把 ONTAP 管理閘道(mgwd)打進 congestion collapse。這是 mgwd **容量耗盡**,不是明確的速率限制(沒有 HTTP 429)。在同樣的 plugin 負載下,9.15.1P19 的 mgwd 明顯比 ASA 的 9.14.1 敏感得多。
-- **修正:** `lun_list()` 本來就在**一次**分頁呼叫裡回傳每顆 LUN 的 `serial_number`,因此改用 `serial_to_wwid()`(純本地運算、不打 REST)在本地算 WWID,而非每顆 LUN 各打一次。**~75 calls/輪 → 0 額外**;算出來的 alive-set **逐位元組相同**(已在真實 ONTAP 驗證)。其餘行為完全不變。
+- **根因：** `_cleanup_orphaned_devices()`——它在 `status()` 背景清理中、**每個節點每 ~10s 輪詢都會跑一次**——為了建立 alive-set,**對每顆 LUN 各打一次** `lun_get_wwid($lun->{name})`。這是 N+1 REST 風暴(`lun_get_serial` → `lun_get` → 每顆 LUN 一個 GET)。75 顆 LUN × N 個節點 = 每 10s ~75·N 個 REST 呼叫，足以把 ONTAP 管理閘道(mgwd)打進 congestion collapse。這是 mgwd **容量耗盡**，不是明確的速率限制(沒有 HTTP 429)。在同樣的 plugin 負載下，9.15.1P19 的 mgwd 明顯比 ASA 的 9.14.1 敏感得多。
+- **修正：** `lun_list()` 本來就在**一次**分頁呼叫裡回傳每顆 LUN 的 `serial_number`，因此改用 `serial_to_wwid()`(純本地運算、不打 REST)在本地算 WWID，而非每顆 LUN 各打一次。**~75 calls/輪 → 0 額外**；算出來的 alive-set **逐位元組相同**(已在真實 ONTAP 驗證)。其餘行為完全不變。
 
-**測試:**
+**測試：**
 
 - `docs/TESTING.md` 與 zh-TW 版新增 Section 30。
-- 新的真實 ONTAP 測試 `tests/cleanup_load.pl` **6/6**:配置 3 顆 LUN、instrument API,驗證清理期間 **0 次** per-LUN `lun_get` 呼叫、且每個 WWID 仍在 alive-set,再驗證 0 殘留。
-- 完整回歸、行為無變:`sim_functional` 13/13、單元 reaper 20/20 + status-timeout 13/13 + activate-budget 8/8、`make test` 全模組 OK。其餘每輪呼叫已稽核:`get_managed_capacity` 走 aggregate 提前返回(1 個呼叫、無 N+1);`_check_aggregate_capacity`(1 小時冷卻)與 `_check_lif_redundancy`(24 小時冷卻)的查詢本來就有節流。
+- 新的真實 ONTAP 測試 `tests/cleanup_load.pl` **6/6**：配置 3 顆 LUN、instrument API，驗證清理期間 **0 次** per-LUN `lun_get` 呼叫、且每個 WWID 仍在 alive-set，再驗證 0 殘留。
+- 完整回歸、行為無變：`sim_functional` 13/13、單元 reaper 20/20 + status-timeout 13/13 + activate-budget 8/8、`make test` 全模組 OK。其餘每輪呼叫已稽核：`get_managed_capacity` 走 aggregate 提前返回(1 個呼叫、無 N+1);`_check_aggregate_capacity`(1 小時冷卻)與 `_check_lif_redundancy`(24 小時冷卻)的查詢本來就有節流。
 
 ## [0.2.20] - 2026-06-16
 
 ### activate_storage iSCSI 登入預算 Release（「絕不卡住 PVE」）
 
-v0.2.19 的後續,把「絕不卡住 PVE」這條規則補完整。
+v0.2.19 的後續，把「絕不卡住 PVE」這條規則補完整。
 
-**強化:**
+**強化：**
 
-v0.2.19 已讓 pvestatd 健康路徑（`activate_storage`／`status`）改用短逾時、不重試的 API client,界定了 ONTAP REST 呼叫。但 `activate_storage` 還有一段 iSCSI discover/login 迴圈,它每個 portal 的逾時（probe 2s、discovery 30s、login 60s）只界定**單一** portal,並未界定整個迴圈的累積時間——數個「連得到卻在登入時 hang」的 LIF 加起來仍可能拖住 pvestatd（與 v0.2.12 同一個教訓:per-call 逾時不會界定迴圈總時間）。
+v0.2.19 已讓 pvestatd 健康路徑（`activate_storage`／`status`）改用短逾時、不重試的 API client，界定了 ONTAP REST 呼叫。但 `activate_storage` 還有一段 iSCSI discover/login 迴圈，它每個 portal 的逾時（probe 2s、discovery 30s、login 60s）只界定**單一** portal，並未界定整個迴圈的累積時間——數個「連得到卻在登入時 hang」的 LIF 加起來仍可能拖住 pvestatd（與 v0.2.12 同一個教訓：per-call 逾時不會界定迴圈總時間）。
 
-- **修正:** 新增 `ontap-activate-deadline` 選項（預設 30s）,界定 discover/login 的累積工作量。一旦超過預算**且**已有至少一個 portal 登入成功,剩餘 portal 就延到下次 activation 再處理（透過「已登入」快速路徑接手）。進行中的 login **絕不**中斷,且在尚未有任何路徑時**絕不**跳過——它必須取得至少一條路徑,否則就誠實失敗。multipath 備援會在下次 activation 自我修復;相較之下,卡住 pvestatd 糟糕得多。
-- `CLAUDE.md` 新增「PVE Daemon Isolation（never wedge PVE）」規則章節,為未來所有進入點記下此不變量。
-- **另外:** `activate_storage` 現在**只 snapshot 一次** iSCSI session(單一 `iscsiadm -m session`),而非透過 `is_portal_logged_in()` 對每個 portal 各跑一次。那些 per-portal 呼叫在 budget gate **之前**執行,所以退化的 iscsid 可能加上 N × 最多 30s,而 budget 管不到;一次 snapshot 讓迴圈 setup 成本固定。
+- **修正：** 新增 `ontap-activate-deadline` 選項（預設 30s），界定 discover/login 的累積工作量。一旦超過預算**且**已有至少一個 portal 登入成功，剩餘 portal 就延到下次 activation 再處理（透過「已登入」快速路徑接手）。進行中的 login **絕不**中斷，且在尚未有任何路徑時**絕不**跳過——它必須取得至少一條路徑，否則就誠實失敗。multipath 備援會在下次 activation 自我修復；相較之下，卡住 pvestatd 糟糕得多。
+- `CLAUDE.md` 新增「PVE Daemon Isolation（never wedge PVE）」規則章節，為未來所有進入點記下此不變量。
+- **另外：** `activate_storage` 現在**只 snapshot 一次** iSCSI session(單一 `iscsiadm -m session`)，而非透過 `is_portal_logged_in()` 對每個 portal 各跑一次。那些 per-portal 呼叫在 budget gate **之前**執行，所以退化的 iscsid 可能加上 N × 最多 30s，而 budget 管不到；一次 snapshot 讓迴圈 setup 成本固定。
 
-**測試:**
+**測試：**
 
 - `docs/TESTING.md` 與 zh-TW 版新增 Section 29。
-- 單元測試 8/8:超過預算且已有路徑 → 剩餘跳過;超過預算但 0 路徑 → 全部嘗試（絕不跳過）;預算內 → 全部嘗試。模擬器功能 regression 13/13(預算不會破壞正常 activation)。`make test` 所有模組 OK。
+- 單元測試 8/8：超過預算且已有路徑 → 剩餘跳過；超過預算但 0 路徑 → 全部嘗試（絕不跳過）；預算內 → 全部嘗試。模擬器功能 regression 13/13(預算不會破壞正常 activation)。`make test` 所有模組 OK。
 
 ## [0.2.19] - 2026-06-16
 
 ### pvestatd 隔離 + 殘留路徑 reaper + 連線重用 Release
 
-三個各自獨立的韌性修正,分別由客戶的 ONTAP 升級事故與先前的 LUN-ID 重用事故浮現。
+三個各自獨立的韌性修正，分別由客戶的 ONTAP 升級事故與先前的 LUN-ID 重用事故浮現。
 
-**修正 1 — 殘留 SCSI 路徑 reaper（在未執行拆除的節點上發生 LUN-ID 重用）:**
+**修正 1 — 殘留 SCSI 路徑 reaper（在未執行拆除的節點上發生 LUN-ID 重用）：**
 
-某節點無法為一顆活著的 LUN 建立 multipath map:`device-mapper: error getting device (-EBUSY)`,且 `multipath -ll` 看不到任何東西,其他節點卻一切正常。per-node igroup 模式會把每顆 LUN map 給**所有**節點;從未對該 LUN 執行 `free_image()` 的節點會留下殘留 `sd` 路徑;ONTAP 把釋放的 SCSI LUN-ID 重用給新 LUN;殘留 `sd`（此時已讀不出 WWID）遮蔽了被重用的 LUN-ID,device-mapper 便無法載入新 map。v0.2.18 的拆除掃除以 WWID 比對,因此抓不到這些殘留——它們已不再回報任何可比對的 WWID。
+某節點無法為一顆活著的 LUN 建立 multipath map:`device-mapper: error getting device (-EBUSY)`，且 `multipath -ll` 看不到任何東西，其他節點卻一切正常。per-node igroup 模式會把每顆 LUN map 給**所有**節點；從未對該 LUN 執行 `free_image()` 的節點會留下殘留 `sd` 路徑；ONTAP 把釋放的 SCSI LUN-ID 重用給新 LUN；殘留 `sd`（此時已讀不出 WWID）遮蔽了被重用的 LUN-ID,device-mapper 便無法載入新 map。v0.2.18 的拆除掃除以 WWID 比對，因此抓不到這些殘留——它們已不再回報任何可比對的 WWID。
 
-- **修正:** 新增 `Multipath::list_netapp_scsi_paths()`（裸 `sd` 拓樸列舉）+ `_reap_stale_scsi_paths()`,作為 `_cleanup_orphaned_devices()` 的第三個 pass。只有在以下條件全部成立時才會移除一條 `sd`:廠商為 NETAPP、沒有任何 holder 且未掛載,且符合其一——(Case A) 它是本儲存追蹤過、ONTAP 上已刪除 LUN 的殘留;或 (Case B) 同一個 iSCSI target IQN + 同一個 LUN-ID 上有另一條 sibling `sd` 讀到活著（ONTAP alive-set）的 WWID,而這一條不同或空白（LUN-ID 被重用）。300s 寬限期;任何不確定一律放著不動。reap 後以 rescan + multipath reload 自我修復。
+- **修正：** 新增 `Multipath::list_netapp_scsi_paths()`（裸 `sd` 拓樸列舉）+ `_reap_stale_scsi_paths()`，作為 `_cleanup_orphaned_devices()` 的第三個 pass。只有在以下條件全部成立時才會移除一條 `sd`：廠商為 NETAPP、沒有任何 holder 且未掛載，且符合其一——(Case A) 它是本儲存追蹤過、ONTAP 上已刪除 LUN 的殘留；或 (Case B) 同一個 iSCSI target IQN + 同一個 LUN-ID 上有另一條 sibling `sd` 讀到活著（ONTAP alive-set）的 WWID，而這一條不同或空白（LUN-ID 被重用）。300s 寬限期；任何不確定一律放著不動。reap 後以 rescan + multipath reload 自我修復。
 
-**修正 2 — pvestatd 逾時隔離（退化的 ONTAP 不再卡住 PVE 或同節點其他儲存）:**
+**修正 2 — pvestatd 逾時隔離（退化的 ONTAP 不再卡住 PVE 或同節點其他儲存）：**
 
-ONTAP 升級期間,某控制器的管理 REST 發生 read timeout。`activate_storage`／`status` 把數個 15s × 2 retry 的呼叫疊成 `status update time (189s)`,而 pvestatd 依序處理所有儲存的迴圈把同節點的另一個 netappontap 儲存一起拖成 `inactive`。
+ONTAP 升級期間，某控制器的管理 REST 發生 read timeout。`activate_storage`／`status` 把數個 15s × 2 retry 的呼叫疊成 `status update time (189s)`，而 pvestatd 依序處理所有儲存的迴圈把同節點的另一個 netappontap 儲存一起拖成 `inactive`。
 
-- **修正:** 新增 `ontap-status-timeout` 選項（預設 5s）。pvestatd 健康路徑（`activate_storage`／`status` 前景）改用短逾時、單次嘗試的 API client——下一輪約 10s 的輪詢就是重試。資料路徑（alloc／free／clone）維持原本的韌性 client。實測快速失敗:**5.0s vs 32.0s**。
+- **修正：** 新增 `ontap-status-timeout` 選項（預設 5s）。pvestatd 健康路徑（`activate_storage`／`status` 前景）改用短逾時、單次嘗試的 API client——下一輪約 10s 的輪詢就是重試。資料路徑（alloc／free／clone）維持原本的韌性 client。實測快速失敗：**5.0s vs 32.0s**。
 
-**修正 3 — HTTP keep-alive（不打爆 ONTAP 的管理閘道）:**
+**修正 3 — HTTP keep-alive（不打爆 ONTAP 的管理閘道）：**
 
-請求風暴（無連線重用 + 每請求 basic auth,再乘上叢集節點數與重試）把 ONTAP 的管理閘道打進持續 read timeout——現場實證:**被打時 15s／請求,一停止輪詢即 0.5s**。`LWP::UserAgent` 改用 `keep_alive => 1`,REST 呼叫重用同一條 TCP+TLS 連線,而非每次新握手 + 重新認證。
+請求風暴（無連線重用 + 每請求 basic auth，再乘上叢集節點數與重試）把 ONTAP 的管理閘道打進持續 read timeout——現場實證：**被打時 15s／請求，一停止輪詢即 0.5s**。`LWP::UserAgent` 改用 `keep_alive => 1`,REST 呼叫重用同一條 TCP+TLS 連線，而非每次新握手 + 重新認證。
 
-**測試:**
+**測試：**
 
 - `docs/TESTING.md` 與 zh-TW 版新增 Section 28。
-- 模擬器功能測試（真實 ONTAP + 真實主機裝置）:**13/13**——完整 alloc／activate／free lifecycle 含主機端裝置驗證、殘留 `sd` reaper 對健康 live 裝置零誤刪、退化快速失敗 5.0s vs 32.0s。單元測試:reaper 決策邏輯 20/20、status-path client 13/13。ONTAP 與主機端均驗證 0 殘留。
+- 模擬器功能測試（真實 ONTAP + 真實主機裝置）：**13/13**——完整 alloc／activate／free lifecycle 含主機端裝置驗證、殘留 `sd` reaper 對健康 live 裝置零誤刪、退化快速失敗 5.0s vs 32.0s。單元測試：reaper 決策邏輯 20/20、status-path client 13/13。ONTAP 與主機端均驗證 0 殘留。
 
 ## [0.2.18] - 2026-05-29
 
 ### 清理時殘留 SCSI 路徑掃除 Release
 
-**強化（v0.2.17 事故 log 中浮現的獨立議題）:**
+**強化（v0.2.17 事故 log 中浮現的獨立議題）：**
 
-kernel 印出 `LUN assignments on this target have changed. The Linux SCSI layer does not automatically remap LUN assignments.`。ONTAP 在 `lun_map` 時自動配 SCSI LUN-ID,unmap 後會把釋放的 LUN-ID 重用給不同的 LUN。若 host 上仍有殘留 `sd` 裝置綁在該 `H:C:T:L`,新 LUN 在該路徑上便無法使用,kernel 也拒絕自動 remap。
+kernel 印出 `LUN assignments on this target have changed. The Linux SCSI layer does not automatically remap LUN assignments.`。ONTAP 在 `lun_map` 時自動配 SCSI LUN-ID,unmap 後會把釋放的 LUN-ID 重用給不同的 LUN。若 host 上仍有殘留 `sd` 裝置綁在該 `H:C:T:L`，新 LUN 在該路徑上便無法使用，kernel 也拒絕自動 remap。
 
-- **根本缺口:** `cleanup_lun_devices()` 只移除目前還在 multipath map 內的路徑,且 map 已不在時整段完全 no-op——把殘留單一 `sd` 路徑留在原地,日後與重用的 LUN-ID 撞號。
+- **根本缺口：** `cleanup_lun_devices()` 只移除目前還在 multipath map 內的路徑，且 map 已不在時整段完全 no-op——把殘留單一 `sd` 路徑留在原地，日後與重用的 LUN-ID 撞號。
 
-- **修正:** 新增 `Multipath::get_scsi_paths_for_wwid()`,列舉該 WWID 的**所有** NETAPP `sd` 路徑（含已脫離 map 的路徑,以裝置的 SCSI `wwid`／VPD 識別碼比對）;`cleanup_lun_devices()` 新增 Step 8 掃除,即使 map 已不在也會移除它們。掃除限定 NETAPP 廠商（絕不碰其他儲存）、以 WWID 比對（無誤判）,並以 wall-clock 預算（預設 30s）界定上限,讓擁有數百個 `sd` 裝置且路徑正在失效的 host 不會卡住拆除（v0.2.12 教訓:per-read timeout 不會界定累積時間）。
+- **修正：** 新增 `Multipath::get_scsi_paths_for_wwid()`，列舉該 WWID 的**所有** NETAPP `sd` 路徑（含已脫離 map 的路徑，以裝置的 SCSI `wwid`／VPD 識別碼比對）；`cleanup_lun_devices()` 新增 Step 8 掃除，即使 map 已不在也會移除它們。掃除限定 NETAPP 廠商（絕不碰其他儲存）、以 WWID 比對（無誤判），並以 wall-clock 預算（預設 30s）界定上限，讓擁有數百個 `sd` 裝置且路徑正在失效的 host 不會卡住拆除（v0.2.12 教訓：per-read timeout 不會界定累積時間）。
 
-**測試:**
+**測試：**
 
 - `docs/TESTING.md` 與 zh-TW 版新增 Section 27（helper 比對、Step 8 殘留掃除、靜態守則）。
-- 模擬器（pc-pve1）已驗證:`get_scsi_paths_for_wwid()` 比對到真實裝置路徑、對 bogus WWID 回傳空;Step 8 掃除被 `multipath -f` 變殘留的 `sd` 路徑（舊版這情況 no-op）;`budget => 0` 安全退出並警告。
+- 模擬器（pc-pve1）已驗證：`get_scsi_paths_for_wwid()` 比對到真實裝置路徑、對 bogus WWID 回傳空；Step 8 掃除被 `multipath -f` 變殘留的 `sd` 路徑（舊版這情況 no-op）；`budget => 0` 安全退出並警告。
 
 ## [0.2.17] - 2026-05-29
 
 ### 殘留清理路徑健康閘門 + LUN 清單分頁 Release
 
-**Bug 修正(正式環境事故,客戶回報 2026-05,節點 pve15):**
+**Bug 修正(正式環境事故，客戶回報 2026-05，節點 pve15):**
 
-在**執行中**的 VM 熱加一顆硬碟,可能讓這顆全新硬碟立刻出現 I/O error（`I/O error, dev dm-NN`）。把 VM 關機再開機就「恢復」。
+在**執行中**的 VM 熱加一顆硬碟，可能讓這顆全新硬碟立刻出現 I/O error（`I/O error, dev dm-NN`）。把 VM 關機再開機就「恢復」。
 
 - **根因(兩個缺陷):**
-  1. `_cleanup_orphaned_devices()` 以單一 `lun_list()` 快照建立「存活集合」,並清除任何不在集合內的已追蹤 WWID。但剛建立的 LUN 可能有一段時間查不到（ONTAP read-after-write／傳播延遲——與 v0.2.9 ASA 最終一致性同類,如今餵給了 reaper 的存活集合）。LUN 數量龐大時該查詢還可能被截斷。
-  2. reaper 呼叫 `cleanup_lun_devices()` 前**完全不檢查 multipath 路徑健康狀態**,因此有 active 路徑的活裝置與真正的殘留無法區分。由於 VM 在執行中,QEMU 開著該裝置:`multipath -f` 失敗,退回的 `dmsetup remove --force` 把 map 從 QEMU 底下強制抽掉,於是產生 I/O error。（注意:QEMU 的開啟檔案描述子不是 sysfs holder,所以 `is_device_in_use()` 偵測不到它——路徑健康閘門才是真正的防線。）
+  1. `_cleanup_orphaned_devices()` 以單一 `lun_list()` 快照建立「存活集合」，並清除任何不在集合內的已追蹤 WWID。但剛建立的 LUN 可能有一段時間查不到（ONTAP read-after-write／傳播延遲——與 v0.2.9 ASA 最終一致性同類，如今餵給了 reaper 的存活集合）。LUN 數量龐大時該查詢還可能被截斷。
+  2. reaper 呼叫 `cleanup_lun_devices()` 前**完全不檢查 multipath 路徑健康狀態**，因此有 active 路徑的活裝置與真正的殘留無法區分。由於 VM 在執行中，QEMU 開著該裝置：`multipath -f` 失敗，退回的 `dmsetup remove --force` 把 map 從 QEMU 底下強制抽掉，於是產生 I/O error。（注意：QEMU 的開啟檔案描述子不是 sysfs holder，所以 `is_device_in_use()` 偵測不到它——路徑健康閘門才是真正的防線。）
 
-- **修正 1 —— 路徑健康閘門(`Multipath::multipath_path_health()`):** reaper 絕不移除仍有 active 路徑（或狀態無法判定）的裝置。真正的殘留所有路徑都會 failed／faulty。同時套用於第一輪拆除與第二輪「untracked stale」操作者警告,因此 plugin 也不會再對健康裝置建議 `multipath -f`。
+- **修正 1 —— 路徑健康閘門(`Multipath::multipath_path_health()`):** reaper 絕不移除仍有 active 路徑（或狀態無法判定）的裝置。真正的殘留所有路徑都會 failed／faulty。同時套用於第一輪拆除與第二輪「untracked stale」操作者警告，因此 plugin 也不會再對健康裝置建議 `multipath -f`。
 
-- **修正 2 —— 寬限期:** 在過去 300 秒內才被追蹤的 WWID 不拆,涵蓋 read-after-write 窗口。沿用既有的首次追蹤時間戳,不新增任何狀態檔。
+- **修正 2 —— 寬限期：** 在過去 300 秒內才被追蹤的 WWID 不拆，涵蓋 read-after-write 窗口。沿用既有的首次追蹤時間戳，不新增任何狀態檔。
 
-- **修正 3 —— LUN 清單分頁(`API::_get_all_records()`):** `lun_list()` 現在會追隨 ONTAP REST 的 `_links.next`,讓超過 1000 顆 LUN 的 SVM 不會被靜默截斷存活集合。同樣的分頁套用於 `volume_list`、`volume_get_clone_children`、`igroup_list`、`snapshot_list`。
+- **修正 3 —— LUN 清單分頁(`API::_get_all_records()`):** `lun_list()` 現在會追隨 ONTAP REST 的 `_links.next`，讓超過 1000 顆 LUN 的 SVM 不會被靜默截斷存活集合。同樣的分頁套用於 `volume_list`、`volume_get_clone_children`、`igroup_list`、`snapshot_list`。
 
-**測試:**
+**測試：**
 
-- `docs/TESTING.md` 與 zh-TW 版新增 Section 26:路徑健康邏輯（7 案）、分頁完整性、靜態 regression 守則、執行中 VM 功能性重現（含強制 host-side 裝置驗證,v0.2.14 守則）、寬限期守則。
-- 模擬器完整測試 PASS:兩道 reaper 防線皆驗證、真正的殘留（ONTAP 上 LUN 已刪、路徑全失效）仍會被清除且 host-side 乾淨拆除、5 個分頁函式對真實 ONTAP 正常回傳、完整硬碟生命週期（alloc／snapshot／rollback／resize／full clone／free）乾淨且零 I/O error。
+- `docs/TESTING.md` 與 zh-TW 版新增 Section 26：路徑健康邏輯（7 案）、分頁完整性、靜態 regression 守則、執行中 VM 功能性重現（含強制 host-side 裝置驗證，v0.2.14 守則）、寬限期守則。
+- 模擬器完整測試 PASS：兩道 reaper 防線皆驗證、真正的殘留（ONTAP 上 LUN 已刪、路徑全失效）仍會被清除且 host-side 乾淨拆除、5 個分頁函式對真實 ONTAP 正常回傳、完整硬碟生命週期（alloc／snapshot／rollback／resize／full clone／free）乾淨且零 I/O error。
 
 ## [0.2.16] - 2026-05-24
 
 ### Temp Clone 背景清理 Idempotency 修正 Release
 
-**Bug 修正(操作雜訊,v0.2.15 測試期間發現):**
+**Bug 修正(操作雜訊，v0.2.15 測試期間發現):**
 
-- **`_remove_temp_clone()` 現在會在進入時偵測「ONTAP 上 volume 已不存在」並直接回成功**,而不會在後續 `volume_clone_split` 階段 die。先前的行為:tracking 內若有殘留 entry 而對應 ONTAP volume 已被 out-of-band 刪掉(被中斷的清理、跨節點 race、人工管理動作等),TTL 背景 reaper(`_cleanup_temp_clones`)會每 10 秒一次 `status()` poll 重試到天荒地老,journal 持續吐:
+- **`_remove_temp_clone()` 現在會在進入時偵測「ONTAP 上 volume 已不存在」並直接回成功**，而不會在後續 `volume_clone_split` 階段 die。先前的行為：tracking 內若有殘留 entry 而對應 ONTAP volume 已被 out-of-band 刪掉(被中斷的清理、跨節點 race、人工管理動作等),TTL 背景 reaper(`_cleanup_temp_clones`)會每 10 秒一次 `status()` poll 重試到天荒地老，journal 持續吐：
   ```
   Cleaning up old temporary FlexClone: tmpclone_<name>
   Failed to cleanup temp clone '...': volume_clone_split on temp clone '...' failed:
     Volume '...' not found at .../NetAppONTAPPlugin.pm line N.
   ```
-  且不會自我修復 — 呼叫端的 `eval` 雖然攔住 die,但**不會**刪掉 state file 內的 entry(因為「清理」其實沒成功),所以下次 poll 又重試,結果一樣。v0.2.16 修正後,helper 在**第一次** poll 就直接回成功,呼叫端順利把殘留 entry 從 tracking 移除,下一個 cycle 起就完全安靜。
+  且不會自我修復 — 呼叫端的 `eval` 雖然攔住 die，但**不會**刪掉 state file 內的 entry(因為「清理」其實沒成功)，所以下次 poll 又重試，結果一樣。v0.2.16 修正後，helper 在**第一次** poll 就直接回成功，呼叫端順利把殘留 entry 從 tracking 移除，下一個 cycle 起就完全安靜。
 
-**正式環境下這種情境怎麼發生:**
+**正式環境下這種情境怎麼發生：**
 
-- 上次清理中斷:`volume_delete` 在 ONTAP 上成功,但 state file 的 untrack 寫入沒發生(當機、重開機卡在半路等)
-- 跨節點 race:另一個叢集節點在我們讀 state 與動作之間把 temp clone 砍了
-- ONTAP 管理員手動清:有人在 ONTAP 上 out-of-band 砍掉 temp FlexClone
-- 重開機後狀態錯位:tmpfs `/var/run` 沒清,但 ONTAP 側的清理早就完成
+- 上次清理中斷：`volume_delete` 在 ONTAP 上成功，但 state file 的 untrack 寫入沒發生(當機、重開機卡在半路等)
+- 跨節點 race：另一個叢集節點在我們讀 state 與動作之間把 temp clone 砍了
+- ONTAP 管理員手動清：有人在 ONTAP 上 out-of-band 砍掉 temp FlexClone
+- 重開機後狀態錯位：tmpfs `/var/run` 沒清，但 ONTAP 側的清理早就完成
 
-**安全性:**
+**安全性：**
 
-- 區分「確認 not found」(`volume_get` 回 undef 且不 die)與「API transient 失敗」(`volume_get` die)。只有前者觸發 skip 路徑;後者照樣 die 傳遞,讓下次 cycle 重試,不會悄悄漏掉真實的 clone。
-- 最壞情境(理論上不會發生但仍納入考量):若 `volume_get` 在 volume 實際存在時錯誤地回 undef,我們會略過清理並 untrack — 留下 ONTAP 端殘留。但:temp clone 是 FlexClone,實際 unique block 極少;且 `_cleanup_orphaned_devices` 仍會偵測到 host 上殘留的 multipath device。`volume_get` 的契約清楚(undef = SVM 內無 records),不太會出這種 corner case。
+- 區分「確認 not found」(`volume_get` 回 undef 且不 die)與「API transient 失敗」(`volume_get` die)。只有前者觸發 skip 路徑；後者照樣 die 傳遞，讓下次 cycle 重試，不會悄悄漏掉真實的 clone。
+- 最壞情境(理論上不會發生但仍納入考量)：若 `volume_get` 在 volume 實際存在時錯誤地回 undef，我們會略過清理並 untrack — 留下 ONTAP 端殘留。但：temp clone 是 FlexClone，實際 unique block 極少；且 `_cleanup_orphaned_devices` 仍會偵測到 host 上殘留的 multipath device。`volume_get` 的契約清楚(undef = SVM 內無 records)，不太會出這種 corner case。
 
 ## [0.2.15] - 2026-05-24
 
 ### 跨儲存殘留偵測修正 Release
 
-**Bug 修正(正式環境事件,2026-05-21~23 客戶回報):**
+**Bug 修正(正式環境事件，2026-05-21~23 客戶回報):**
 
-- **`_cleanup_orphaned_devices()` 不再把相關 netappontap storage 的 WWID 誤判為殘留。** 客戶現場每個 cluster 節點的 pvestatd journal 都出現重複的 cluster-wide 警告:
+- **`_cleanup_orphaned_devices()` 不再把相關 netappontap storage 的 WWID 誤判為殘留。** 客戶現場每個 cluster 節點的 pvestatd journal 都出現重複的 cluster-wide 警告：
   ```
   Orphan cleanup: detected N untracked NETAPP multipath device(s) that may be stale.
   Plugin will NOT auto-clean these (risk of touching manually-managed storage).
@@ -147,18 +147,18 @@ kernel 印出 `LUN assignments on this target have changed. The Linux SCSI layer
     multipath -f <wwid>
   (This warning repeats at most once per hour per device.)
   ```
-  但跑完整 plugin/ONTAP audit 證實:警告列出的 WWID **全部都是健康的、被 plugin 正常管理的 LUN**,只是它們屬於客戶**另一個** netappontap storage(客戶同節點同時掛了 `netappASA` + `netappFAS_Node2`)。如果操作員照警告手動清,會直接拆掉相關 storage 上跑著的 VM 磁碟。
-- 根本原因:`list_netapp_multipath_devices()` 回傳 host 上**所有** vendor=NETAPP 的設備,沒按 storage 過濾。`_cleanup_orphaned_devices()` 是 per-storage 跑的,second-pass 偵測在比對「host 全體 NETAPP 設備 vs 單一 storage 的 tracking + ONTAP alive 清單」,相關 storage 的 WWID 既不在 alive 也不在 tracking,就被誤判為殘留。
-- 修法:旗標前,先建一份「**其他任何** netappontap storage 所追蹤的 WWID 聯集」(透過 `PVE::Storage::config()` 找出其他 netappontap storeid,讀它們的 tracking JSON),命中聯集的 WWID 跳過 — 屬於相關 storage,由它自己的 cleanup 負責。
+  但跑完整 plugin/ONTAP audit 證實：警告列出的 WWID **全部都是健康的、被 plugin 正常管理的 LUN**，只是它們屬於客戶**另一個** netappontap storage(客戶同節點同時掛了 `netappASA` + `netappFAS_Node2`)。如果操作員照警告手動清，會直接拆掉相關 storage 上跑著的 VM 磁碟。
+- 根本原因：`list_netapp_multipath_devices()` 回傳 host 上**所有** vendor=NETAPP 的設備，沒按 storage 過濾。`_cleanup_orphaned_devices()` 是 per-storage 跑的，second-pass 偵測在比對「host 全體 NETAPP 設備 vs 單一 storage 的 tracking + ONTAP alive 清單」，相關 storage 的 WWID 既不在 alive 也不在 tracking，就被誤判為殘留。
+- 修法：旗標前，先建一份「**其他任何** netappontap storage 所追蹤的 WWID 聯集」(透過 `PVE::Storage::config()` 找出其他 netappontap storeid，讀它們的 tracking JSON)，命中聯集的 WWID 跳過 — 屬於相關 storage，由它自己的 cleanup 負責。
 
 **會中招的情境**(這 bug 顯現的條件):
 
 - 任一 PVE 節點掛了兩個以上 netappontap storage — **正式環境很常見**(客戶會分 ASA + FAS 做分層儲存)。
-- 警告本身有「同 WWID 每節點每小時最多一次」的冷卻,但客戶兩邊加起來 100+ WWID,每小時叢集仍累積幾十條雜訊。
+- 警告本身有「同 WWID 每節點每小時最多一次」的冷卻，但客戶兩邊加起來 100+ WWID，每小時叢集仍累積幾十條雜訊。
 
 **未改動**(被 fix 保留的正確行為):
 
-- 真正的殘留偵測仍然有效:一個 WWID 若**不在任何** plugin storage 的 tracking 中,且所有 path 都失效,依然會被標示提示手動清。
+- 真正的殘留偵測仍然有效：一個 WWID 若**不在任何** plugin storage 的 tracking 中，且所有 path 都失效，依然會被標示提示手動清。
 - 每個 storage 的 cleanup 仍各自獨立跑 — 各 storage 仍由自己的 first-pass(tracked vs alive 比對)處理自己的殘留。
 
 ## [0.2.14] - 2026-05-14
@@ -167,39 +167,39 @@ kernel 印出 `LUN assignments on this target have changed. The Linux SCSI layer
 
 **Bug 修正(v0.2.13 部署後一天客戶現場發現 regression):**
 
-- **`volume_snapshot_delete()` 與 `_cleanup_temp_clones` 現在會完整拆掉 host 端 dm-multipath + sd* 殘留設備。** v0.2.13 的 fix 只處理 ONTAP 那邊(`volume_clone_split` + `volume_delete`),temp clone 的 LUN 從 ONTAP 上刪掉後,host 端 `/dev/mapper/<wwid>` 跟底下 4 個 `sd*` 路徑沒清。`multipathd` 之後每隔幾秒就 log 一次 `tur checker reports path is down`,沒完沒了。客戶在 v0.2.13 部署後 24 小時內就回報:對一個 CT 做 create + backup + remove 之後,4 條殘留 path 持續洗版 syslog。同樣的缺漏也存在於 1 小時 TTL 背景清理 `_cleanup_temp_clones`,只是時間延遲讓問題不那麼明顯。
-- 新增共用 helper `_remove_temp_clone($api, $temp_clone_name)`,流程對齊 `free_image()` 的 7 步模式:抓 slave 清單 → unmap → `cleanup_lun_devices` → 移除殘留 sd* → `multipath_reload` → `volume_clone_split` → wait → `volume_delete`。兩個 call site(`volume_snapshot_delete` 和 `_cleanup_temp_clones`)都統一走這個 helper。
+- **`volume_snapshot_delete()` 與 `_cleanup_temp_clones` 現在會完整拆掉 host 端 dm-multipath + sd* 殘留設備。** v0.2.13 的 fix 只處理 ONTAP 那邊(`volume_clone_split` + `volume_delete`),temp clone 的 LUN 從 ONTAP 上刪掉後，host 端 `/dev/mapper/<wwid>` 跟底下 4 個 `sd*` 路徑沒清。`multipathd` 之後每隔幾秒就 log 一次 `tur checker reports path is down`，沒完沒了。客戶在 v0.2.13 部署後 24 小時內就回報：對一個 CT 做 create + backup + remove 之後，4 條殘留 path 持續洗版 syslog。同樣的缺漏也存在於 1 小時 TTL 背景清理 `_cleanup_temp_clones`，只是時間延遲讓問題不那麼明顯。
+- 新增共用 helper `_remove_temp_clone($api, $temp_clone_name)`，流程對齊 `free_image()` 的 7 步模式：抓 slave 清單 → unmap → `cleanup_lun_devices` → 移除殘留 sd* → `multipath_reload` → `volume_clone_split` → wait → `volume_delete`。兩個 call site(`volume_snapshot_delete` 和 `_cleanup_temp_clones`)都統一走這個 helper。
 
 **測試強化(回應客戶意見「這種問題請加入測試清單」):**
 
-- TESTING.md / TESTING_zh-TW.md 的 Section 24 加上明確的 HOST 端 device 殘留驗證:`volume_snapshot_delete` 跑完後 `get_device_by_wwid` 必須回 undef、sd* slave 不能存在於 `/sys/block`、`/dev/mapper/<wwid>` 必須不存在。這些驗證若在 v0.2.13 的 CI 跑過就會立刻 catch 到 regression;舊版測試只檢查 ONTAP 那層。長期 regression 守則。
-- CLAUDE.md 新增 release SOP 規則:**任何測試只要涵蓋「在 ONTAP 上刪 LUN/卷」的路徑,都必須包含 host 端 device 殘留驗證**。只測 ONTAP 不夠 — 清理類 bug 一定要兩邊都驗。
+- TESTING.md / TESTING_zh-TW.md 的 Section 24 加上明確的 HOST 端 device 殘留驗證：`volume_snapshot_delete` 跑完後 `get_device_by_wwid` 必須回 undef、sd* slave 不能存在於 `/sys/block`、`/dev/mapper/<wwid>` 必須不存在。這些驗證若在 v0.2.13 的 CI 跑過就會立刻 catch 到 regression；舊版測試只檢查 ONTAP 那層。長期 regression 守則。
+- CLAUDE.md 新增 release SOP 規則：**任何測試只要涵蓋「在 ONTAP 上刪 LUN/卷」的路徑，都必須包含 host 端 device 殘留驗證**。只測 ONTAP 不夠 — 清理類 bug 一定要兩邊都驗。
 
-**既存殘留處理建議:**
+**既存殘留處理建議：**
 
-- v0.2.14 之前備份留下的 host 殘留**不會自動清**(plugin 設計:不主動清不在 tracking 內的 WWID,避免誤動到客戶自己的儲存)。`_cleanup_orphaned_devices` 會在 syslog 警告並列出清理指令。手動清:對每一個殘留 WWID 跑 `multipath -f <wwid>`,然後 `echo 1 > /sys/block/sdX/device/delete` 移除底下的 sd*。
+- v0.2.14 之前備份留下的 host 殘留**不會自動清**(plugin 設計：不主動清不在 tracking 內的 WWID，避免誤動到客戶自己的儲存)。`_cleanup_orphaned_devices` 會在 syslog 警告並列出清理指令。手動清：對每一個殘留 WWID 跑 `multipath -f <wwid>`，然後 `echo 1 > /sys/block/sdX/device/delete` 移除底下的 sd*。
 
 ## [0.2.13] - 2026-05-13
 
 ### Snapshot 刪除清理修正 Release
 
-**Bug 修正(正式環境事件,2026-05-13 客戶回報):**
+**Bug 修正(正式環境事件，2026-05-13 客戶回報):**
 
-- **`volume_snapshot_delete()` 現在會在刪 snapshot 之前,先同步移除依附在該 snapshot 上的暫時 FlexClone。** 客戶的 `vzdump` CT snapshot-mode 備份備份本身成功,但是清理那一步失敗,訊息:
+- **`volume_snapshot_delete()` 現在會在刪 snapshot 之前，先同步移除依附在該 snapshot 上的暫時 FlexClone。** 客戶的 `vzdump` CT snapshot-mode 備份備份本身成功，但是清理那一步失敗，訊息：
   ```
   snapshot 'vzdump' was not (fully) removed - ONTAP job failed:
     Snapshot copy "pve_snap_vzdump" of volume "..." in SVM "..."
     has not expired or is locked.
   ```
-  根本原因:PVE 要讀 snapshot(vzdump CT 備份、`qm clone --snapname`、從 snapshot 做 `qemu-img convert` 等)時,`path($vol, $snap)` 會呼叫 `_get_snapshot_path()`,以該 snapshot 為 parent 建立暫時 FlexClone。只要這個 FlexClone 還在,ONTAP 就會把 parent snapshot 鎖住不准刪。Plugin 原本的清理機制是 1 小時 TTL 的背景任務(`_cleanup_temp_clones`),但 vzdump 在備份完當下立刻呼叫 `volume_snapshot_delete`,還在 TTL 內,所以每次都失敗。本次修正在 `volume_snapshot_delete` 開頭同步檢查 deterministic 的暫時 clone 名稱,若該 clone 的 LUN 仍在本機被佔用(透過 `is_device_in_use` 做 lsof 式 holder 檢查)則拒絕並回報具體裝置,否則做 unmap + 刪除暫時 FlexClone,再進行 snapshot 刪除。
+  根本原因：PVE 要讀 snapshot(vzdump CT 備份、`qm clone --snapname`、從 snapshot 做 `qemu-img convert` 等)時，`path($vol, $snap)` 會呼叫 `_get_snapshot_path()`，以該 snapshot 為 parent 建立暫時 FlexClone。只要這個 FlexClone 還在，ONTAP 就會把 parent snapshot 鎖住不准刪。Plugin 原本的清理機制是 1 小時 TTL 的背景任務(`_cleanup_temp_clones`)，但 vzdump 在備份完當下立刻呼叫 `volume_snapshot_delete`，還在 TTL 內，所以每次都失敗。本次修正在 `volume_snapshot_delete` 開頭同步檢查 deterministic 的暫時 clone 名稱，若該 clone 的 LUN 仍在本機被佔用(透過 `is_device_in_use` 做 lsof 式 holder 檢查)則拒絕並回報具體裝置，否則做 unmap + 刪除暫時 FlexClone，再進行 snapshot 刪除。
 
 **風險評估(正式環境安全審查):**
 
-- 本機並行讀者:PVE 在 VM/CT 層有 lock,單一節點上不會有兩個並行讀者在同一個 snapshot 上,標準流程不會出現此情境。`is_device_in_use` 檢查為極端情境的安全網,真的撞到會 die 並回報具體裝置與 `lsof` 提示。
-- 跨節點並行讀者:從刪除端無法直接觀察。Plugin 依賴「呼叫 `volume_snapshot_delete` 的節點 = 開啟 snapshot 的節點」這個慣例(vzdump 符合)。和既存 `_cleanup_temp_clones` 背景清理的 trade-off 相同。
-- 清理過程 API 失敗:每一步都用 `eval` 包。若 `volume_delete` 暫時 clone 失敗,函式 die 並輸出明確訊息,**不再呼叫** `snapshot_delete`(本來也會用舊的 locked 錯誤失敗),讓操作者直接看到具體失敗點而非下游混亂訊息。
-- 背景 TTL reaper 競爭:兩條清理路徑同時跑時其中一條會贏,另一條取得「volume not found」,由 `eval` 容忍。
-- 未動到:`volume_snapshot_rollback`、`free_image`。ONTAP 對 clone 的行為在這兩個情境下不同(rollback 通常允許,free_image 自己會清 snapshot),需要另外 audit;本版範圍不含。
+- 本機並行讀者：PVE 在 VM/CT 層有 lock，單一節點上不會有兩個並行讀者在同一個 snapshot 上，標準流程不會出現此情境。`is_device_in_use` 檢查為極端情境的安全網，真的撞到會 die 並回報具體裝置與 `lsof` 提示。
+- 跨節點並行讀者：從刪除端無法直接觀察。Plugin 依賴「呼叫 `volume_snapshot_delete` 的節點 = 開啟 snapshot 的節點」這個慣例(vzdump 符合)。和既存 `_cleanup_temp_clones` 背景清理的 trade-off 相同。
+- 清理過程 API 失敗：每一步都用 `eval` 包。若 `volume_delete` 暫時 clone 失敗，函式 die 並輸出明確訊息，**不再呼叫** `snapshot_delete`(本來也會用舊的 locked 錯誤失敗)，讓操作者直接看到具體失敗點而非下游混亂訊息。
+- 背景 TTL reaper 競爭：兩條清理路徑同時跑時其中一條會贏，另一條取得「volume not found」，由 `eval` 容忍。
+- 未動到：`volume_snapshot_rollback`、`free_image`。ONTAP 對 clone 的行為在這兩個情境下不同(rollback 通常允許，free_image 自己會清 snapshot)，需要另外 audit；本版範圍不含。
 
 ## [0.2.12] - 2026-05-05
 
@@ -207,21 +207,21 @@ kernel 印出 `LUN assignments on this target have changed. The Linux SCSI layer
 
 **Bug 修正(來自相關專案 jt-pve-storage-purestorage v1.1.9 的同類型稽核):**
 
-- **`activate_storage()` 現在會在呼叫 `iscsiadm` 之前,先用 TCP probe 確認每一個 iSCSI LIF 是否可達。** 舊行為直接把 `iscsi_get_portals()` 回傳的所有 portal 全部拿去 `iscsiadm -m discovery` 再 `iscsiadm -m node -l`,完全不檢查 TCP 連線是否通。在多 LIF SVM 配置(這正是 ONTAP HA 推薦做法)且主機端線路或 zoning 不對稱時,每個不通的 LIF 都會讓 `iscsiadm` 卡 30 秒(discovery)再加上最多 60 秒(login)。雖然外面包了 `eval` 不會 die,但累積的 timeout 還是會把整次 `activate_storage()` 拖到上百秒。`pvestatd` 每個輪詢都會走 `activate_storage`,所以這個卡頓會連鎖造成 web UI 凍結、其他儲存被排隊餓死。今天 Pure 那邊在客戶現場(4 LIF FlashArray、2 段網路只通到 1 段)修了 v1.1.9 把這個問題解掉,跨專案稽核確認 NetApp 這邊在 `NetAppONTAPPlugin.pm:502-526` 是一模一樣的程式樣式,本版同步修正。
-- 這個修正對 NetApp 特別重要 — v0.2.11 的 `_check_lif_redundancy()` 會主動建議使用者「把 LIF 分散到兩個 controller」,而這正是受害面最大的配置。使用者越照建議做,asymmetric 線路下中招機率越高。
+- **`activate_storage()` 現在會在呼叫 `iscsiadm` 之前，先用 TCP probe 確認每一個 iSCSI LIF 是否可達。** 舊行為直接把 `iscsi_get_portals()` 回傳的所有 portal 全部拿去 `iscsiadm -m discovery` 再 `iscsiadm -m node -l`，完全不檢查 TCP 連線是否通。在多 LIF SVM 配置(這正是 ONTAP HA 推薦做法)且主機端線路或 zoning 不對稱時，每個不通的 LIF 都會讓 `iscsiadm` 卡 30 秒(discovery)再加上最多 60 秒(login)。雖然外面包了 `eval` 不會 die，但累積的 timeout 還是會把整次 `activate_storage()` 拖到上百秒。`pvestatd` 每個輪詢都會走 `activate_storage`，所以這個卡頓會連鎖造成 web UI 凍結、其他儲存被排隊餓死。今天 Pure 那邊在客戶現場(4 LIF FlashArray、2 段網路只通到 1 段)修了 v1.1.9 把這個問題解掉，跨專案稽核確認 NetApp 這邊在 `NetAppONTAPPlugin.pm:502-526` 是一模一樣的程式樣式，本版同步修正。
+- 這個修正對 NetApp 特別重要 — v0.2.11 的 `_check_lif_redundancy()` 會主動建議使用者「把 LIF 分散到兩個 controller」，而這正是受害面最大的配置。使用者越照建議做，asymmetric 線路下中招機率越高。
 
-**API 新增:**
+**API 新增：**
 
-- `ISCSI.pm` 新增 `probe_portal($ip, $port, timeout => $t)`。內部用 `IO::Socket::INET` 配 `alarm()` 做帶上限的 TCP connect。可達回傳 1,不可達回傳 0。
+- `ISCSI.pm` 新增 `probe_portal($ip, $port, timeout => $t)`。內部用 `IO::Socket::INET` 配 `alarm()` 做帶上限的 TCP connect。可達回傳 1，不可達回傳 0。
 
-**新組態選項:**
+**新組態選項：**
 
-- `ontap-portal-probe-timeout`(整數 0..30,預設 2 秒)。設 0 可關閉預先檢查,回到 0.2.12 之前的行為。網路延遲較高或壅塞的儲存網路可調高。可用 `pvesm set <storeid> --ontap-portal-probe-timeout <n>` 修改。
+- `ontap-portal-probe-timeout`(整數 0..30，預設 2 秒)。設 0 可關閉預先檢查，回到 0.2.12 之前的行為。網路延遲較高或壅塞的儲存網路可調高。可用 `pvesm set <storeid> --ontap-portal-probe-timeout <n>` 修改。
 
-**行為變更:**
+**行為變更：**
 
-- 當所有 LIF 都不可達時,`activate_storage()` 現在會 die,訊息會列出不可達的 portals、登入失敗的 portals(連同 `iscsiadm` 錯誤)以及如何用 `pvesm set <storeid> --nodes <list>` 把儲存綁到只在通的節點上。舊版只會說「Failed to connect to any iSCSI portal」。
-- 當部分 LIF 不可達但至少有一個通時,會用一行 `warn` 列出被跳過的 portals 與排查提示,然後正常用可達的 LIF 子集繼續啟用儲存。
+- 當所有 LIF 都不可達時，`activate_storage()` 現在會 die，訊息會列出不可達的 portals、登入失敗的 portals(連同 `iscsiadm` 錯誤)以及如何用 `pvesm set <storeid> --nodes <list>` 把儲存綁到只在通的節點上。舊版只會說「Failed to connect to any iSCSI portal」。
+- 當部分 LIF 不可達但至少有一個通時，會用一行 `warn` 列出被跳過的 portals 與排查提示，然後正常用可達的 LIF 子集繼續啟用儲存。
 
 ## [0.2.11] - 2026-04-30
 

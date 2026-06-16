@@ -127,6 +127,39 @@ journalctl -xeu pvedaemon | grep -i "netapp\|ontap" | tail -20
    vserver iscsi show -vserver <svm-name>
    ```
 
+### Storage Briefly Shows "inactive" During an ONTAP Upgrade or Under Heavy Load
+
+**Symptoms:**
+- A netappontap storage flaps to `inactive` in the web UI and recovers a few seconds later, especially during an ONTAP/firmware upgrade (controller takeover/giveback) or when ONTAP is heavily loaded.
+- `journalctl -u pvestatd` shows brief `unreachable ... Reason: ... read timeout` messages that clear on their own.
+
+**This is expected, by design (v0.2.19+), and does NOT affect running VMs.**
+
+- The pvestatd health path (`activate_storage`/`status`) uses a short timeout with no retry (`ontap-status-timeout`, default 5s). When ONTAP is momentarily slow, the plugin fails fast and recovers on the next ~10s poll, instead of stalling pvestatd and dragging *other* storages on the same node into `inactive`.
+- **Running VMs keep their I/O** throughout — `inactive` only affects the status display and new operations, not already-activated devices. Confirm with `multipath -ll` (the LUN's paths stay `active ready running`).
+
+**What to do:**
+- Nothing, if it clears within a poll or two — it is the intended fast-fail behaviour.
+- If a *heavily-loaded but healthy* ONTAP flaps often, raise the health-path timeout:
+  ```bash
+  pvesm set <storeid> --ontap-status-timeout 10   # default 5, range 1-30
+  ```
+- Do NOT manually `multipath -f` or remove devices during the flap — let it recover.
+
+### Re-enabling a Storage That Was Disabled During an ONTAP Outage/Upgrade
+
+If you disabled a storage (`pvesm set <storeid> --disable 1`) to ride out an ONTAP outage, **upgrade the plugin on ALL cluster nodes to the latest version BEFORE re-enabling**, then enable. Enabling first while nodes still run an older plugin can re-trigger the original problem (a request storm that overwhelms ONTAP's management gateway).
+
+```bash
+# On EVERY node that has the storage in scope:
+dpkg -i jt-pve-storage-netapp_<latest>-1_all.deb
+systemctl restart pvestatd pvedaemon pveproxy   # guarantee the new code is loaded
+
+# Only after ALL nodes are upgraded and ONTAP is confirmed responsive:
+pvesm set <storeid> --disable 0
+journalctl -u pvestatd -f                        # watch "status update time" stay low
+```
+
 ### Invalid Configuration
 
 **Symptoms:**

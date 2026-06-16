@@ -230,6 +230,51 @@ netappontap: <storage-id>
 - Increase this value for networks with high latency
 - Lower values may be useful for development/testing
 
+### ontap-portal-probe-timeout
+
+**Type:** integer (0-30)
+**Default:** 2
+**Description:** Timeout (seconds) for the TCP pre-check that skips unreachable iSCSI portals before `iscsiadm` discovery/login. Set to `0` to disable the pre-check (legacy behaviour).
+
+```bash
+--ontap-portal-probe-timeout 2   # Default
+--ontap-portal-probe-timeout 0   # Disable (only on very high-latency fabrics)
+```
+
+**Notes:**
+- Without it, an unreachable LIF would cost up to 30s discovery + 60s login each, stalling `activate_storage`/`status`.
+- Raise on high-latency or congested storage networks.
+
+### ontap-status-timeout
+
+**Type:** integer (1-30)
+**Default:** 5
+**Description:** Per-call ONTAP REST timeout used ONLY by the pvestatd health path (`activate_storage`/`status`), with no retry. Keeps a degraded ONTAP (e.g. one controller offline during an ONTAP/firmware upgrade) from stalling pvestatd and dragging sibling netappontap storages on the same node into `inactive`.
+
+```bash
+--ontap-status-timeout 5    # Default
+--ontap-status-timeout 10   # More tolerance for a slow-but-healthy ONTAP
+```
+
+**Notes:**
+- The data path (alloc/free/clone) is unaffected and keeps its resilient longer timeout + retries. The next pvestatd poll (~10s) is the retry, so dropping per-call retries here loses nothing.
+- On a heavily-loaded but healthy ONTAP whose metadata queries occasionally exceed this value, the storage may briefly show `inactive` and recover on the next poll. **Running VMs are not affected** (their devices stay mapped). Raise this value if you see such flapping.
+
+### ontap-activate-deadline
+
+**Type:** integer (5-120)
+**Default:** 30
+**Description:** Wall-clock budget (seconds) for the iSCSI discover/login loop in `activate_storage`. Once spent AND at least one portal is already logged in, the remaining portals are deferred to a later activation. Bounds the cumulative iSCSI login time so a single reachable-but-hanging portal cannot stall pvestatd.
+
+```bash
+--ontap-activate-deadline 30   # Default
+--ontap-activate-deadline 60   # High-latency fabrics with many LIFs
+```
+
+**Notes:**
+- An in-progress login is never interrupted, and the loop never skips while zero paths are up (it must obtain at least one path or fail honestly) — so it cannot mark a slow-but-reachable storage inactive.
+- Skipped portals are picked up on a later activation; multipath redundancy self-heals.
+
 ## Standard PVE Options
 
 ### content

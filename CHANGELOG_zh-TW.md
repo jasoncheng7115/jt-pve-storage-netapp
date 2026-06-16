@@ -2,6 +2,23 @@
 
 NetApp ONTAP Storage Plugin for Proxmox VE 的所有重要變更都記錄在此。
 
+## [0.2.21] - 2026-06-16
+
+### 殘留清理 N+1 REST 風暴修正(ONTAP 管理閘道負載）
+
+**Bug 修正(正式環境事故,客戶 2026-06-16——FAS 在 ONTAP 9.15.1P19;同叢集、同 plugin 的姊妹 ASA 9.14.1 沒事):**
+
+韌體升級後,FAS 管理 REST 變慢(~4s／請求)且間歇拒連;pvestatd 把該儲存反覆標成 `inactive`。全叢集停用該儲存後,積壓**緩慢**排空(19s → 14s → 12s …),證明負載來自 PVE 輪詢、而非 FAS 故障——且 `cluster show` 兩節點皆健康。
+
+- **根因:** `_cleanup_orphaned_devices()`——它在 `status()` 背景清理中、**每個節點每 ~10s 輪詢都會跑一次**——為了建立 alive-set,**對每顆 LUN 各打一次** `lun_get_wwid($lun->{name})`。這是 N+1 REST 風暴(`lun_get_serial` → `lun_get` → 每顆 LUN 一個 GET)。75 顆 LUN × N 個節點 = 每 10s ~75·N 個 REST 呼叫,足以把 ONTAP 管理閘道(mgwd)打進 congestion collapse。這是 mgwd **容量耗盡**,不是明確的速率限制(沒有 HTTP 429)。在同樣的 plugin 負載下,9.15.1P19 的 mgwd 明顯比 ASA 的 9.14.1 敏感得多。
+- **修正:** `lun_list()` 本來就在**一次**分頁呼叫裡回傳每顆 LUN 的 `serial_number`,因此改用 `serial_to_wwid()`(純本地運算、不打 REST)在本地算 WWID,而非每顆 LUN 各打一次。**~75 calls/輪 → 0 額外**;算出來的 alive-set **逐位元組相同**(已在真實 ONTAP 驗證)。其餘行為完全不變。
+
+**測試:**
+
+- `docs/TESTING.md` 與 zh-TW 版新增 Section 30。
+- 新的真實 ONTAP 測試 `tests/cleanup_load.pl` **6/6**:配置 3 顆 LUN、instrument API,驗證清理期間 **0 次** per-LUN `lun_get` 呼叫、且每個 WWID 仍在 alive-set,再驗證 0 殘留。
+- 完整回歸、行為無變:`sim_functional` 13/13、單元 reaper 20/20 + status-timeout 13/13 + activate-budget 8/8、`make test` 全模組 OK。其餘每輪呼叫已稽核:`get_managed_capacity` 走 aggregate 提前返回(1 個呼叫、無 N+1);`_check_aggregate_capacity`(1 小時冷卻)與 `_check_lif_redundancy`(24 小時冷卻)的查詢本來就有節流。
+
 ## [0.2.20] - 2026-06-16
 
 ### activate_storage iSCSI 登入預算 Release（「絕不卡住 PVE」）

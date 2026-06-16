@@ -2,6 +2,23 @@
 
 All notable changes to the NetApp ONTAP Storage Plugin for Proxmox VE are documented here.
 
+## [0.2.21] - 2026-06-16
+
+### Orphan-Cleanup N+1 REST Storm Fix (ONTAP mgmt-gateway load)
+
+**Bug fix (production incident, customer 2026-06-16 — FAS on ONTAP 9.15.1P19; a sibling ASA on 9.14.1 with the same plugin was unaffected):**
+
+After a firmware upgrade, the FAS management REST became slow (~4s/request) and intermittently refused connections; pvestatd flapped the storage to `inactive`. Disabling the storage cluster-wide drained the backlog *slowly* (19s → 14s → 12s …), proving the load came from PVE polling rather than a FAS outage — and `cluster show` was healthy.
+
+- **Root cause:** `_cleanup_orphaned_devices()` — which runs in the `status()` background cleanup on **every ~10s poll on every cluster node** — called `lun_get_wwid($lun->{name})` once **per LUN** to build its alive-set. That is an N+1 REST storm (`lun_get_serial` → `lun_get` → GET per LUN). An SVM with 75 LUNs × N nodes generated ~75·N REST calls every 10s — enough to overwhelm ONTAP's management gateway (mgwd) into congestion collapse. This is mgwd **capacity exhaustion**, not an explicit rate limit (no HTTP 429). ONTAP 9.15.1P19's mgwd proved far more load-sensitive than the ASA's 9.14.1 under the identical plugin load.
+- **Fix:** `lun_list()` already returns `serial_number` for every LUN in ONE paginated call, so the WWID is now computed locally via `serial_to_wwid()` (pure, no REST) instead of the per-LUN call. **~75 calls/poll → 0 extra**; the computed alive-set is byte-identical (verified on real ONTAP). Behaviour is otherwise unchanged.
+
+**Testing:**
+
+- `docs/TESTING.md` Section 30 added (EN + zh-TW).
+- New real-ONTAP test `tests/cleanup_load.pl` **6/6**: alloc 3 LUNs, instrument the API, assert **zero** per-LUN `lun_get` calls during cleanup AND every WWID still present in the alive-set, then verify 0 leftover.
+- Full regression with no change: `sim_functional` 13/13, unit reaper 20/20 + status-timeout 13/13 + activate-budget 8/8, `make test` all modules OK. The other per-poll calls were audited: `get_managed_capacity` early-returns on the aggregate (1 call, no N+1); `_check_aggregate_capacity` (1h cooldown) and `_check_lif_redundancy` (24h cooldown) already throttle their queries.
+
 ## [0.2.20] - 2026-06-16
 
 ### activate_storage iSCSI Login Budget Release ("never wedge PVE")

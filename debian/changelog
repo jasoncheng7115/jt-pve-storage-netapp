@@ -1,3 +1,40 @@
+jt-pve-storage-netapp (0.2.21-1) stable; urgency=medium
+
+  * Orphan-Cleanup N+1 REST Storm Fix (ONTAP mgmt-gateway load)
+  * Requirements: Proxmox VE 9.1 or later
+  * Bug fix (production incident, customer 2026-06-16, FAS on ONTAP
+    9.15.1P19; a sibling ASA on 9.14.1 with the same plugin was fine):
+    - After a firmware upgrade, the FAS management REST became slow
+      (~4s/request) and intermittently refused connections; pvestatd
+      flapped the storage 'inactive'. Disabling the storage cluster-wide
+      drained it slowly (19s -> 14s -> 12s ...), proving the load came
+      from PVE polling, not a FAS outage. cluster show was healthy.
+    - Root cause: _cleanup_orphaned_devices() (run in the status()
+      background cleanup on EVERY ~10s poll on EVERY cluster node) called
+      lun_get_wwid($lun->{name}) once PER LUN to build its alive-set --
+      an N+1 REST storm (lun_get_serial -> lun_get -> GET per LUN). An SVM
+      with 75 LUNs x N nodes generated ~75*N REST calls every 10s, enough
+      to overwhelm ONTAP's management gateway (mgwd) into congestion
+      collapse -- especially on 9.15.1P19, whose mgwd is far more load-
+      sensitive than the ASA's 9.14.1 under the identical plugin load.
+      Not an explicit rate limit (no HTTP 429) -- mgwd capacity exhaustion.
+    - Fix: lun_list() already returns serial_number for every LUN in ONE
+      paginated call, so compute the WWID locally via serial_to_wwid()
+      (pure, no REST) instead of the per-LUN call. ~75 calls/poll -> 0
+      extra; the computed alive-set is byte-identical (verified on real
+      ONTAP). Behaviour is otherwise unchanged.
+  * Testing: docs/TESTING.md Section 30 added. New real-ONTAP test
+    (tests/cleanup_load.pl) 6/6: alloc 3 LUNs, instrument the API, assert
+    ZERO per-LUN lun_get calls during cleanup AND every WWID still in the
+    alive-set, then verify 0 leftover. Full regression: sim_functional
+    13/13, unit reaper 20/20 + status-timeout 13/13 + activate-budget 8/8,
+    make test all modules OK. The other per-poll calls were audited:
+    get_managed_capacity early-returns on the aggregate (1 call, no N+1);
+    _check_aggregate_capacity (1h cooldown) and _check_lif_redundancy
+    (24h cooldown) already throttle their queries.
+
+ -- Jason Cheng <jason@jason.tools>  Tue, 16 Jun 2026 16:00:00 +0800
+
 jt-pve-storage-netapp (0.2.20-1) stable; urgency=medium
 
   * activate_storage iSCSI Login Budget Release ("never wedge PVE")

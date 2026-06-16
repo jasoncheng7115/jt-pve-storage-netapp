@@ -1020,10 +1020,22 @@ sub _cleanup_orphaned_devices {
         return;
     }
 
-    # Build set of currently-alive WWIDs and auto-import them into tracking
+    # Build set of currently-alive WWIDs and auto-import them into tracking.
+    #
+    # PERFORMANCE (v0.2.21, CRITICAL): lun_list() already returns
+    # serial_number for every LUN in ONE paginated call, so compute the WWID
+    # locally via serial_to_wwid(). The previous code called
+    # lun_get_wwid($lun->{name}) per LUN -- an N+1 REST storm (lun_get_serial
+    # -> lun_get -> GET, once PER LUN). This runs in the status() background
+    # cleanup on EVERY ~10s poll on EVERY cluster node, so an SVM with 75 LUNs
+    # x N nodes generated ~75*N REST calls every 10s -- enough to overwhelm
+    # ONTAP's management gateway (mgwd) into congestion collapse, especially
+    # after a firmware upgrade leaves mgwd more load-sensitive. serial_to_wwid()
+    # is pure local computation (no REST). 75 calls/poll -> 0 extra.
     my %alive_wwids;
     for my $lun (@$luns) {
-        my $wwid = eval { $api->lun_get_wwid($lun->{name}); };
+        my $serial = $lun->{serial_number};
+        my $wwid = $serial ? $api->serial_to_wwid($serial) : undef;
         next unless $wwid;
         $alive_wwids{lc($wwid)} = 1;
         # Auto-import: ensure this WWID is tracked even if path() was never

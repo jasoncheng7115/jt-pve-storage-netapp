@@ -2340,6 +2340,38 @@ grep -A 6 'login_deadline' "$P" | grep -c '@logged_in'            # gate checks 
 
 ---
 
+## 30. Orphan-Cleanup N+1 REST Storm Fix (v0.2.21)
+
+`_cleanup_orphaned_devices()` must build its alive-set from the `serial_number`
+already returned by `lun_list()`, NOT a per-LUN `lun_get_wwid()` call (an N+1
+REST storm that overwhelmed ONTAP's mgmt gateway).
+
+### 30.1 N+1 eliminated + alive-set unchanged (simulator, CORE)
+
+```bash
+perl -Ilib tests/cleanup_load.pl
+# Expected: 6/6. Allocates 3 real LUNs, instruments the API:
+#  - ZERO per-LUN lun_get calls during _cleanup_orphaned_devices (was 1/LUN)
+#  - every allocated WWID is still present in the alive/tracking set
+#    (serial_to_wwid computes the SAME WWID as the old lun_get_wwid)
+#  - 0 leftover on host and ONTAP after free.
+```
+
+### 30.2 Static regression guards
+
+```bash
+P=lib/PVE/Storage/Custom/NetAppONTAPPlugin.pm
+# the alive-set loop must NOT call lun_get_wwid (that was the per-LUN storm).
+# Exclude comment lines -- the comment legitimately names the removed call.
+grep -A 16 'Build set of currently-alive WWIDs' "$P" | grep -v '^\s*#' | grep -c 'lun_get_wwid'   # Expected: 0
+# it must use the serial_number from lun_list + local serial_to_wwid
+grep -A 16 'Build set of currently-alive WWIDs' "$P" | grep -v '^\s*#' | grep -c 'serial_number\|serial_to_wwid'  # >= 2
+# lun_list must still request serial_number
+grep -c "serial_number" lib/PVE/Storage/Custom/NetAppONTAP/API.pm                 # >= 1
+```
+
+---
+
 ## Cleanup
 
 ```bash
@@ -2359,6 +2391,18 @@ pvesm list $STORAGE
 ## Release Test Results
 
 Each release must pass all tests above before publishing. Results are recorded below.
+
+### v0.2.21-1 Orphan-Cleanup N+1 REST Storm Fix Release (2026-06-16)
+
+**Scope:** Section 30 (new) — eliminate the per-LUN `lun_get_wwid()` N+1 in `_cleanup_orphaned_devices()`.
+
+**Environment:** `pc-pve1` (PVE 9.2, dev lib via `-Ilib`). ONTAP simulator (svm0, iSCSI). Storage `netapp1`.
+
+- **30.1 N+1 eliminated + alive-set unchanged (`cleanup_load.pl`):** 6/6 PASS. Allocated 3 real LUNs; instrumented `API::lun_get`; during `_cleanup_orphaned_devices` it was called **0** times (was 1/LUN); all 3 WWIDs present in the alive/tracking set; `serial_to_wwid(serial)` produced a WWID byte-identical to the old `lun_get_wwid()` (verified directly: `3600a0980…6863` == `3600a0980…6863`); 0 leftover on host and ONTAP after free.
+- **30.2 static guards:** match (alive-set loop has no `lun_get_wwid`; uses `serial_number` + `serial_to_wwid`; `lun_list` still requests `serial_number`).
+- **Full regression (no behaviour change):** `sim_functional` 13/13, reaper 20/20, status-timeout 13/13, activate-budget 8/8, `make test` 6/6. Other per-poll calls audited: `get_managed_capacity` early-returns on the aggregate (1 call); `_check_aggregate_capacity`/`_check_lif_redundancy` are cooldown-throttled (1h/24h).
+
+**Result: PASS.** Surgical fix — same alive-set, ~75 fewer REST calls per poll per node.
 
 ### v0.2.20-1 activate_storage iSCSI Login Budget Release (2026-06-16)
 

@@ -1941,6 +1941,36 @@ grep -A 6 'login_deadline' "$P" | grep -c '@logged_in'            # 閘門檢查
 
 ---
 
+## 30. 殘留清理 N+1 REST 風暴修正（v0.2.21）
+
+`_cleanup_orphaned_devices()` 必須用 `lun_list()` **本來就回傳**的 `serial_number` 來建立 alive-set,而**不是**對每顆 LUN 各打一次 `lun_get_wwid()`(那是把 ONTAP 管理閘道打爆的 N+1 REST 風暴)。
+
+### 30.1 N+1 消除 + alive-set 不變（模擬器,核心)
+
+```bash
+perl -Ilib tests/cleanup_load.pl
+# 預期:6/6。配置 3 顆真實 LUN、instrument API:
+#  - _cleanup_orphaned_devices 期間 0 次 per-LUN lun_get 呼叫(原本每顆 1 次)
+#  - 每個配置的 WWID 仍在 alive／tracking 集合內
+#    (serial_to_wwid 算出與舊 lun_get_wwid 完全相同的 WWID)
+#  - free 後主機與 ONTAP 皆 0 殘留。
+```
+
+### 30.2 靜態 regression 守則
+
+```bash
+P=lib/PVE/Storage/Custom/NetAppONTAPPlugin.pm
+# alive-set 迴圈不可呼叫 lun_get_wwid(那就是 per-LUN 風暴)。
+# 排除註解行——註解裡會合理地提到被移除的呼叫名稱。
+grep -A 16 'Build set of currently-alive WWIDs' "$P" | grep -v '^\s*#' | grep -c 'lun_get_wwid'   # 預期:0
+# 必須用 lun_list 的 serial_number + 本地 serial_to_wwid
+grep -A 16 'Build set of currently-alive WWIDs' "$P" | grep -v '^\s*#' | grep -c 'serial_number\|serial_to_wwid'  # >= 2
+# lun_list 仍要求 serial_number
+grep -c "serial_number" lib/PVE/Storage/Custom/NetAppONTAP/API.pm                 # >= 1
+```
+
+---
+
 ## 清除
 
 ```bash

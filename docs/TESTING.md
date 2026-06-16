@@ -2301,6 +2301,45 @@ grep -c 'keep_alive' "$A"                                         # Expected: 1
 
 ---
 
+## 29. activate_storage iSCSI Login Budget (v0.2.20)
+
+Bounds the cumulative iSCSI discover/login time in `activate_storage` so a
+reachable-but-hanging portal cannot stall pvestatd (`ontap-activate-deadline`,
+default 30s).
+
+### 29.1 Budget gate logic (offline unit test)
+
+Drives `activate_storage` with mocked iSCSI helpers + a fake API object and
+small real sleeps to cross the budget deadline.
+
+```bash
+perl -Ilib tests/activate_budget.t
+# Expected: 8/8.
+#  - past budget WITH a path already up  -> remaining portals SKIPPED
+#  - past budget WITH zero paths up      -> all portals attempted (never skip)
+#  - within budget                       -> all portals attempted
+```
+
+### 29.2 No regression on real ONTAP (simulator)
+
+```bash
+perl -Ilib tests/sim_functional.pl
+# Expected: 13/13. The budget gate must not change normal activation when
+# ONTAP is healthy (all portals log in well within the budget).
+```
+
+### 29.3 Static regression guards
+
+```bash
+P=lib/PVE/Storage/Custom/NetAppONTAPPlugin.pm
+grep -c 'ontap-activate-deadline' "$P"                            # Expected: >= 2 (property + use)
+# budget gate present in the iSCSI loop, and only skips when a path is up
+grep -c 'skipped_budget' "$P"                                     # Expected: >= 2
+grep -A 6 'login_deadline' "$P" | grep -c '@logged_in'            # gate checks >=1 path up
+```
+
+---
+
 ## Cleanup
 
 ```bash
@@ -2320,6 +2359,19 @@ pvesm list $STORAGE
 ## Release Test Results
 
 Each release must pass all tests above before publishing. Results are recorded below.
+
+### v0.2.20-1 activate_storage iSCSI Login Budget Release (2026-06-16)
+
+**Scope:** Section 29 (new) — `ontap-activate-deadline` wall-clock budget on the iSCSI discover/login loop, completing the "never wedge PVE" rule.
+
+**Environment:** `pc-pve1` (PVE 9.2, dev lib via `-Ilib`). ONTAP simulator (svm0, iSCSI). Storage `netapp1`.
+
+- **29.1 budget gate logic (offline unit, `activate_budget.t`):** 8/8 PASS. Past budget with ≥1 path up → remaining portals skipped (deferred); past budget with 0 paths up → all 3 attempted (never skip, then fail honestly); within budget → all 4 attempted. In-progress logins never interrupted.
+- **29.2 no regression on real ONTAP (`sim_functional.pl`):** 13/13 PASS. Full alloc/activate/free lifecycle with the budget gate in place; healthy ONTAP logs in all portals well within budget, behaviour unchanged.
+- **29.3 static guards:** all match (`ontap-activate-deadline` property + use, budget gate present, gate conditioned on ≥1 path up).
+- `make test` syntax: all 6 modules OK.
+
+**Result: PASS.** Conservative scope confirmed: the gate only ever defers *additional* portals after the budget once a working path exists — it cannot mark a legitimately-slow-but-reachable storage inactive (the loop never skips while zero paths are up).
 
 ### v0.2.19-1 pvestatd Isolation + Stale-Path Reaper + Connection Reuse Release (2026-06-16)
 

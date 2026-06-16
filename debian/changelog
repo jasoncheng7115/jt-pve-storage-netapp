@@ -1,3 +1,38 @@
+jt-pve-storage-netapp (0.2.20-1) stable; urgency=medium
+
+  * activate_storage iSCSI Login Budget Release ("never wedge PVE")
+  * Requirements: Proxmox VE 9.1 or later
+  * Hardening (follow-on to v0.2.19, completes the "never wedge PVE" rule):
+    - v0.2.19 gave the pvestatd health path (activate_storage/status) a
+      short-timeout, no-retry API client, bounding the ONTAP REST calls.
+      But activate_storage also runs an iSCSI discover/login loop whose
+      per-portal timeouts (probe 2s, discovery 30s, login 60s) bound EACH
+      portal but NOT the loop's cumulative time -- several reachable-but-
+      hanging LIFs could still add up and stall pvestatd (same lesson as
+      v0.2.12: per-call timeouts do not bound a loop's total time).
+    - Fix: new "ontap-activate-deadline" option (default 30s) caps the
+      cumulative discover/login work. Once the budget is spent AND at
+      least one portal is already logged in, the remaining portals are
+      deferred to a later activation (picked up via the already-logged-in
+      fast path). An in-progress login is NEVER interrupted, and the loop
+      NEVER skips while zero paths are up (it must obtain at least one or
+      fail honestly). Multipath redundancy self-heals on the next
+      activation; the alternative -- wedging pvestatd -- is far worse.
+    - CLAUDE.md gains a "PVE Daemon Isolation (never wedge PVE)" rule
+      section documenting the invariant for all future entry points.
+    - Also: activate_storage now snapshots iSCSI sessions ONCE (a single
+      `iscsiadm -m session`) instead of calling it per portal via
+      is_portal_logged_in(). The per-portal calls ran BEFORE the budget
+      gate, so a degraded iscsid could add N x up-to-30s that the budget
+      could not bound; one snapshot keeps the loop's setup cost flat.
+  * Testing: docs/TESTING.md Section 29 added. Unit test 8/8 (past budget
+    with a path up -> remaining skipped; past budget with zero up -> all
+    attempted; within budget -> all attempted). Simulator functional
+    regression 13/13 (budget does not break normal activation). make test
+    all modules OK.
+
+ -- Jason Cheng <jason@jason.tools>  Tue, 16 Jun 2026 15:30:00 +0800
+
 jt-pve-storage-netapp (0.2.19-1) stable; urgency=medium
 
   * pvestatd Isolation + Stale-Path Reaper + Connection Reuse Release

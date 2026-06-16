@@ -33,6 +33,7 @@ use PVE::Storage::Custom::NetAppONTAP::ISCSI qw(
     logout_target
     rescan_sessions
     is_portal_logged_in
+    get_sessions
     wait_for_device
 );
 use PVE::Storage::Custom::NetAppONTAP::Multipath qw(
@@ -174,6 +175,22 @@ sub properties {
             maximum => 30,
             default => 5,
         },
+        'ontap-activate-deadline' => {
+            description => "Wall-clock budget (seconds) for the iSCSI"
+                . " discover/login loop in activate_storage. Once this budget"
+                . " is spent AND at least one portal is already logged in, the"
+                . " remaining portals are skipped this round (they are picked up"
+                . " on a later activation). Bounds the cumulative iSCSI login"
+                . " time so a single reachable-but-hanging portal cannot stall"
+                . " pvestatd. An in-progress login is never interrupted, and the"
+                . " loop never skips when zero portals are up yet (it must get"
+                . " at least one path). Raise on high-latency fabrics with many"
+                . " LIFs.",
+            type => 'integer',
+            minimum => 5,
+            maximum => 120,
+            default => 30,
+        },
     };
 }
 
@@ -192,6 +209,7 @@ sub options {
         'ontap-device-timeout' => { optional => 1 },
         'ontap-portal-probe-timeout' => { optional => 1 },
         'ontap-status-timeout' => { optional => 1 },
+        'ontap-activate-deadline' => { optional => 1 },
         nodes                => { optional => 1 },
         disable              => { optional => 1 },
         content              => { optional => 1 },
@@ -565,13 +583,41 @@ sub activate_storage {
         my @logged_in;
         my @unreachable;
         my @failed;
+        my @skipped_budget;
+
+        # Wall-clock budget for the cumulative discover/login work (v0.2.20).
+        # Per-call timeouts (probe 2s, discovery 30s, login 60s) bound EACH
+        # portal but NOT the loop's total time -- with several reachable-but-
+        # hanging LIFs the sum can still wedge pvestatd (the "never wedge PVE"
+        # rule; same lesson as v0.2.12). Once the budget is spent AND we already
+        # have a working path, stop starting NEW logins. We never interrupt an
+        # in-progress login, and we never skip while zero portals are up (we
+        # must obtain at least one path or fail honestly).
+        my $login_deadline = time() + ($scfg->{'ontap-activate-deadline'} // 30);
+
+        # Snapshot current iSCSI sessions ONCE (one `iscsiadm -m session` call)
+        # instead of re-running it per portal via is_portal_logged_in(). With
+        # many LIFs and a degraded iscsid the per-portal calls would otherwise
+        # add N x up-to-30s -- and that runs BEFORE the budget gate, so the
+        # budget could not bound it. One snapshot keeps the loop's setup cost
+        # flat. (Empty list on error -> treat all as not-logged-in, safe.)
+        my $iscsi_sessions = eval { get_sessions(); } // [];
 
         for my $portal (@$portals) {
             my $portal_addr = "$portal->{address}:$portal->{port}";
 
-            # Fast path: already logged in
-            if (is_portal_logged_in($portal_addr, $portal->{target})) {
+            # Fast path: already logged in (free -- always counted, even past
+            # the budget). Uses the one-shot session snapshot.
+            if (is_portal_logged_in($portal_addr, $portal->{target}, $iscsi_sessions)) {
                 push @logged_in, $portal_addr;
+                next;
+            }
+
+            # Budget gate: past the deadline with at least one path already up
+            # -> defer the rest to a later activation rather than risk stalling
+            # pvestatd on a slow/hanging portal.
+            if (time() >= $login_deadline && @logged_in) {
+                push @skipped_budget, $portal_addr;
                 next;
             }
 
@@ -611,6 +657,17 @@ sub activate_storage {
                 . "  If this is unexpected, check network/switch zoning"
                 . " between this node and the listed LIFs, or move"
                 . " unused LIFs off the SVM.\n";
+        }
+
+        if (@skipped_budget) {
+            warn "Deferred login to " . scalar(@skipped_budget)
+                . " iSCSI portal(s) on SVM '$scfg->{'ontap-svm'}' after the "
+                . "activate budget (" . ($scfg->{'ontap-activate-deadline'} // 30)
+                . "s) with " . scalar(@logged_in) . " path(s) already up: "
+                . join(", ", @skipped_budget) . ".\n"
+                . "  These are picked up on a later activation; this protects "
+                . "pvestatd from a slow/hanging portal. If it recurs, check why "
+                . "those LIFs are slow to log in (or raise ontap-activate-deadline).\n";
         }
 
         unless (@logged_in) {

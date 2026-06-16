@@ -2,6 +2,25 @@
 
 All notable changes to the NetApp ONTAP Storage Plugin for Proxmox VE are documented here.
 
+## [0.2.20] - 2026-06-16
+
+### activate_storage iSCSI Login Budget Release ("never wedge PVE")
+
+A follow-on to v0.2.19 that completes the "never wedge PVE" rule.
+
+**Hardening:**
+
+v0.2.19 gave the pvestatd health path (`activate_storage`/`status`) a short-timeout, no-retry API client, bounding the ONTAP REST calls. But `activate_storage` also runs an iSCSI discover/login loop whose per-portal timeouts (probe 2s, discovery 30s, login 60s) bound EACH portal but NOT the loop's cumulative time — several reachable-but-hanging LIFs could still add up and stall pvestatd (the same lesson as v0.2.12: per-call timeouts do not bound a loop's total time).
+
+- **Fix:** new `ontap-activate-deadline` option (default 30s) caps the cumulative discover/login work. Once the budget is spent AND at least one portal is already logged in, the remaining portals are deferred to a later activation (picked up via the already-logged-in fast path). An in-progress login is NEVER interrupted, and the loop NEVER skips while zero paths are up — it must obtain at least one path or fail honestly. Multipath redundancy self-heals on the next activation; the alternative (wedging pvestatd) is far worse.
+- `CLAUDE.md` gains a "PVE Daemon Isolation (never wedge PVE)" rule section documenting the invariant for all future entry points.
+- **Also:** `activate_storage` now snapshots iSCSI sessions ONCE (a single `iscsiadm -m session`) instead of calling it per portal via `is_portal_logged_in()`. The per-portal calls ran BEFORE the budget gate, so a degraded iscsid could add N × up-to-30s that the budget could not bound; one snapshot keeps the loop's setup cost flat.
+
+**Testing:**
+
+- `docs/TESTING.md` Section 29 added (EN + zh-TW).
+- Unit test 8/8: past budget with a path up → remaining skipped; past budget with zero up → all attempted (never skip); within budget → all attempted. Simulator functional regression 13/13 (the budget does not break normal activation). `make test` all modules OK.
+
 ## [0.2.19] - 2026-06-16
 
 ### pvestatd Isolation + Stale-Path Reaper + Connection Reuse Release

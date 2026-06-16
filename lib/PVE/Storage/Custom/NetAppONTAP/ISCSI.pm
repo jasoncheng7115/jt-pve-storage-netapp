@@ -327,9 +327,14 @@ sub is_target_logged_in {
 # This is needed for multipath: each portal (LIF) requires its own session,
 # even though all portals share the same target IQN.
 sub is_portal_logged_in {
-    my ($portal_addr, $target) = @_;
+    my ($portal_addr, $target, $sessions) = @_;
 
-    my $sessions = get_sessions();
+    # Optional pre-fetched session list (v0.2.20): callers that check many
+    # portals in a loop should snapshot get_sessions() ONCE and pass it here,
+    # instead of re-running `iscsiadm -m session` per portal (N x up-to-30s if
+    # iscsid is degraded -- and NOT covered by the caller's wall-clock budget,
+    # since this runs before the budget gate).
+    $sessions //= get_sessions();
     for my $session (@$sessions) {
         next unless $session->{target} eq $target;
         # Session portal format may include port, normalize for comparison

@@ -2,6 +2,25 @@
 
 NetApp ONTAP Storage Plugin for Proxmox VE 的所有重要變更都記錄在此。
 
+## [0.2.20] - 2026-06-16
+
+### activate_storage iSCSI 登入預算 Release（「絕不卡住 PVE」）
+
+v0.2.19 的後續,把「絕不卡住 PVE」這條規則補完整。
+
+**強化:**
+
+v0.2.19 已讓 pvestatd 健康路徑（`activate_storage`／`status`）改用短逾時、不重試的 API client,界定了 ONTAP REST 呼叫。但 `activate_storage` 還有一段 iSCSI discover/login 迴圈,它每個 portal 的逾時（probe 2s、discovery 30s、login 60s）只界定**單一** portal,並未界定整個迴圈的累積時間——數個「連得到卻在登入時 hang」的 LIF 加起來仍可能拖住 pvestatd（與 v0.2.12 同一個教訓:per-call 逾時不會界定迴圈總時間）。
+
+- **修正:** 新增 `ontap-activate-deadline` 選項（預設 30s）,界定 discover/login 的累積工作量。一旦超過預算**且**已有至少一個 portal 登入成功,剩餘 portal 就延到下次 activation 再處理（透過「已登入」快速路徑接手）。進行中的 login **絕不**中斷,且在尚未有任何路徑時**絕不**跳過——它必須取得至少一條路徑,否則就誠實失敗。multipath 備援會在下次 activation 自我修復;相較之下,卡住 pvestatd 糟糕得多。
+- `CLAUDE.md` 新增「PVE Daemon Isolation（never wedge PVE）」規則章節,為未來所有進入點記下此不變量。
+- **另外:** `activate_storage` 現在**只 snapshot 一次** iSCSI session(單一 `iscsiadm -m session`),而非透過 `is_portal_logged_in()` 對每個 portal 各跑一次。那些 per-portal 呼叫在 budget gate **之前**執行,所以退化的 iscsid 可能加上 N × 最多 30s,而 budget 管不到;一次 snapshot 讓迴圈 setup 成本固定。
+
+**測試:**
+
+- `docs/TESTING.md` 與 zh-TW 版新增 Section 29。
+- 單元測試 8/8:超過預算且已有路徑 → 剩餘跳過;超過預算但 0 路徑 → 全部嘗試（絕不跳過）;預算內 → 全部嘗試。模擬器功能 regression 13/13(預算不會破壞正常 activation)。`make test` 所有模組 OK。
+
 ## [0.2.19] - 2026-06-16
 
 ### pvestatd 隔離 + 殘留路徑 reaper + 連線重用 Release

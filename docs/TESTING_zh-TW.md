@@ -1906,6 +1906,41 @@ grep -c 'keep_alive' "$A"                                         # 預期:1
 
 ---
 
+## 29. activate_storage iSCSI 登入預算（v0.2.20）
+
+界定 `activate_storage` 中 iSCSI discover/login 的累積時間,讓「連得到卻在登入時 hang」的 portal 不會拖住 pvestatd（`ontap-activate-deadline`,預設 30s）。
+
+### 29.1 預算閘門邏輯（離線單元測試）
+
+以 mock 的 iSCSI helper + 假 API 物件驅動 `activate_storage`,並用小段真實 sleep 跨過預算 deadline。
+
+```bash
+perl -Ilib tests/activate_budget.t
+# 預期:8/8。
+#  - 超過預算且已有路徑    -> 剩餘 portal 跳過
+#  - 超過預算但 0 路徑     -> 全部嘗試（絕不跳過)
+#  - 預算內              -> 全部嘗試
+```
+
+### 29.2 真實 ONTAP 無 regression（模擬器）
+
+```bash
+perl -Ilib tests/sim_functional.pl
+# 預期:13/13。ONTAP 健康時預算閘門不應改變正常 activation
+#（所有 portal 都在預算內順利登入)。
+```
+
+### 29.3 靜態 regression 守則
+
+```bash
+P=lib/PVE/Storage/Custom/NetAppONTAPPlugin.pm
+grep -c 'ontap-activate-deadline' "$P"                            # 預期:>= 2(屬性 + 使用)
+grep -c 'skipped_budget' "$P"                                     # 預期:>= 2
+grep -A 6 'login_deadline' "$P" | grep -c '@logged_in'            # 閘門檢查 >=1 路徑已登入
+```
+
+---
+
 ## 清除
 
 ```bash
@@ -1925,6 +1960,19 @@ pvesm list $STORAGE
 ## 發佈測試結果
 
 每次發佈前都必須通過上述所有測試。結果記錄如下。
+
+### v0.2.20-1 activate_storage iSCSI 登入預算 Release (2026-06-16)
+
+**範圍:** Section 29（新)—— iSCSI discover/login 迴圈的 `ontap-activate-deadline` wall-clock 預算,把「絕不卡住 PVE」規則補完整。
+
+**環境:** `pc-pve1`（PVE 9.2,dev lib 以 `-Ilib`）。ONTAP 模擬器（svm0,iSCSI）。儲存 `netapp1`。
+
+- **29.1 預算閘門邏輯（離線單元,`activate_budget.t`）:** 8/8 PASS。超過預算且已有 ≥1 路徑 → 剩餘 portal 跳過（延後);超過預算但 0 路徑 → 全部 3 個嘗試（絕不跳過,然後誠實失敗);預算內 → 全部 4 個嘗試。進行中的 login 絕不中斷。
+- **29.2 真實 ONTAP 無 regression（`sim_functional.pl`）:** 13/13 PASS。預算閘門在位下跑完整 alloc/activate/free lifecycle;ONTAP 健康時所有 portal 都在預算內登入,行為不變。
+- **29.3 靜態守則:** 全部相符（`ontap-activate-deadline` 屬性 + 使用、預算閘門存在、閘門以 ≥1 路徑已登入為條件)。
+- `make test` 語法:6 個模組全 OK。
+
+**結果:PASS。** 保守範圍確認:閘門只會在「已有可用路徑後」延後**額外**的 portal——不會把「只是慢但連得到」的儲存誤判成 inactive(迴圈在 0 路徑時絕不跳過)。
 
 ### v0.2.19-1 pvestatd 隔離 + 殘留路徑 reaper + 連線重用 Release (2026-06-16)
 

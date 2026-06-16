@@ -12,7 +12,7 @@ NetApp ONTAP Storage Plugin for Proxmox VE 的所有重要變更都記錄在此�
 
 某節點無法為一顆活著的 LUN 建立 multipath map:`device-mapper: error getting device (-EBUSY)`,且 `multipath -ll` 看不到任何東西,其他節點卻一切正常。per-node igroup 模式會把每顆 LUN map 給**所有**節點;從未對該 LUN 執行 `free_image()` 的節點會留下殘留 `sd` 路徑;ONTAP 把釋放的 SCSI LUN-ID 重用給新 LUN;殘留 `sd`（此時已讀不出 WWID）遮蔽了被重用的 LUN-ID,device-mapper 便無法載入新 map。v0.2.18 的拆除掃除以 WWID 比對,因此抓不到這些殘留——它們已不再回報任何可比對的 WWID。
 
-- **修正:** 新增 `Multipath::list_netapp_scsi_paths()`（裸 `sd` 拓樸列舉）+ `_reap_stale_scsi_paths()`,作為 `_cleanup_orphaned_devices()` 的第三個 pass。只有在以下條件全部成立時才會移除一條 `sd`:廠商為 NETAPP、沒有任何 holder 且未掛載,且符合其一——(Case A) 它是本儲存追蹤過、ONTAP 上已刪除 LUN 的孤兒;或 (Case B) 同一個 iSCSI target IQN + 同一個 LUN-ID 上有另一條 sibling `sd` 讀到活著（ONTAP alive-set）的 WWID,而這一條不同或空白（LUN-ID 被重用）。300s 寬限期;任何不確定一律放著不動。reap 後以 rescan + multipath reload 自我修復。
+- **修正:** 新增 `Multipath::list_netapp_scsi_paths()`（裸 `sd` 拓樸列舉）+ `_reap_stale_scsi_paths()`,作為 `_cleanup_orphaned_devices()` 的第三個 pass。只有在以下條件全部成立時才會移除一條 `sd`:廠商為 NETAPP、沒有任何 holder 且未掛載,且符合其一——(Case A) 它是本儲存追蹤過、ONTAP 上已刪除 LUN 的殘留;或 (Case B) 同一個 iSCSI target IQN + 同一個 LUN-ID 上有另一條 sibling `sd` 讀到活著（ONTAP alive-set）的 WWID,而這一條不同或空白（LUN-ID 被重用）。300s 寬限期;任何不確定一律放著不動。reap 後以 rescan + multipath reload 自我修復。
 
 **修正 2 — pvestatd 逾時隔離（退化的 ONTAP 不再卡住 PVE 或同節點其他儲存）:**
 
@@ -27,7 +27,7 @@ ONTAP 升級期間,某控制器的管理 REST 發生 read timeout。`activate_st
 **測試:**
 
 - `docs/TESTING.md` 與 zh-TW 版新增 Section 28。
-- 模擬器功能測試（真實 ONTAP + 真實主機裝置）:**13/13**——完整 alloc／activate／free lifecycle 含主機端裝置斷言、殘留 `sd` reaper 對健康 live 裝置零誤刪、退化快速失敗 5.0s vs 32.0s。單元測試:reaper 決策邏輯 20/20、status-path client 13/13。ONTAP 與主機端均驗證 0 殘留。
+- 模擬器功能測試（真實 ONTAP + 真實主機裝置）:**13/13**——完整 alloc／activate／free lifecycle 含主機端裝置驗證、殘留 `sd` reaper 對健康 live 裝置零誤刪、退化快速失敗 5.0s vs 32.0s。單元測試:reaper 決策邏輯 20/20、status-path client 13/13。ONTAP 與主機端均驗證 0 殘留。
 
 ## [0.2.18] - 2026-05-29
 
@@ -37,18 +37,18 @@ ONTAP 升級期間,某控制器的管理 REST 發生 read timeout。`activate_st
 
 kernel 印出 `LUN assignments on this target have changed. The Linux SCSI layer does not automatically remap LUN assignments.`。ONTAP 在 `lun_map` 時自動配 SCSI LUN-ID,unmap 後會把釋放的 LUN-ID 重用給不同的 LUN。若 host 上仍有殘留 `sd` 裝置綁在該 `H:C:T:L`,新 LUN 在該路徑上便無法使用,kernel 也拒絕自動 remap。
 
-- **根本缺口:** `cleanup_lun_devices()` 只移除目前還在 multipath map 內的路徑,且 map 已不在時整段完全 no-op——把孤兒單一 `sd` 路徑留在原地,日後與重用的 LUN-ID 撞號。
+- **根本缺口:** `cleanup_lun_devices()` 只移除目前還在 multipath map 內的路徑,且 map 已不在時整段完全 no-op——把殘留單一 `sd` 路徑留在原地,日後與重用的 LUN-ID 撞號。
 
 - **修正:** 新增 `Multipath::get_scsi_paths_for_wwid()`,列舉該 WWID 的**所有** NETAPP `sd` 路徑（含已脫離 map 的路徑,以裝置的 SCSI `wwid`／VPD 識別碼比對）;`cleanup_lun_devices()` 新增 Step 8 掃除,即使 map 已不在也會移除它們。掃除限定 NETAPP 廠商（絕不碰其他儲存）、以 WWID 比對（無誤判）,並以 wall-clock 預算（預設 30s）界定上限,讓擁有數百個 `sd` 裝置且路徑正在失效的 host 不會卡住拆除（v0.2.12 教訓:per-read timeout 不會界定累積時間）。
 
 **測試:**
 
-- `docs/TESTING.md` 與 zh-TW 版新增 Section 27（helper 比對、Step 8 孤兒掃除、靜態守則）。
-- 模擬器（pc-pve1）已驗證:`get_scsi_paths_for_wwid()` 比對到真實裝置路徑、對 bogus WWID 回傳空;Step 8 掃除被 `multipath -f` 變孤兒的 `sd` 路徑（舊版這情況 no-op）;`budget => 0` 安全退出並警告。
+- `docs/TESTING.md` 與 zh-TW 版新增 Section 27（helper 比對、Step 8 殘留掃除、靜態守則）。
+- 模擬器（pc-pve1）已驗證:`get_scsi_paths_for_wwid()` 比對到真實裝置路徑、對 bogus WWID 回傳空;Step 8 掃除被 `multipath -f` 變殘留的 `sd` 路徑（舊版這情況 no-op）;`budget => 0` 安全退出並警告。
 
 ## [0.2.17] - 2026-05-29
 
-### 孤兒清理路徑健康閘門 + LUN 清單分頁 Release
+### 殘留清理路徑健康閘門 + LUN 清單分頁 Release
 
 **Bug 修正(正式環境事故,客戶回報 2026-05,節點 pve15):**
 
@@ -66,7 +66,7 @@ kernel 印出 `LUN assignments on this target have changed. The Linux SCSI layer
 
 **測試:**
 
-- `docs/TESTING.md` 與 zh-TW 版新增 Section 26:路徑健康邏輯（7 案）、分頁完整性、靜態 regression 守則、執行中 VM 功能性重現（含強制 host-side 裝置斷言,v0.2.14 守則）、寬限期守則。
+- `docs/TESTING.md` 與 zh-TW 版新增 Section 26:路徑健康邏輯（7 案）、分頁完整性、靜態 regression 守則、執行中 VM 功能性重現（含強制 host-side 裝置驗證,v0.2.14 守則）、寬限期守則。
 - 模擬器完整測試 PASS:兩道 reaper 防線皆驗證、真正的殘留（ONTAP 上 LUN 已刪、路徑全失效）仍會被清除且 host-side 乾淨拆除、5 個分頁函式對真實 ONTAP 正常回傳、完整硬碟生命週期（alloc／snapshot／rollback／resize／full clone／free）乾淨且零 I/O error。
 
 ## [0.2.16] - 2026-05-24
@@ -93,15 +93,15 @@ kernel 印出 `LUN assignments on this target have changed. The Linux SCSI layer
 **安全性:**
 
 - 區分「確認 not found」(`volume_get` 回 undef 且不 die)與「API transient 失敗」(`volume_get` die)。只有前者觸發 skip 路徑;後者照樣 die 傳遞,讓下次 cycle 重試,不會悄悄漏掉真實的 clone。
-- 最壞情境(理論上不會發生但仍納入考量):若 `volume_get` 在 volume 實際存在時錯誤地回 undef,我們會略過清理並 untrack — 留下 ONTAP 端孤兒。但:temp clone 是 FlexClone,實際 unique block 極少;且 `_cleanup_orphaned_devices` 仍會偵測到 host 上殘留的 multipath device。`volume_get` 的契約清楚(undef = SVM 內無 records),不太會出這種 corner case。
+- 最壞情境(理論上不會發生但仍納入考量):若 `volume_get` 在 volume 實際存在時錯誤地回 undef,我們會略過清理並 untrack — 留下 ONTAP 端殘留。但:temp clone 是 FlexClone,實際 unique block 極少;且 `_cleanup_orphaned_devices` 仍會偵測到 host 上殘留的 multipath device。`volume_get` 的契約清楚(undef = SVM 內無 records),不太會出這種 corner case。
 
 ## [0.2.15] - 2026-05-24
 
-### 跨儲存孤兒偵測修正 Release
+### 跨儲存殘留偵測修正 Release
 
 **Bug 修正(正式環境事件,2026-05-21~23 客戶回報):**
 
-- **`_cleanup_orphaned_devices()` 不再把姊妹 netappontap storage 的 WWID 誤判為孤兒。** 客戶現場每個 cluster 節點的 pvestatd journal 都出現重複的 cluster-wide 警告:
+- **`_cleanup_orphaned_devices()` 不再把姊妹 netappontap storage 的 WWID 誤判為殘留。** 客戶現場每個 cluster 節點的 pvestatd journal 都出現重複的 cluster-wide 警告:
   ```
   Orphan cleanup: detected N untracked NETAPP multipath device(s) that may be stale.
   Plugin will NOT auto-clean these (risk of touching manually-managed storage).
@@ -112,7 +112,7 @@ kernel 印出 `LUN assignments on this target have changed. The Linux SCSI layer
   (This warning repeats at most once per hour per device.)
   ```
   但跑完整 plugin/ONTAP audit 證實:警告列出的 WWID **全部都是健康的、被 plugin 正常管理的 LUN**,只是它們屬於客戶**另一個** netappontap storage(客戶同節點同時掛了 `netappASA` + `netappFAS_Node2`)。如果操作員照警告手動清,會直接拆掉姊妹 storage 上跑著的 VM 磁碟。
-- 根本原因:`list_netapp_multipath_devices()` 回傳 host 上**所有** vendor=NETAPP 的設備,沒按 storage 過濾。`_cleanup_orphaned_devices()` 是 per-storage 跑的,second-pass 偵測在比對「host 全體 NETAPP 設備 vs 單一 storage 的 tracking + ONTAP alive 清單」,姊妹 storage 的 WWID 既不在 alive 也不在 tracking,就被誤判為孤兒。
+- 根本原因:`list_netapp_multipath_devices()` 回傳 host 上**所有** vendor=NETAPP 的設備,沒按 storage 過濾。`_cleanup_orphaned_devices()` 是 per-storage 跑的,second-pass 偵測在比對「host 全體 NETAPP 設備 vs 單一 storage 的 tracking + ONTAP alive 清單」,姊妹 storage 的 WWID 既不在 alive 也不在 tracking,就被誤判為殘留。
 - 修法:旗標前,先建一份「**其他任何** netappontap storage 所追蹤的 WWID 聯集」(透過 `PVE::Storage::config()` 找出其他 netappontap storeid,讀它們的 tracking JSON),命中聯集的 WWID 跳過 — 屬於姊妹 storage,由它自己的 cleanup 負責。
 
 **會中招的情境**(這 bug 顯現的條件):
@@ -122,8 +122,8 @@ kernel 印出 `LUN assignments on this target have changed. The Linux SCSI layer
 
 **未改動**(被 fix 保留的正確行為):
 
-- 真正的孤兒偵測仍然有效:一個 WWID 若**不在任何** plugin storage 的 tracking 中,且所有 path 都失效,依然會被標示提示手動清。
-- 每個 storage 的 cleanup 仍各自獨立跑 — 各 storage 仍由自己的 first-pass(tracked vs alive 比對)處理自己的孤兒。
+- 真正的殘留偵測仍然有效:一個 WWID 若**不在任何** plugin storage 的 tracking 中,且所有 path 都失效,依然會被標示提示手動清。
+- 每個 storage 的 cleanup 仍各自獨立跑 — 各 storage 仍由自己的 first-pass(tracked vs alive 比對)處理自己的殘留。
 
 ## [0.2.14] - 2026-05-14
 
@@ -136,8 +136,8 @@ kernel 印出 `LUN assignments on this target have changed. The Linux SCSI layer
 
 **測試強化(回應客戶意見「這種問題請加入測試清單」):**
 
-- TESTING.md / TESTING_zh-TW.md 的 Section 24 加上明確的 HOST 端 device 殘留斷言:`volume_snapshot_delete` 跑完後 `get_device_by_wwid` 必須回 undef、sd* slave 不能存在於 `/sys/block`、`/dev/mapper/<wwid>` 必須不存在。這些斷言若在 v0.2.13 的 CI 跑過就會立刻 catch 到 regression;舊版測試只檢查 ONTAP 那層。長期 regression 守則。
-- CLAUDE.md 新增 release SOP 規則:**任何測試只要涵蓋「在 ONTAP 上刪 LUN/卷」的路徑,都必須包含 host 端 device 殘留斷言**。只測 ONTAP 不夠 — 清理類 bug 一定要兩邊都驗。
+- TESTING.md / TESTING_zh-TW.md 的 Section 24 加上明確的 HOST 端 device 殘留驗證:`volume_snapshot_delete` 跑完後 `get_device_by_wwid` 必須回 undef、sd* slave 不能存在於 `/sys/block`、`/dev/mapper/<wwid>` 必須不存在。這些驗證若在 v0.2.13 的 CI 跑過就會立刻 catch 到 regression;舊版測試只檢查 ONTAP 那層。長期 regression 守則。
+- CLAUDE.md 新增 release SOP 規則:**任何測試只要涵蓋「在 ONTAP 上刪 LUN/卷」的路徑,都必須包含 host 端 device 殘留驗證**。只測 ONTAP 不夠 — 清理類 bug 一定要兩邊都驗。
 
 **既存殘留處理建議:**
 

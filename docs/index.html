@@ -1442,7 +1442,7 @@
         <div class="changelog-date">2026-06-16</div>
         <div class="changelog-summary">
             <span class="lang-en">Orphan-Cleanup N+1 REST Storm Fix (ONTAP mgmt-gateway load). On a customer's FAS (ONTAP 9.15.1P19), the management REST went slow (~4s/req) and intermittently refused connections after a firmware upgrade — a sibling ASA on 9.14.1 with the same plugin was fine. Root cause: <code>_cleanup_orphaned_devices()</code> (run every ~10s poll on every node) called <code>lun_get_wwid()</code> once <em>per LUN</em> to build its alive-set — an N+1 REST storm (75 LUNs × N nodes ≈ 75·N calls every 10s) that overwhelmed ONTAP's management gateway (mgwd) into congestion collapse (capacity exhaustion, not a 429 rate limit). Fix: <code>lun_list()</code> already returns <code>serial_number</code> in one call, so the WWID is now computed locally via <code>serial_to_wwid()</code> — ~75 calls/poll → 0 extra, byte-identical alive-set (verified on real ONTAP). New test <code>cleanup_load.pl</code> 6/6; full regression 13/13 + 20/20 + 13/13 + 8/8.</span>
-            <span class="lang-zh">殘留清理 N+1 REST 風暴修正(ONTAP 管理閘道負載)。客戶的 FAS(ONTAP 9.15.1P19)韌體升級後,管理 REST 變慢(~4s／請求)且間歇拒連——同叢集、同 plugin 的姊妹 ASA 9.14.1 沒事。根因:<code>_cleanup_orphaned_devices()</code>(每節點每 ~10s 輪詢都跑)為了建立 alive-set,對<em>每顆 LUN</em> 各打一次 <code>lun_get_wwid()</code>——N+1 REST 風暴(75 顆 × N 節點 ≈ 每 10s 75·N 個呼叫),把 ONTAP 管理閘道(mgwd)打進 congestion collapse(容量耗盡,非 429 速率限制)。修正:<code>lun_list()</code> 本來就在一次呼叫回傳 <code>serial_number</code>,改用 <code>serial_to_wwid()</code> 本地算 WWID——~75 calls/輪 → 0 額外,alive-set 逐位元組相同(真實 ONTAP 驗證)。新測試 <code>cleanup_load.pl</code> 6/6;完整回歸 13/13 + 20/20 + 13/13 + 8/8。</span>
+            <span class="lang-zh">殘留清理 N+1 REST 風暴修正(ONTAP 管理閘道負載)。客戶的 FAS(ONTAP 9.15.1P19)韌體升級後,管理 REST 變慢(~4s／請求)且間歇拒連——同叢集、同 plugin 的相關 ASA 9.14.1 沒事。根因:<code>_cleanup_orphaned_devices()</code>(每節點每 ~10s 輪詢都跑)為了建立 alive-set,對<em>每顆 LUN</em> 各打一次 <code>lun_get_wwid()</code>——N+1 REST 風暴(75 顆 × N 節點 ≈ 每 10s 75·N 個呼叫),把 ONTAP 管理閘道(mgwd)打進 congestion collapse(容量耗盡,非 429 速率限制)。修正:<code>lun_list()</code> 本來就在一次呼叫回傳 <code>serial_number</code>,改用 <code>serial_to_wwid()</code> 本地算 WWID——~75 calls/輪 → 0 額外,alive-set 逐位元組相同(真實 ONTAP 驗證)。新測試 <code>cleanup_load.pl</code> 6/6;完整回歸 13/13 + 20/20 + 13/13 + 8/8。</span>
         </div>
     </div>
 
@@ -1496,7 +1496,7 @@
         <div class="changelog-date">2026-05-24</div>
         <div class="changelog-summary">
             <span class="lang-en">Cross-Storage Orphan Detection Fix (production incident). With two+ netappontap storages on the same node (e.g. ASA + FAS), each storage's orphan cleanup falsely flagged the OTHER storage's healthy LUNs as orphans and suggested <code>multipath -f &lt;wwid&gt;</code> — operators following those commands would tear down active VM disks. Fix: <code>_cleanup_orphaned_devices()</code> now builds a union of WWIDs tracked by all sibling netappontap storages and excludes them from orphan candidates.</span>
-            <span class="lang-zh">跨儲存殘留偵測修正(正式環境事件)。同節點掛兩個以上 netappontap storage 時(例如 ASA + FAS),每個 storage 的殘留清理會把對方健康的 LUN 誤判為殘留,印 <code>multipath -f &lt;wwid&gt;</code> 建議 — 操作員若照做會拆掉跑著的 VM 磁碟。修正:<code>_cleanup_orphaned_devices()</code> 現在會建立所有姊妹 netappontap storage 追蹤 WWID 的聯集,並從殘留候選排除。</span>
+            <span class="lang-zh">跨儲存殘留偵測修正(正式環境事件)。同節點掛兩個以上 netappontap storage 時(例如 ASA + FAS),每個 storage 的殘留清理會把對方健康的 LUN 誤判為殘留,印 <code>multipath -f &lt;wwid&gt;</code> 建議 — 操作員若照做會拆掉跑著的 VM 磁碟。修正:<code>_cleanup_orphaned_devices()</code> 現在會建立所有相關 netappontap storage 追蹤 WWID 的聯集,並從殘留候選排除。</span>
         </div>
     </div>
 
@@ -1523,7 +1523,7 @@
         <div class="changelog-date">2026-05-05</div>
         <div class="changelog-summary">
             <span class="lang-en">iSCSI Portal TCP Pre-check. <code>activate_storage()</code> now TCP-probes every iSCSI LIF before invoking <code>iscsiadm</code>. Pre-fix behaviour stalled 30s (discovery) + 60s (login) per unreachable LIF, cascading via pvestatd polls into web UI hangs. New <code>probe_portal()</code> helper uses bounded <code>IO::Socket::INET</code> connect. New option <code>ontap-portal-probe-timeout</code> (0..30, default 2). Sibling-pattern audit from jt-pve-storage-purestorage v1.1.9.</span>
-            <span class="lang-zh">iSCSI Portal TCP 預先檢查。<code>activate_storage()</code> 現在會在呼叫 <code>iscsiadm</code> 之前先用 TCP 確認 LIF 是否可達。修正前每個不通的 LIF 會吃 30 秒（discovery）+ 60 秒（login），透過 pvestatd 輪詢連鎖造成 web UI 凍結。新增 <code>probe_portal()</code> helper 用帶上限的 <code>IO::Socket::INET</code> 連線。新選項 <code>ontap-portal-probe-timeout</code>（0..30,預設 2）。修正來源:姊妹專案 jt-pve-storage-purestorage v1.1.9 的同類型稽核。</span>
+            <span class="lang-zh">iSCSI Portal TCP 預先檢查。<code>activate_storage()</code> 現在會在呼叫 <code>iscsiadm</code> 之前先用 TCP 確認 LIF 是否可達。修正前每個不通的 LIF 會吃 30 秒（discovery）+ 60 秒（login），透過 pvestatd 輪詢連鎖造成 web UI 凍結。新增 <code>probe_portal()</code> helper 用帶上限的 <code>IO::Socket::INET</code> 連線。新選項 <code>ontap-portal-probe-timeout</code>（0..30,預設 2）。修正來源:相關專案 jt-pve-storage-purestorage v1.1.9 的同類型稽核。</span>
         </div>
     </div>
 

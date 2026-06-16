@@ -1101,7 +1101,7 @@ echo "glob calls: $GLOB_COUNT, alarm wraps: $ALARM_COUNT"
 
 ## 23. iSCSI Portal TCP 預先檢查 (v0.2.12)
 
-驗證 `activate_storage()` 在遇到不可達的 iSCSI LIF 時,會於可控時間內跳過,而不是被 `iscsiadm` discovery / login timeout 拖住。修正來源:姊妹專案 `jt-pve-storage-purestorage` v1.1.9 的同類型稽核。
+驗證 `activate_storage()` 在遇到不可達的 iSCSI LIF 時,會於可控時間內跳過,而不是被 `iscsiadm` discovery / login timeout 拖住。修正來源:相關專案 `jt-pve-storage-purestorage` v1.1.9 的同類型稽核。
 
 ### 23.1 probe_portal helper 單元測試
 
@@ -1467,7 +1467,7 @@ grep -A 30 '^sub volume_snapshot_delete' "$P" | grep -cE '\$api->volume_clone_sp
 
 ## 25. 跨儲存殘留偵測(v0.2.15)
 
-驗證 `_cleanup_orphaned_devices()` 的 second-pass 偵測不會把同類型(netappontap)的姊妹 storage 所持有的 WWID 誤判為殘留。客戶現場事件(2026-05):同一台 PVE 節點同時掛了 `netappASA` + `netappFAS_Node2`,plugin 持續印 cluster-wide warning,建議對「健康的、姊妹 storage 持有的 LUN」執行 `multipathd disablequeueing map <wwid>` / `multipath -f <wwid>`。操作員若照做會拆掉跑著的 VM 磁碟。
+驗證 `_cleanup_orphaned_devices()` 的 second-pass 偵測不會把同類型(netappontap)的相關 storage 所持有的 WWID 誤判為殘留。客戶現場事件(2026-05):同一台 PVE 節點同時掛了 `netappASA` + `netappFAS_Node2`,plugin 持續印 cluster-wide warning,建議對「健康的、相關 storage 持有的 LUN」執行 `multipathd disablequeueing map <wwid>` / `multipath -f <wwid>`。操作員若照做會拆掉跑著的 VM 磁碟。
 
 **規則(已記入 CLAUDE.md):** 任何「比對 host 上 NETAPP 多重路徑設備 vs 單一 storage tracking」的邏輯,**必須**同時排除同節點上其他 netappontap storage 所追蹤的 WWID。
 
@@ -1521,7 +1521,7 @@ for my $storeid (qw(netapp1 netapp2)) {
         !$alive{$w} && !$tracked->{$w};
     } @$netapp_devs;
 
-    # POST-FIX 模擬(額外排除姊妹 storage)
+    # POST-FIX 模擬(額外排除相關 storage)
     my %other_plugin_wwid;
     for my $other (keys %{PVE::Storage::config()->{ids}}) {
         next if $other eq $storeid;
@@ -1578,11 +1578,11 @@ for my $storeid (qw(netapp1 netapp2)) {
 ```bash
 P=lib/PVE/Storage/Custom/NetAppONTAPPlugin.pm
 
-# 修正必須引用姊妹 storage WWID
+# 修正必須引用相關 storage WWID
 grep -A 80 '^sub _cleanup_orphaned_devices' "$P" | grep -c 'other_plugin_wwid'
 # 預期: >= 3(宣告 + 填充 + 檢查)
 
-# 必須遍歷 config 找姊妹 netappontap storage
+# 必須遍歷 config 找相關 netappontap storage
 grep -A 80 '^sub _cleanup_orphaned_devices' "$P" | grep -c 'PVE::Storage::config'
 # 預期: >= 1
 

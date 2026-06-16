@@ -1991,6 +1991,27 @@ pvesm list $STORAGE
 
 每次發佈前都必須通過上述所有測試。結果記錄如下。
 
+### v0.2.22-1 postinst restart-pvestatd 警告 Release (2026-06-16)
+
+**範圍：** 僅 `debian/postinst`——新增醒目的「restart pvestatd（而非 reload）」升級警告。沒有 Perl code 變更（`lib/` 與 0.2.21 逐位元組相同）。
+
+- postinst `bash -n`：語法 OK。彩色警告區塊在服務 reload 之後正確顯示。
+- 外掛回歸與 0.2.21 相同（無 code 變更）：`cleanup_load.pl` 6/6、`sim_functional` 13/13、reaper 20/20、status-timeout 13/13、activate-budget 8/8、`make test` 6/6。
+
+**結果：PASS。** 純可操作性發版：補上「裝了卻沒生效」的缺口（reload 保持相同 PID、可能跑舊 Perl code；必須在每個節點完整 `systemctl restart pvestatd`）。
+
+### v0.2.21-1 殘留清理 N+1 REST 風暴修正 Release (2026-06-16)
+
+**範圍：** Section 30（新）——消除 `_cleanup_orphaned_devices()` 中每顆 LUN 各打一次 `lun_get_wwid()` 的 N+1。
+
+**環境：** `pc-pve1`（PVE 9.2，dev lib 以 `-Ilib`）。ONTAP 模擬器（svm0，iSCSI）。儲存 `netapp1`。
+
+- **30.1 N+1 消除 + alive-set 不變（`cleanup_load.pl`）：** 6/6 PASS。配置 3 顆真實 LUN；instrument `API::lun_get`；`_cleanup_orphaned_devices` 期間呼叫 **0** 次（原本每顆 1 次）；3 個 WWID 全在 alive-set；`serial_to_wwid(serial)` 算出與舊 `lun_get_wwid()` 逐位元組相同的 WWID；free 後主機與 ONTAP 皆 0 殘留。
+- **30.2 靜態守則：** 相符（alive-set 迴圈無 `lun_get_wwid`；用 `serial_number` + `serial_to_wwid`；`lun_list` 仍要求 `serial_number`）。
+- **完整回歸（行為無變）：** `sim_functional` 13/13、reaper 20/20、status-timeout 13/13、activate-budget 8/8、`make test` 6/6。其餘每輪呼叫已稽核：`get_managed_capacity` 走 aggregate 提前返回（1 個呼叫）；`_check_aggregate_capacity`／`_check_lif_redundancy` 以冷卻節流（1h／24h）。
+
+**結果：PASS。** 外科手術式修正——alive-set 相同，每輪每節點少打 ~75 次 REST。
+
 ### v0.2.20-1 activate_storage iSCSI 登入預算 Release (2026-06-16)
 
 **範圍：** Section 29（新)—— iSCSI discover/login 迴圈的 `ontap-activate-deadline` wall-clock 預算，把「絕不卡住 PVE」規則補完整。

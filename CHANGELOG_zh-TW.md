@@ -2,6 +2,19 @@
 
 NetApp ONTAP Storage Plugin for Proxmox VE 的所有重要變更都記錄在此。
 
+## [0.2.22] - 2026-06-16
+
+### postinst：醒目的「restart pvestatd（而非 reload）」升級警告
+
+**可操作性修正（v0.2.21 事故的後續）：**
+
+postinst 用 `systemctl reload`（SIGHUP）重載 PVE 服務，以避免 restart 在 stop 階段卡在 D-state 子程序（v0.2.5／v0.2.6 教訓）。但在許多 PVE 版本上，SIGHUP re-exec **不會**重載外掛的 Perl 模組——即使新檔案已在磁碟上，pvestatd 仍在記憶體裡跑**舊 code**（PID 不變）。在 v0.2.21 的部署中，這讓一個已安裝的修正看起來一個多小時都沒生效，直到完整 restart 才好。
+
+- **修正：** postinst 現在會在 reload 之後印出一段醒目的彩色警告，告知操作者**必須**在**每一個**叢集節點執行 `systemctl restart pvestatd` 才能讓新 code 生效，並說明如何確認 PID 已改變（reload 會保持相同 PID＝舊 code）。我們維持 `reload`（不自動 restart）以保留避免 D-state 卡住的保護；這段警告補上「裝了卻沒生效」的缺口。
+- `docs/TROUBLESHOOTING.md` 已記載此 restart 需求（v0.2.21 週期加入）。
+
+**沒有 Perl code 變更**——`lib/` 模組與 0.2.21 逐位元組相同。測試：postinst `bash -n` OK；警告正確顯示；完整外掛回歸與 0.2.21 相同（`sim_functional` 13/13、單元 20/13/8、`cleanup_load` 6/6）。
+
 ## [0.2.21] - 2026-06-16
 
 ### 殘留清理 N+1 REST 風暴修正(ONTAP 管理閘道負載）

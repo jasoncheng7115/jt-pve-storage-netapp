@@ -388,6 +388,25 @@ case "$1" in
             fi
         done
 
+        # CRITICAL upgrade note (v0.2.22): on many PVE versions 'systemctl
+        # reload pvestatd' (SIGHUP -> re-exec) does NOT reload the plugin's
+        # Perl modules -- pvestatd keeps running the OLD code in memory even
+        # though the new files are on disk (the PID stays the same). A customer
+        # hit exactly this: an installed fix appeared to have no effect for over
+        # an hour until a full restart. We deliberately keep 'reload' above to
+        # avoid restart stop-phase hangs on D-state children, but the operator
+        # MUST do a full restart to guarantee the new code is active.
+        echo ""
+        echo -e "\033[1;33m============================================================\033[0m"
+        echo -e "\033[1;33m IMPORTANT: reload does NOT reliably load new plugin code.\033[0m"
+        echo -e "\033[1;33m To activate this version, run on EVERY cluster node:\033[0m"
+        echo -e "     \033[1;32msystemctl restart pvestatd\033[0m"
+        echo -e "   Verify the PID changes (reload keeps the same PID = stale code):"
+        echo -e "     systemctl show -p MainPID pvestatd   # before and after"
+        echo -e "\033[1;33m Until pvestatd is RESTARTED (not just reloaded) on all nodes,\033[0m"
+        echo -e "\033[1;33m the previously running plugin code stays active.\033[0m"
+        echo -e "\033[1;33m============================================================\033[0m"
+
         echo ""
         echo "Installation complete."
         echo "See /usr/share/doc/jt-pve-storage-netapp/ for documentation."

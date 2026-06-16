@@ -2,6 +2,19 @@
 
 All notable changes to the NetApp ONTAP Storage Plugin for Proxmox VE are documented here.
 
+## [0.2.22] - 2026-06-16
+
+### postinst: prominent "restart pvestatd (not reload)" upgrade warning
+
+**Operability fix (follow-on to the v0.2.21 incident):**
+
+postinst reloads PVE services with `systemctl reload` (SIGHUP) to avoid restart stop-phase hangs on D-state children (the v0.2.5/v0.2.6 lesson). But on many PVE versions a SIGHUP re-exec does NOT reload the plugin's Perl modules — pvestatd keeps running the **old code in memory** even though the new files are on disk (the PID stays the same). During the v0.2.21 rollout this made an installed fix appear to have no effect for over an hour, until a full restart.
+
+- **Fix:** postinst now prints a prominent, colored warning after the reload that the operator MUST run `systemctl restart pvestatd` on **every** cluster node to activate the new code, with how to verify the PID changed (reload keeps the same PID = stale code). We keep `reload` (not auto-restart) to preserve the D-state-hang protection; the warning closes the "installed but not active" gap.
+- `docs/TROUBLESHOOTING.md` already documents the restart requirement (added in the v0.2.21 cycle).
+
+**No Perl code change** — `lib/` modules are byte-identical to 0.2.21. Testing: postinst `bash -n` OK; warning renders; full plugin regression unchanged from 0.2.21 (`sim_functional` 13/13, units 20/13/8, `cleanup_load` 6/6).
+
 ## [0.2.21] - 2026-06-16
 
 ### Orphan-Cleanup N+1 REST Storm Fix (ONTAP mgmt-gateway load)

@@ -2392,6 +2392,15 @@ pvesm list $STORAGE
 
 Each release must pass all tests above before publishing. Results are recorded below.
 
+### v0.2.22-1 postinst restart-pvestatd Warning Release (2026-06-16)
+
+**Scope:** `debian/postinst` only — add a prominent "restart pvestatd (not reload)" upgrade warning. No Perl code change (`lib/` byte-identical to 0.2.21).
+
+- postinst `bash -n`: syntax OK. The colored warning block renders correctly after the service reload.
+- Plugin regression unchanged from 0.2.21 (no code changed): `cleanup_load.pl` 6/6, `sim_functional` 13/13, reaper 20/20, status-timeout 13/13, activate-budget 8/8, `make test` 6/6.
+
+**Result: PASS.** Operability-only release: closes the "installed but not active" gap (reload keeps the same PID and may run stale Perl code; a full `systemctl restart pvestatd` on every node is required).
+
 ### v0.2.21-1 Orphan-Cleanup N+1 REST Storm Fix Release (2026-06-16)
 
 **Scope:** Section 30 (new) — eliminate the per-LUN `lun_get_wwid()` N+1 in `_cleanup_orphaned_devices()`.

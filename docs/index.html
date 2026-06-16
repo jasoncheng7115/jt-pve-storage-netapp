@@ -142,7 +142,7 @@
     <div class="hero__glow"></div>
     <div class="hero__glow-left"></div>
     <div class="hero__content">
-        <div class="hero__badge">v0.2.21 <span class="hero__badge-sep"></span> MIT License</div>
+        <div class="hero__badge">v0.2.22 <span class="hero__badge-sep"></span> MIT License</div>
         <h1 class="hero__title">jt-pve-storage-netapp</h1>
         <p class="hero__project-desc">
             <span class="lang-en">NetApp ONTAP SAN/iSCSI/FC Storage Plugin for Proxmox VE</span>
@@ -522,7 +522,7 @@
                 <span class="lang-en">Install the plugin package</span>
                 <span class="lang-zh">安裝 plugin 套件</span>
             </div>
-            <pre><span class="cmd">dpkg</span> <span class="flag">-i</span> jt-pve-storage-netapp_0.2.21-1_all.deb</pre>
+            <pre><span class="cmd">dpkg</span> <span class="flag">-i</span> jt-pve-storage-netapp_0.2.22-1_all.deb</pre>
             <p>
                 <span class="lang-en">The plugin automatically configures multipath and reloads Proxmox VE services (pvedaemon, pvestatd, pveproxy).</span>
                 <span class="lang-zh">Plugin 會自動設定 multipath 並重新載入 Proxmox VE 服務（pvedaemon、pvestatd、pveproxy）。</span>
@@ -596,7 +596,7 @@
                 <span class="lang-en">Install new package</span>
                 <span class="lang-zh">安裝新套件</span>
             </div>
-            <pre><span class="cmd">dpkg</span> <span class="flag">-i</span> jt-pve-storage-netapp_0.2.21-1_all.deb</pre>
+            <pre><span class="cmd">dpkg</span> <span class="flag">-i</span> jt-pve-storage-netapp_0.2.22-1_all.deb</pre>
         </div>
     </div>
     <div class="step">
@@ -1436,6 +1436,15 @@
         <span class="lang-en">Version history. For full details see <a href="https://github.com/jasoncheng7115/jt-pve-storage-netapp/blob/main/CHANGELOG.md">CHANGELOG.md</a>.</span>
         <span class="lang-zh">版本紀錄。完整內容請參閱 <a href="https://github.com/jasoncheng7115/jt-pve-storage-netapp/blob/main/CHANGELOG_zh-TW.md">CHANGELOG_zh-TW.md</a>。</span>
     </p>
+
+    <div class="changelog-entry">
+        <div class="changelog-version">v0.2.22 <span class="changelog-tag changelog-tag--fix">Fix</span></div>
+        <div class="changelog-date">2026-06-16</div>
+        <div class="changelog-summary">
+            <span class="lang-en">postinst: prominent "restart pvestatd (not reload)" upgrade warning. postinst reloads PVE services with <code>systemctl reload</code> (SIGHUP) to avoid restart stop-phase hangs on D-state children, but on many PVE versions SIGHUP re-exec does NOT reload the plugin's Perl modules — pvestatd keeps running the old code in memory (the PID stays the same) even though the new files are on disk. In the v0.2.21 rollout this made an installed fix appear to have no effect for over an hour. postinst now prints a prominent warning that the operator MUST run <code>systemctl restart pvestatd</code> on every node (and verify the PID changed). No Perl code change — lib/ is byte-identical to 0.2.21.</span>
+            <span class="lang-zh">postinst：醒目的「restart pvestatd（而非 reload）」升級警告。postinst 用 <code>systemctl reload</code>（SIGHUP）重載 PVE 服務，以避免 restart 卡在 D-state 子程序，但在許多 PVE 版本上 SIGHUP re-exec **不會**重載外掛的 Perl 模組——即使新檔案已在磁碟上，pvestatd 仍在記憶體裡跑舊 code（PID 不變）。在 v0.2.21 部署中，這讓一個已安裝的修正一個多小時都看似沒生效。postinst 現在會印出醒目警告，告知操作者**必須**在每個節點執行 <code>systemctl restart pvestatd</code>（並確認 PID 已改變）。沒有 Perl code 變更——lib/ 與 0.2.21 逐位元組相同。</span>
+        </div>
+    </div>
 
     <div class="changelog-entry">
         <div class="changelog-version">v0.2.21 <span class="changelog-tag changelog-tag--fix">Fix</span></div>

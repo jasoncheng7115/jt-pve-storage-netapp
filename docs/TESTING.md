@@ -2233,6 +2233,74 @@ grep -A 60 '^sub get_scsi_paths_for_wwid' "$M" | grep -c 'NETAPP'               
 
 ---
 
+## 28. pvestatd Isolation + Stale-Path Reaper + Connection Reuse (v0.2.19)
+
+Covers the three v0.2.19 fixes: the stale SCSI-path reaper (LUN-ID reuse on a
+non-teardown node), pvestatd timeout isolation (`ontap-status-timeout`), and
+HTTP keep-alive.
+
+### 28.1 Stale-sd reaper decision logic (offline unit test)
+
+Reproduces the exact pve19 topology (SVM-A LUN 16: one live path, three blank
+residue paths) plus every safety guard. Removal is mocked, so it is zero-risk.
+
+```bash
+perl -Ilib tests/stale_sd_reaper.t
+# Expected: 20/20. Reaps the 3 reused-LUN-ID residue paths + 1 tracked orphan;
+# NEVER reaps: live/alive WWID, in-map (has_holders), holderless-but-alive,
+# unknown/manual WWID, sibling-storage-owned, blank-without-reuse-evidence, FC
+# (no IQN), mounted, or within the 300s grace window.
+```
+
+### 28.2 status-path short-timeout client (offline unit test + degraded fast-fail)
+
+```bash
+perl -Ilib tests/status_timeout.t
+# Expected: 13/13. Data path = 15s timeout, 2 retries; status path =
+# ontap-status-timeout (default 5s), single attempt; cached separately.
+
+# Degraded fast-fail against a blackhole IP (192.0.2.1, RFC5737):
+#   status-path client fails in ~5s (no retry); default client ~32s (15s x2 + 2s).
+# This is the 189s -> ~5s improvement that stops pvestatd starving siblings.
+```
+
+### 28.3 Stale-sd reaper no-false-positive on a HEALTHY live device (simulator, CORE)
+
+The load-bearing safety property: against real ONTAP + real host devices, a
+freshly allocated, in-use device MUST survive `_cleanup_orphaned_devices()`
+(which now includes the reaper).
+
+```bash
+perl -Ilib tests/sim_functional.pl
+# Expected: 13/13. alloc_image -> activate -> /dev/mapper device + sd paths
+# present, list_netapp_scsi_paths reports has_holders=1; running the reaper does
+# NOT remove the device or any sd path; free_image then removes the multipath
+# device, /dev/mapper entry, and all sd slaves (v0.2.14 host-side assertions).
+# ONTAP + host both verified 0 leftover.
+```
+
+### 28.4 Static regression guards
+
+```bash
+P=lib/PVE/Storage/Custom/NetAppONTAPPlugin.pm
+M=lib/PVE/Storage/Custom/NetAppONTAP/Multipath.pm
+A=lib/PVE/Storage/Custom/NetAppONTAP/API.pm
+
+grep -c 'sub list_netapp_scsi_paths' "$M"                         # Expected: 1
+grep -c 'sub _reap_stale_scsi_paths' "$P"                         # Expected: 1
+# reaper wired as a third pass in the orphan cleanup
+grep -c '_reap_stale_scsi_paths' "$P"                             # Expected: >= 2
+# reaper safety gates + grace present
+grep -A 90 '^sub _reap_stale_scsi_paths' "$P" | grep -c 'has_holders\|GRACE\|alive'  # >= 3
+# status-path client: short timeout + no retry
+grep -A 40 '^sub _get_api' "$P" | grep -c 'status_path\|retry_count'  # >= 2
+grep -c 'ontap-status-timeout' "$P"                               # Expected: >= 2
+# keep-alive enabled
+grep -c 'keep_alive' "$A"                                         # Expected: 1
+```
+
+---
+
 ## Cleanup
 
 ```bash
@@ -2252,6 +2320,20 @@ pvesm list $STORAGE
 ## Release Test Results
 
 Each release must pass all tests above before publishing. Results are recorded below.
+
+### v0.2.19-1 pvestatd Isolation + Stale-Path Reaper + Connection Reuse Release (2026-06-16)
+
+**Scope:** Section 28 (new) — stale SCSI-path reaper, pvestatd `ontap-status-timeout` isolation, HTTP keep-alive.
+
+**Environment:** `pc-pve1` (PVE 9.2, dev lib via `-Ilib`). ONTAP simulator rebuilt this session (svm0, target IQN regenerated, two iSCSI portals); host iSCSI re-established. Storage `netapp1` (iSCSI).
+
+- **28.1 reaper decision logic (offline unit, `stale_sd_reaper.t`):** 20/20 PASS. Exact pve19 topology — 3 reused-LUN-ID residue paths + 1 tracked orphan reaped; all 9 safety-guard cases (alive WWID, has_holders, holderless-alive, manual/unknown, sibling-owned, blank-without-evidence, FC, mounted, grace) NOT reaped. Self-heal (rescan + reload) invoked.
+- **28.2 status-path client (offline unit, `status_timeout.t`):** 13/13 PASS. Data path 15s/2-retry; status path 5s/single-attempt; cached separately. Degraded fast-fail vs blackhole IP: **status-path 5.0s vs data-path 32.0s (6.3x)**.
+- **28.3 reaper no-false-positive on a healthy live device (simulator functional, `sim_functional.pl`):** 13/13 PASS. Real ONTAP + real devices: alloc (`vm-999000-disk-0`, WWID `3600a0980...`, 2 sd paths) → `list_netapp_scsi_paths` sees `has_holders=1` → `_cleanup_orphaned_devices` (incl. reaper) left device + both sd paths intact → `free_image` removed multipath device, `/dev/mapper` entry, and both sd slaves. ONTAP (0 LUN/volume) + host (0 multipath/sd) leftover.
+- **28.4 static guards:** all match (reaper helper + third pass, safety gates/grace, status_path client + `ontap-status-timeout`, `keep_alive`).
+- `make test` syntax: all 6 modules OK.
+
+**Result: PASS.** Environment restored to clean state (test LUN freed, 0 leftover on ONTAP and host). Not reproduced on the simulator: the reaper actually removing a stale path (needs real LUN-ID reuse) — covered by 28.1's exact-topology Case A/B unit cases.
 
 ### v0.2.18-1 Stale SCSI Path Sweep on Cleanup Release (2026-05-29)
 

@@ -51,6 +51,7 @@ use PVE::Storage::Custom::NetAppONTAP::Multipath qw(
     get_device_usage_details
     sysfs_read_with_timeout
     list_netapp_multipath_devices
+    list_netapp_scsi_paths
 );
 use File::Basename qw(basename);
 use PVE::Storage::Custom::NetAppONTAP::FC qw(
@@ -158,6 +159,21 @@ sub properties {
             maximum => 30,
             default => 2,
         },
+        'ontap-status-timeout' => {
+            description => "Per-call ONTAP REST timeout (seconds) used ONLY by"
+                . " the pvestatd health path (activate_storage/status), with no"
+                . " retry. Keeps a degraded ONTAP (e.g. one controller offline"
+                . " during a firmware/ONTAP upgrade) from stalling pvestatd and"
+                . " dragging sibling netappontap storages on the same node into"
+                . " 'inactive'. The data path (alloc/free/clone) is unaffected"
+                . " and keeps its resilient longer timeout + retries. Lower ="
+                . " faster isolation of a sibling storage; higher = more"
+                . " tolerance for a slow-but-alive ONTAP.",
+            type => 'integer',
+            minimum => 1,
+            maximum => 30,
+            default => 5,
+        },
     };
 }
 
@@ -175,6 +191,7 @@ sub options {
         'ontap-protocol'     => { optional => 1 },
         'ontap-device-timeout' => { optional => 1 },
         'ontap-portal-probe-timeout' => { optional => 1 },
+        'ontap-status-timeout' => { optional => 1 },
         nodes                => { optional => 1 },
         disable              => { optional => 1 },
         content              => { optional => 1 },
@@ -274,12 +291,21 @@ sub _translate_limit_error {
 }
 
 sub _get_api {
-    my ($scfg) = @_;
+    my ($scfg, %opts) = @_;
 
     my $storeid = $scfg->{storage} // $scfg->{'ontap-portal'} // 'unknown';
 
+    # status_path: a short-timeout, single-attempt client for the pvestatd
+    # health path (activate_storage/status). A degraded ONTAP must fail fast
+    # here so it cannot back up pvestatd's sequential storage loop and starve
+    # sibling netappontap storages on the same node into 'inactive'. The data
+    # path keeps the resilient default client (longer timeout + retries).
+    # Cached under a separate key so the two clients never clobber each other.
+    my $status_path = $opts{status_path} ? 1 : 0;
+    my $cache_key   = $status_path ? "$storeid\0status" : $storeid;
+
     # Return cached client if available, config hasn't changed, and cache is fresh
-    if (my $cached = $api_cache{$storeid}) {
+    if (my $cached = $api_cache{$cache_key}) {
         my $cache_age = time() - ($cached->{timestamp} // 0);
         if ($cache_age < API_CACHE_TTL &&
             $cached->{host} eq $scfg->{'ontap-portal'} &&
@@ -290,7 +316,7 @@ sub _get_api {
 
     my $ssl_verify = $scfg->{'ontap-ssl-verify'} // 1;
 
-    my $api = PVE::Storage::Custom::NetAppONTAP::API->new(
+    my %api_opts = (
         host       => $scfg->{'ontap-portal'},
         username   => $scfg->{'ontap-username'},
         password   => $scfg->{'ontap-password'},
@@ -298,8 +324,16 @@ sub _get_api {
         aggregate  => $scfg->{'ontap-aggregate'},
         ssl_verify => $ssl_verify,
     );
+    if ($status_path) {
+        # No retry: pvestatd re-polls every ~10s, so the next poll IS the
+        # retry. One short attempt bounds the per-cycle cost to ~timeout.
+        $api_opts{timeout}     = $scfg->{'ontap-status-timeout'} // 5;
+        $api_opts{retry_count} = 1;
+    }
 
-    $api_cache{$storeid} = {
+    my $api = PVE::Storage::Custom::NetAppONTAP::API->new(%api_opts);
+
+    $api_cache{$cache_key} = {
         api       => $api,
         host      => $scfg->{'ontap-portal'},
         svm       => $scfg->{'ontap-svm'},
@@ -474,7 +508,16 @@ sub activate_storage {
     # Verify ONTAP connectivity. If this fails (network down, API down,
     # auth changed), record the failure so monitoring systems are alerted.
     # We re-throw the error after recording so PVE behavior is unchanged.
-    my $api = eval { _get_api($scfg); };
+    #
+    # status_path => 1: use the short-timeout, no-retry client. A degraded
+    # ONTAP (e.g. a controller mid-upgrade whose mgmt REST read-times-out) must
+    # fail this check in ~ontap-status-timeout seconds, NOT ~32s. Otherwise the
+    # several sequential REST calls below (each 15s x 2 retries on the default
+    # client) stack up -- the field incident showed pvestatd "status update
+    # time (189s)" -- and pvestatd's sequential storage loop drags sibling
+    # netappontap storages on the same node into 'inactive'. The next pvestatd
+    # poll (~10s) is the retry, so dropping per-call retries here loses nothing.
+    my $api = eval { _get_api($scfg, status_path => 1); };
     if (!$api || $@) {
         my $err = $@ || "API client not available";
         _record_status_failure($storeid, "activate_storage: API connection failed: $err");
@@ -856,6 +899,38 @@ sub _untrack_wwid {
     });
 }
 
+# Stale-SCSI-path grace state (v0.2.19). Lives in /var/run (tmpfs) -- it only
+# enforces a "seen reapable for >= N seconds" grace window, so losing it on
+# reboot is harmless (a reboot clears the stale sd anyway). Keyed per storage;
+# only the per-storage background grandchild touches it, so no lock is needed.
+sub _stale_sd_state_file {
+    my ($storeid) = @_;
+    (my $safe = $storeid) =~ s/[^a-zA-Z0-9_-]/_/g;
+    return "$WWID_LOCK_DIR/${safe}-stale-sd.json";
+}
+
+sub _read_stale_sd_state {
+    my ($storeid) = @_;
+    my $file = _stale_sd_state_file($storeid);
+    return {} unless -f $file;
+    my $json = do { local $/; open my $fh, '<', $file or return {}; <$fh> };
+    return eval { JSON::decode_json($json) } // {};
+}
+
+sub _write_stale_sd_state {
+    my ($storeid, $state) = @_;
+    _ensure_wwid_state_dir();   # also (re)creates the /var/run tmpfs dir
+    my $file = _stale_sd_state_file($storeid);
+    my $tmp = "$file.tmp.$$";
+    open my $fh, '>', $tmp or do {
+        warn "Cannot write stale-sd state file $tmp: $!\n";
+        return;
+    };
+    print $fh JSON::encode_json($state);
+    close $fh;
+    rename($tmp, $file) or warn "Cannot rename $tmp -> $file: $!\n";
+}
+
 # Find and clean up orphaned multipath devices on this node.
 #
 # Two-phase strategy (v0.2.3):
@@ -982,8 +1057,11 @@ sub _cleanup_orphaned_devices {
     # OTHER netappontap storage and treat them as "owned by another sibling
     # storage; not our concern". Each storage's own cleanup still runs
     # independently to handle its own orphans.
-    eval {
-        my %other_plugin_wwid;
+    #
+    # Built once here (hoisted out of the eval below) so the v0.2.19 stale-SCSI-
+    # path reaper can reuse the exact same sibling-ownership set.
+    my %other_plugin_wwid;
+    {
         my $cfg = eval { PVE::Storage::config(); };
         if ($cfg && $cfg->{ids}) {
             for my $other_storeid (keys %{$cfg->{ids}}) {
@@ -998,7 +1076,9 @@ sub _cleanup_orphaned_devices {
                 $other_plugin_wwid{lc($_)} = 1 for keys %$other_tracked;
             }
         }
+    }
 
+    eval {
         my $netapp_devs = list_netapp_multipath_devices();
         my @untracked;
         for my $dev (@$netapp_devs) {
@@ -1048,6 +1128,138 @@ sub _cleanup_orphaned_devices {
             }
         }
     };
+
+    # Third pass (v0.2.19): reap stale RAW SCSI (sd) paths left behind by
+    # LUN-ID reuse. These are below the multipath-map layer the first two
+    # passes operate on, so neither catches them. Reuses the alive set,
+    # tracking, and sibling-ownership already computed above.
+    eval { _reap_stale_scsi_paths($storeid, \%alive_wwids, $tracked, \%other_plugin_wwid); };
+    warn "Stale SCSI path reaper error for '$storeid': $@\n" if $@;
+}
+
+# v0.2.19: reap stale raw SCSI (sd) paths left behind by LUN-ID reuse.
+#
+# Background: in per-node igroup mode every LUN is mapped to ALL node igroups
+# (so VMs can migrate). When a LUN is deleted, only the node that ran
+# free_image() tears down its sd paths; other nodes that merely had it mapped
+# keep stale sd. ONTAP later reuses that freed SCSI LUN-ID for a DIFFERENT LUN.
+# On those other nodes the stale sd (whose backing LUN is gone -- it now reports
+# no WWID, or a cached old one) shadows the reused LUN-ID, and device-mapper
+# cannot build the new map: "error getting device (-EBUSY)"; the map never
+# appears in `multipath -ll`. The teardown-time sweep (get_scsi_paths_for_wwid)
+# cannot catch these because they no longer advertise any matchable WWID. This
+# reaper works at the raw-sd / topology level instead.
+#
+# SAFETY (data-availability is paramount -- a false reap destroys live I/O). An
+# sd is removed ONLY when ALL of the following hold:
+#   - vendor is NETAPP (enforced inside list_netapp_scsi_paths)
+#   - it has NO holders (not in any multipath map, no LVM/dm-crypt/kpartx on
+#     top) and is not mounted/swap. Any in-use path is excluded by this alone,
+#     because an in-use path is always a holder of something.
+#   - it is provably plugin-scoped stale, by ONE of:
+#       Case A (orphan): a readable WWID that THIS storage tracked but is no
+#         longer in the ONTAP alive set, and not owned by a sibling storage.
+#       Case B (reused LUN-ID): a sibling sd at the SAME iSCSI target IQN and
+#         SAME LUN-ID reports a WWID that IS in the ONTAP alive set (a live
+#         pve_* LUN), while this sd reports a DIFFERENT WWID (or none). Within
+#         one target a LUN-ID maps to exactly one LUN, so a mismatch here is by
+#         definition stale residue of that LUN-ID's previous tenant -- and the
+#         live sibling proves the slot now belongs to a plugin LUN, so this is
+#         never a customer's manually-managed LUN.
+#   - it has been continuously reapable for >= 300s (grace), ruling out a
+#     freshly discovered device whose INQUIRY has not completed, and ONTAP
+#     read-after-write races (same class as the v0.2.17 orphan-reaper grace).
+#
+# If ONTAP could not be queried the caller has already aborted before reaching
+# here, so the alive set is always authoritative. Anything indeterminate is left
+# alone: we would rather leave a stale device for the next poll than risk
+# removing a live one.
+sub _reap_stale_scsi_paths {
+    my ($storeid, $alive_wwids, $tracked, $other_plugin_wwid) = @_;
+
+    my $paths = eval { list_netapp_scsi_paths(); } // [];
+    return unless @$paths;
+
+    # For each (iSCSI target IQN, SCSI LUN-ID), record the alive plugin WWID a
+    # sibling path reports there (if any). This is the Case B reuse evidence.
+    my %alive_at;
+    for my $p (@$paths) {
+        next unless defined $p->{target_id} && defined $p->{lun};
+        next unless $p->{wwid} && $alive_wwids->{$p->{wwid}};
+        $alive_at{"$p->{target_id}\0$p->{lun}"} = $p->{wwid};
+    }
+
+    # Grace state (tmpfs): reapable-key -> first-seen epoch. We only persist
+    # keys still reapable this pass, so a device that recovers (or is reaped)
+    # drops out and its grace timer resets.
+    my $seen = _read_stale_sd_state($storeid);
+    my %new_seen;
+    my $GRACE_SECS = 300;
+
+    my @reap;
+    for my $p (@$paths) {
+        next if $p->{has_holders};   # in a map / stacked / live -> NEVER reap
+        next if $p->{mounted};
+
+        my $w = $p->{wwid};          # '' if the device reports none
+        my $gkey = (defined $p->{target_id} && defined $p->{lun})
+            ? "$p->{target_id}\0$p->{lun}" : undef;
+        my $alive_here = defined $gkey ? $alive_at{$gkey} : undef;
+
+        my $reason;
+        if ($w && $alive_wwids->{$w}) {
+            # This sd IS a live LUN's path -> absolutely never reap.
+            next;
+        } elsif (defined $alive_here && (!$w || $w ne $alive_here)) {
+            # Case B: the LUN-ID is now owned by a live plugin LUN ($alive_here)
+            # on a sibling path; this path is the stale leftover of its previous
+            # tenant.
+            $reason = "reused LUN-ID at $p->{hctl} (live $alive_here on a "
+                    . "sibling path; this path stale)";
+        } elsif ($w && $tracked->{$w} && !$other_plugin_wwid->{$w}) {
+            # Case A: orphan of a deleted plugin LUN this storage tracked.
+            $reason = "orphan of deleted tracked LUN $w at $p->{hctl}";
+        } else {
+            # Untracked/unknown WWID, or no reuse evidence -> could be a
+            # customer's manual storage or a transient. Leave it alone.
+            next;
+        }
+
+        my $key = "$p->{hctl}|$w";
+        my $first = $seen->{$key};
+        if (!$first) {
+            # First time we have seen this path reapable: start the grace clock.
+            $new_seen{$key} = time();
+            next;
+        }
+        $new_seen{$key} = $first;
+        next if (time() - $first) < $GRACE_SECS;
+
+        push @reap, { %$p, reason => $reason };
+    }
+
+    _write_stale_sd_state($storeid, \%new_seen);
+
+    return unless @reap;
+
+    my $reaped = 0;
+    for my $p (@reap) {
+        warn "Stale SCSI path reaper: removing /dev/$p->{dev} ($p->{reason})\n";
+        eval { remove_scsi_device("/dev/$p->{dev}"); $reaped++; 1; }
+            or warn "Stale SCSI path reaper: failed to remove /dev/$p->{dev}: $@\n";
+    }
+
+    if ($reaped) {
+        # Self-heal: rescan the iSCSI hosts so the now-freed LUN-ID is
+        # rediscovered cleanly, then reconfigure multipath so the map that was
+        # previously blocked with -EBUSY can finally load. rescan_scsi_hosts()
+        # is iSCSI-host scoped (safe per the SCSI-host-scan-filtering rule).
+        warn "Stale SCSI path reaper: removed $reaped stale path(s) for "
+           . "'$storeid'; rescanning and reloading multipath to rebuild "
+           . "clean maps\n";
+        eval { rescan_scsi_hosts(delay => 1); };
+        eval { multipath_reload(); };
+    }
 }
 
 sub _health_state_dir {
@@ -1259,12 +1471,21 @@ sub _check_lif_redundancy {
 sub status {
     my ($class, $storeid, $scfg, $cache) = @_;
 
+    # Normal (resilient) client for the BACKGROUND cleanup grandchild below --
+    # it runs detached and must not fail-fast on transient blips.
     my $api = eval { _get_api($scfg); };
     if (!$api) {
         warn "Failed to connect to ONTAP API for status check: $@";
         _record_status_failure($storeid, "API connection failed: $@");
         return (0, 0, 0, 0);
     }
+
+    # Short-timeout, no-retry client for the FOREGROUND capacity/health checks,
+    # which run inline in the pvestatd loop. A degraded ONTAP must fail these in
+    # ~ontap-status-timeout seconds so it cannot back up pvestatd and starve
+    # sibling storages (see the activate_storage rationale). Construction never
+    # touches the network, so this cannot fail here.
+    my $status_api = eval { _get_api($scfg, status_path => 1); } // $api;
 
     # Background cleanup tasks (don't block status check)
     # 1. Old temporary FlexClones
@@ -1290,7 +1511,7 @@ sub status {
     waitpid($intermediate_pid, 0) if defined $intermediate_pid;
 
     eval {
-        my $capacity = $api->get_managed_capacity();
+        my $capacity = $status_api->get_managed_capacity();
 
         $cache->{total}     = $capacity->{total};
         $cache->{used}      = $capacity->{used};
@@ -1306,10 +1527,10 @@ sub status {
     _record_status_success($storeid);
 
     # Aggregate capacity health check (syslog WARNING/ERROR with cooldown)
-    eval { _check_aggregate_capacity($api, $storeid, $scfg); };
+    eval { _check_aggregate_capacity($status_api, $storeid, $scfg); };
 
     # LIF redundancy check (24h cooldown, warns if < 2 iSCSI LIFs)
-    eval { _check_lif_redundancy($api, $storeid, $scfg); };
+    eval { _check_lif_redundancy($status_api, $storeid, $scfg); };
 
     return ($cache->{total}, $cache->{avail}, $cache->{used}, 1);
 }

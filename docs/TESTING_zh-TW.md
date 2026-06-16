@@ -1844,6 +1844,68 @@ grep -A 60 '^sub get_scsi_paths_for_wwid' "$M" | grep -c 'NETAPP'               
 
 ---
 
+## 28. pvestatd 隔離 + 殘留路徑 reaper + 連線重用（v0.2.19）
+
+涵蓋 v0.2.19 三個修正:殘留 SCSI 路徑 reaper（在未執行拆除的節點上發生 LUN-ID 重用）、pvestatd 逾時隔離（`ontap-status-timeout`）、HTTP keep-alive。
+
+### 28.1 殘留 sd reaper 決策邏輯（離線單元測試）
+
+重現完整 pve19 拓樸（SVM-A LUN 16:一條活路徑、三條空白殘留路徑）加上每一條安全閘。移除動作為 mock,零風險。
+
+```bash
+perl -Ilib tests/stale_sd_reaper.t
+# 預期:20/20。reap 掉 3 條 LUN-ID 重用殘留 + 1 條追蹤孤兒;
+# 絕不 reap:活著／alive WWID、在 map 內(has_holders)、無 holder 但活著、
+# 未知／手動 WWID、sibling 儲存所有、空白但無重用證據、FC(無 IQN)、已掛載、
+# 或仍在 300s 寬限期內。
+```
+
+### 28.2 status-path 短逾時 client（離線單元測試 + 退化快速失敗）
+
+```bash
+perl -Ilib tests/status_timeout.t
+# 預期:13/13。資料路徑 = 15s 逾時、2 retry;status 路徑 =
+# ontap-status-timeout(預設 5s)、單次嘗試;分開快取。
+
+# 對黑洞 IP(192.0.2.1,RFC5737)的退化快速失敗:
+#   status-path client ~5s 失敗(不重試);預設 client ~32s(15s x2 + 2s)。
+# 這就是把 189s -> ~5s、讓 pvestatd 不再餓死同節點其他儲存的改善。
+```
+
+### 28.3 reaper 對健康 live 裝置零誤刪（模擬器,核心）
+
+最關鍵的安全性質:在真實 ONTAP + 真實主機裝置上,一顆剛配置、使用中的裝置必須在 `_cleanup_orphaned_devices()`（現已含 reaper）後存活。
+
+```bash
+perl -Ilib tests/sim_functional.pl
+# 預期:13/13。alloc_image -> activate -> /dev/mapper 裝置 + sd 路徑存在、
+# list_netapp_scsi_paths 回報 has_holders=1;跑 reaper 後裝置與 sd 路徑都未被移除;
+# free_image 接著移除 multipath 裝置、/dev/mapper、所有 sd slave(v0.2.14 主機端斷言)。
+# ONTAP 與主機端均驗證 0 殘留。
+```
+
+### 28.4 靜態 regression 守則
+
+```bash
+P=lib/PVE/Storage/Custom/NetAppONTAPPlugin.pm
+M=lib/PVE/Storage/Custom/NetAppONTAP/Multipath.pm
+A=lib/PVE/Storage/Custom/NetAppONTAP/API.pm
+
+grep -c 'sub list_netapp_scsi_paths' "$M"                         # 預期:1
+grep -c 'sub _reap_stale_scsi_paths' "$P"                         # 預期:1
+# reaper 接入孤兒清理的第三個 pass
+grep -c '_reap_stale_scsi_paths' "$P"                             # 預期:>= 2
+# reaper 安全閘 + 寬限期存在
+grep -A 90 '^sub _reap_stale_scsi_paths' "$P" | grep -c 'has_holders\|GRACE\|alive'  # >= 3
+# status-path client:短逾時 + 不重試
+grep -A 40 '^sub _get_api' "$P" | grep -c 'status_path\|retry_count'  # >= 2
+grep -c 'ontap-status-timeout' "$P"                               # 預期:>= 2
+# keep-alive 已啟用
+grep -c 'keep_alive' "$A"                                         # 預期:1
+```
+
+---
+
 ## 清除
 
 ```bash
@@ -1863,6 +1925,20 @@ pvesm list $STORAGE
 ## 發佈測試結果
 
 每次發佈前都必須通過上述所有測試。結果記錄如下。
+
+### v0.2.19-1 pvestatd 隔離 + 殘留路徑 reaper + 連線重用 Release (2026-06-16)
+
+**範圍:** Section 28(新）—— 殘留 SCSI 路徑 reaper、pvestatd `ontap-status-timeout` 隔離、HTTP keep-alive。
+
+**環境:** `pc-pve1`（PVE 9.2,dev lib 以 `-Ilib`）。本 session 重建的 ONTAP 模擬器（svm0,target IQN 已重新產生,兩個 iSCSI portal）;主機 iSCSI 已重建。儲存 `netapp1`（iSCSI）。
+
+- **28.1 reaper 決策邏輯（離線單元,`stale_sd_reaper.t`）:** 20/20 PASS。完整 pve19 拓樸——3 條 LUN-ID 重用殘留 + 1 條追蹤孤兒被 reap;9 條安全閘案例（alive WWID、has_holders、無 holder 但活著、手動／未知、sibling 所有、空白無證據、FC、已掛載、寬限期內）皆未 reap。自我修復（rescan + reload）已觸發。
+- **28.2 status-path client（離線單元,`status_timeout.t`）:** 13/13 PASS。資料路徑 15s／2-retry;status 路徑 5s／單次嘗試;分開快取。對黑洞 IP 退化快速失敗:**status-path 5.0s vs data-path 32.0s（6.3x）**。
+- **28.3 reaper 對健康 live 裝置零誤刪（模擬器功能測試,`sim_functional.pl`）:** 13/13 PASS。真實 ONTAP + 真實裝置:alloc（`vm-999000-disk-0`,WWID `3600a0980...`,2 條 sd 路徑）→ `list_netapp_scsi_paths` 見 `has_holders=1` → `_cleanup_orphaned_devices`（含 reaper）後裝置與兩條 sd 路徑完好 → `free_image` 移除 multipath 裝置、`/dev/mapper`、兩條 sd slave。ONTAP（0 LUN/volume）+ 主機（0 multipath/sd）零殘留。
+- **28.4 靜態守則:** 全部相符(reaper helper + 第三個 pass、安全閘／寬限期、status_path client + `ontap-status-timeout`、`keep_alive`）。
+- `make test` 語法:6 個模組全 OK。
+
+**結果:PASS。** 環境已還原乾淨（測試 LUN 已釋放,ONTAP 與主機端零殘留）。模擬器上未重現:reaper 真的移除一條殘留路徑（需真實 LUN-ID 重用）——由 28.1 完整拓樸的 Case A/B 單元案例涵蓋。
 
 ### v0.2.18-1 清理時殘留 SCSI 路徑掃除 Release (2026-05-29)
 

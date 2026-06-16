@@ -1,3 +1,54 @@
+jt-pve-storage-netapp (0.2.19-1) stable; urgency=medium
+
+  * pvestatd Isolation + Stale-Path Reaper + Connection Reuse Release
+  * Requirements: Proxmox VE 9.1 or later
+  * Fix 1 -- stale SCSI-path reaper (LUN-ID reuse on a non-teardown node):
+    - Customer node could not build the multipath map for a live LUN
+      ("device-mapper: error getting device (-EBUSY)"); "multipath -ll"
+      showed nothing while other nodes were fine. Per-node igroup mode
+      maps every LUN to ALL nodes; a node that never ran the LUN's
+      free_image() keeps stale sd paths; ONTAP reuses the freed SCSI
+      LUN-ID for a new LUN; the stale sd (now reports no WWID) shadows
+      the reused LUN-ID and device-mapper cannot load the new map.
+    - The v0.2.18 teardown sweep matches by WWID, so it cannot catch
+      these (they advertise no matchable WWID).
+    - Fix: new Multipath::list_netapp_scsi_paths() (raw-sd topology
+      enumeration) + _reap_stale_scsi_paths() as a third pass in
+      _cleanup_orphaned_devices(). Removes an sd ONLY when: vendor is
+      NETAPP, it has no holders and is not mounted, AND either it is an
+      orphan of a deleted LUN this storage tracked, OR a sibling sd at
+      the same iSCSI target IQN + same LUN-ID reports a live (alive-set)
+      WWID while this one differs/blank (reused LUN-ID). 300s grace;
+      anything indeterminate is left alone. Reap then self-heals with
+      rescan + multipath reload.
+  * Fix 2 -- pvestatd timeout isolation (degraded ONTAP no longer wedges
+    PVE or sibling storages):
+    - During a customer's ONTAP upgrade, one controller's mgmt REST
+      read-timed-out; activate_storage/status stacked several 15s x 2
+      retry calls into "status update time (189s)", and pvestatd's
+      sequential storage loop dragged a sibling storage on the same node
+      into 'inactive'.
+    - Fix: new "ontap-status-timeout" option (default 5s). The pvestatd
+      health path (activate_storage/status foreground) uses a short
+      timeout, single-attempt API client; the next ~10s poll is the
+      retry. Data path (alloc/free/clone) keeps the resilient client.
+      Measured fast-fail: 5.0s vs 32.0s.
+  * Fix 3 -- HTTP keep-alive (do not overwhelm ONTAP's mgmt gateway):
+    - A request storm (no connection reuse + per-request basic auth,
+      multiplied across cluster nodes and retries) overwhelmed ONTAP's
+      mgmt gateway into sustained read timeouts (proven: 15s/req while
+      hammered, 0.5s the instant polling stopped). LWP now uses
+      keep_alive => 1 so REST calls reuse one TCP+TLS connection instead
+      of a new handshake + re-auth per call.
+  * Testing: docs/TESTING.md Section 28 added. Simulator functional test
+    (real ONTAP + real host devices) 13/13: full alloc/activate/free
+    lifecycle with host-side device assertions, stale-sd reaper
+    no-false-positive on a healthy live device, degraded fast-fail
+    5.0s vs 32.0s. Unit tests: reaper decision logic 20/20, status-path
+    client 13/13. ONTAP + host both verified 0 leftover.
+
+ -- Jason Cheng <jason@jason.tools>  Tue, 16 Jun 2026 14:00:00 +0800
+
 jt-pve-storage-netapp (0.2.18-1) stable; urgency=medium
 
   * Stale SCSI Path Sweep on Cleanup Release

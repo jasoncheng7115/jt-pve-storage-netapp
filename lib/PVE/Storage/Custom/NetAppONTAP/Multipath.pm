@@ -33,6 +33,7 @@ our @EXPORT_OK = qw(
     sysfs_write_with_timeout
     sysfs_read_with_timeout
     list_netapp_multipath_devices
+    list_netapp_scsi_paths
 );
 
 # Constants
@@ -614,6 +615,135 @@ sub get_scsi_paths_for_wwid {
         if $bailed;
 
     return \@devs;
+}
+
+# Enumerate ALL local NETAPP sd* devices together with the topology facts the
+# stale-path reaper (v0.2.19) needs to decide whether a raw SCSI path is a
+# leftover that must be removed.
+#
+# Unlike get_scsi_paths_for_wwid() -- which matches a KNOWN WWID -- this returns
+# EVERY NETAPP sd plus its identity/topology, so the caller can reason about a
+# path whose backing LUN is GONE, including the case where the device can no
+# longer report any WWID at all (its LUN was deleted underneath it, or its SCSI
+# LUN-ID was reused by ONTAP for a different LUN). Those stale sd are exactly
+# what makes device-mapper fail a new map with "error getting device (-EBUSY)"
+# when ONTAP reuses a freed LUN-ID on a node that never ran the old LUN's
+# teardown. get_scsi_paths_for_wwid() cannot find them because they advertise no
+# matchable WWID; this function works at the raw-sd / topology level instead.
+#
+# Returns arrayref of hashrefs, each:
+#   {
+#     dev          => 'sdai',              # kernel name (no /dev/ prefix)
+#     hctl         => '2:0:0:16',          # SCSI H:C:T:L
+#     lun          => 16,                  # the L (SCSI LUN-ID), or undef
+#     target_id    => '<iSCSI target IQN>',# grouping key; undef if not iSCSI/FC
+#     wwid         => '3600a0980...',      # normalized multipath WWID (lc), or
+#                                          # '' if the device reports none
+#     has_holders  => 0|1,                 # anything stacked on top (map/LVM/..)
+#     mounted      => 0|1,                 # mounted or used as swap directly
+#   }
+#
+# Vendor-gated to NETAPP. All sysfs reads are timeout-bounded and the whole scan
+# is wall-clock budgeted (v0.2.12 lesson: per-read timeouts do NOT bound
+# cumulative loop time at scale -- hundreds of sd during teardown).
+sub list_netapp_scsi_paths {
+    my (%opts) = @_;
+
+    my $deadline = time() + ($opts{budget} // 30);
+    my $read_to  = $opts{read_timeout} // 3;
+
+    # Read mount/swap sources once (cheap; avoids a per-device file scan).
+    my %mounted_src;
+    if (open(my $mh, '<', '/proc/mounts')) {
+        while (my $l = <$mh>) {
+            my ($src) = split /\s+/, $l;
+            $mounted_src{$src} = 1 if defined $src;
+        }
+        close($mh);
+    }
+    if (open(my $sh, '<', '/proc/swaps')) {
+        my $hdr = <$sh>;   # skip header line
+        while (my $l = <$sh>) {
+            my ($src) = split /\s+/, $l;
+            $mounted_src{$src} = 1 if defined $src;
+        }
+        close($sh);
+    }
+
+    my @paths;
+    opendir(my $dh, '/sys/block') or return \@paths;
+    my @blocks = grep { /^sd[a-z]+$/ } readdir($dh);
+    closedir($dh);
+
+    my $bailed = 0;
+    for my $b (@blocks) {
+        if (time() >= $deadline) { $bailed = 1; last; }
+
+        ($b) = $b =~ /^(sd[a-z]+)$/;   # untaint
+        next unless $b;
+
+        # Vendor gate FIRST -- never touch another vendor's storage.
+        my $vendor = sysfs_read_with_timeout("/sys/block/$b/device/vendor", $read_to) // '';
+        next unless $vendor =~ /NETAPP/i;
+
+        # H:C:T:L from the device symlink target (e.g. ".../host2/.../2:0:0:16").
+        my $devlink = readlink("/sys/block/$b/device");
+        my ($hctl) = (defined $devlink && $devlink =~ m{(\d+:\d+:\d+:\d+)/?$}) ? ($1) : ('');
+        my $lun;
+        $lun = $1 if $hctl =~ /:(\d+)$/;
+
+        # iSCSI target IQN -- the grouping key for LUN-ID reuse detection.
+        # FC paths have no iscsi session -> target_id stays undef (Case B is
+        # skipped for them; Case A still works as it is WWID-based).
+        my $target_id;
+        if (defined $devlink && $devlink =~ m{/session(\d+)/}) {
+            my $sid = $1;
+            my $tn = sysfs_read_with_timeout(
+                "/sys/class/iscsi_session/session$sid/targetname", $read_to);
+            if (defined $tn) {
+                $tn =~ s/^\s+|\s+$//g;
+                $target_id = $tn if length $tn;
+            }
+        }
+
+        # Normalized WWID (multipath "3"+NAA form), or '' when none is reported
+        # (a device whose backing LUN is gone may return nothing here).
+        my $wwid = '';
+        my $raw = sysfs_read_with_timeout("/sys/block/$b/device/wwid", $read_to);
+        if (defined $raw) {
+            $raw =~ s/^\s+|\s+$//g;
+            if ($raw =~ /^(?:naa\.|0x)?([0-9a-f]{16,})$/i) {
+                $wwid = '3' . lc($1);
+            }
+        }
+
+        # has_holders: ANY entry under holders/ means something is stacked on
+        # this path (a multipath map, LVM PV, dm-crypt, kpartx partition, ...).
+        # A path in active use is ALWAYS a holder of something, so this single
+        # check is the load-bearing "never touch an in-use path" gate.
+        my $has_holders = 0;
+        if (opendir(my $hh, "/sys/block/$b/holders")) {
+            my @h = grep { !/^\./ } readdir($hh);
+            closedir($hh);
+            $has_holders = 1 if @h;
+        }
+
+        push @paths, {
+            dev         => $b,
+            hctl        => $hctl,
+            lun         => $lun,
+            target_id   => $target_id,
+            wwid        => $wwid,
+            has_holders => $has_holders,
+            mounted     => ($mounted_src{"/dev/$b"} ? 1 : 0),
+        };
+    }
+
+    warn "list_netapp_scsi_paths: scan budget exceeded; result may be "
+       . "incomplete (some stale sd paths not evaluated this pass)\n"
+        if $bailed;
+
+    return \@paths;
 }
 
 # Get multipath device name by WWID

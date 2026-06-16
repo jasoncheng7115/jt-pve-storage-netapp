@@ -2,6 +2,33 @@
 
 NetApp ONTAP Storage Plugin for Proxmox VE 的所有重要變更都記錄在此。
 
+## [0.2.19] - 2026-06-16
+
+### pvestatd 隔離 + 殘留路徑 reaper + 連線重用 Release
+
+三個各自獨立的韌性修正,分別由客戶的 ONTAP 升級事故與先前的 LUN-ID 重用事故浮現。
+
+**修正 1 — 殘留 SCSI 路徑 reaper（在未執行拆除的節點上發生 LUN-ID 重用）:**
+
+某節點無法為一顆活著的 LUN 建立 multipath map:`device-mapper: error getting device (-EBUSY)`,且 `multipath -ll` 看不到任何東西,其他節點卻一切正常。per-node igroup 模式會把每顆 LUN map 給**所有**節點;從未對該 LUN 執行 `free_image()` 的節點會留下殘留 `sd` 路徑;ONTAP 把釋放的 SCSI LUN-ID 重用給新 LUN;殘留 `sd`（此時已讀不出 WWID）遮蔽了被重用的 LUN-ID,device-mapper 便無法載入新 map。v0.2.18 的拆除掃除以 WWID 比對,因此抓不到這些殘留——它們已不再廣告任何可比對的 WWID。
+
+- **修正:** 新增 `Multipath::list_netapp_scsi_paths()`（裸 `sd` 拓樸列舉）+ `_reap_stale_scsi_paths()`,作為 `_cleanup_orphaned_devices()` 的第三個 pass。只有在以下條件全部成立時才會移除一條 `sd`:廠商為 NETAPP、沒有任何 holder 且未掛載,且符合其一——(Case A) 它是本儲存追蹤過、ONTAP 上已刪除 LUN 的孤兒;或 (Case B) 同一個 iSCSI target IQN + 同一個 LUN-ID 上有另一條 sibling `sd` 讀到活著（ONTAP alive-set）的 WWID,而這一條不同或空白（LUN-ID 被重用）。300s 寬限期;任何不確定一律放著不動。reap 後以 rescan + multipath reload 自我修復。
+
+**修正 2 — pvestatd 逾時隔離（退化的 ONTAP 不再卡住 PVE 或同節點其他儲存）:**
+
+ONTAP 升級期間,某控制器的管理 REST 發生 read timeout。`activate_storage`／`status` 把數個 15s × 2 retry 的呼叫疊成 `status update time (189s)`,而 pvestatd 依序處理所有儲存的迴圈把同節點的另一個 netappontap 儲存一起拖成 `inactive`。
+
+- **修正:** 新增 `ontap-status-timeout` 選項（預設 5s）。pvestatd 健康路徑（`activate_storage`／`status` 前景）改用短逾時、單次嘗試的 API client——下一輪約 10s 的輪詢就是重試。資料路徑（alloc／free／clone）維持原本的韌性 client。實測快速失敗:**5.0s vs 32.0s**。
+
+**修正 3 — HTTP keep-alive（不打爆 ONTAP 的管理閘道）:**
+
+請求風暴（無連線重用 + 每請求 basic auth,再乘上叢集節點數與重試）把 ONTAP 的管理閘道打進持續 read timeout——現場實證:**被打時 15s／請求,一停止輪詢即 0.5s**。`LWP::UserAgent` 改用 `keep_alive => 1`,REST 呼叫重用同一條 TCP+TLS 連線,而非每次新握手 + 重新認證。
+
+**測試:**
+
+- `docs/TESTING.md` 與 zh-TW 版新增 Section 28。
+- 模擬器功能測試（真實 ONTAP + 真實主機裝置）:**13/13**——完整 alloc／activate／free lifecycle 含主機端裝置斷言、殘留 `sd` reaper 對健康 live 裝置零誤刪、退化快速失敗 5.0s vs 32.0s。單元測試:reaper 決策邏輯 20/20、status-path client 13/13。ONTAP 與主機端均驗證 0 殘留。
+
 ## [0.2.18] - 2026-05-29
 
 ### 清理時殘留 SCSI 路徑掃除 Release

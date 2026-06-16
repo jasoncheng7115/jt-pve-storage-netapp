@@ -52,8 +52,20 @@ sub new {
 sub _init_ua {
     my ($self) = @_;
 
+    # keep_alive: reuse one TCP+TLS connection across requests instead of a new
+    # TCP handshake + full TLS negotiation + ONTAP re-auth on EVERY call. Under
+    # load this matters enormously: the plugin issues many REST calls per
+    # activate_storage/status, the client is cached ~5 min, and ALL cluster
+    # nodes poll a shared storage. Without connection reuse a brief ONTAP
+    # slowdown turns into a request storm that overwhelms ONTAP's mgmt gateway
+    # (mgwd) and collapses into sustained read timeouts (proven in the field
+    # 2026-06-16: FAS mgmt was 15s/req while hammered, 0.5s the instant polling
+    # stopped). A connection gone stale after an ONTAP failover fails the next
+    # request, which LWP transparently retries on a fresh connection -- bounded
+    # by the (short, on the status path) timeout.
     my $ua = LWP::UserAgent->new(
         timeout         => $self->{timeout},
+        keep_alive      => 1,
         ssl_opts        => {
             verify_hostname => $self->{ssl_verify},
             SSL_verify_mode => $self->{ssl_verify} ? 1 : 0,

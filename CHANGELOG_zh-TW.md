@@ -10,7 +10,7 @@ NetApp ONTAP Storage Plugin for Proxmox VE 的所有重要變更都記錄在此�
 
 **修正 1 — 殘留 SCSI 路徑 reaper（在未執行拆除的節點上發生 LUN-ID 重用）:**
 
-某節點無法為一顆活著的 LUN 建立 multipath map:`device-mapper: error getting device (-EBUSY)`,且 `multipath -ll` 看不到任何東西,其他節點卻一切正常。per-node igroup 模式會把每顆 LUN map 給**所有**節點;從未對該 LUN 執行 `free_image()` 的節點會留下殘留 `sd` 路徑;ONTAP 把釋放的 SCSI LUN-ID 重用給新 LUN;殘留 `sd`（此時已讀不出 WWID）遮蔽了被重用的 LUN-ID,device-mapper 便無法載入新 map。v0.2.18 的拆除掃除以 WWID 比對,因此抓不到這些殘留——它們已不再廣告任何可比對的 WWID。
+某節點無法為一顆活著的 LUN 建立 multipath map:`device-mapper: error getting device (-EBUSY)`,且 `multipath -ll` 看不到任何東西,其他節點卻一切正常。per-node igroup 模式會把每顆 LUN map 給**所有**節點;從未對該 LUN 執行 `free_image()` 的節點會留下殘留 `sd` 路徑;ONTAP 把釋放的 SCSI LUN-ID 重用給新 LUN;殘留 `sd`（此時已讀不出 WWID）遮蔽了被重用的 LUN-ID,device-mapper 便無法載入新 map。v0.2.18 的拆除掃除以 WWID 比對,因此抓不到這些殘留——它們已不再回報任何可比對的 WWID。
 
 - **修正:** 新增 `Multipath::list_netapp_scsi_paths()`（裸 `sd` 拓樸列舉）+ `_reap_stale_scsi_paths()`,作為 `_cleanup_orphaned_devices()` 的第三個 pass。只有在以下條件全部成立時才會移除一條 `sd`:廠商為 NETAPP、沒有任何 holder 且未掛載,且符合其一——(Case A) 它是本儲存追蹤過、ONTAP 上已刪除 LUN 的孤兒;或 (Case B) 同一個 iSCSI target IQN + 同一個 LUN-ID 上有另一條 sibling `sd` 讀到活著（ONTAP alive-set）的 WWID,而這一條不同或空白（LUN-ID 被重用）。300s 寬限期;任何不確定一律放著不動。reap 後以 rescan + multipath reload 自我修復。
 

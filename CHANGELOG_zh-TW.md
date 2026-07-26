@@ -2,6 +2,111 @@
 
 NetApp ONTAP Storage Plugin for Proxmox VE 的所有重要變更都記錄在此。
 
+## [0.2.23] - 2026-07-26
+
+### Proxmox VE 9.0／9.1／9.2 相容性稽核 + 快照安全修正
+
+**狀態：已準備，尚未發佈。** 對修復後的 ONTAP 模擬器全數通過：單元 **153/153**（`audit_fixes` 105、`status_timeout` 20、`stale_sd_reaper` 20、`activate_budget` 8）、`make test` 6/6，功能測試 **53/53**（`sim_snapshot_safety` 34、`sim_functional` 13、`cleanup_load` 6）。發佈前尚待完成：`make deb`、在本機安裝、`qm` 層級端到端測試（`docs/TESTING.md` 31.8），以及 `github/` 同步、README 的 deb 檔名與 tag。
+
+系統需求由 Proxmox VE 9.1 放寬為 **Proxmox VE 9.0 或更新版本**。
+
+#### 資料安全：快照還原點靜默消失（最高嚴重度）
+
+ONTAP SnapRestore（`PATCH /storage/volumes` 帶 `restore_to.snapshot`）會刪除**該快照之後建立的所有快照**。而 Proxmox VE 完全無從得知：
+
+- Plugin 未實作 `volume_rollback_is_possible()`，因此 PVE 的 base 實作對任何快照都直接回傳 `1`。
+- `PVE::AbstractConfig::snapshot_rollback()` **不會**把較新的快照從 guest config 中移除。
+
+結果：倒回較舊的快照會在 ONTAP 上靜默摧毀較新的快照，但 Proxmox VE 的 config 與 Web UI 仍然列出它們。操作者以為手上還有那些還原點，只有在之後對它們執行倒回或刪除失敗時才會發現。所有倒回具破壞性的核心 plugin（ZFSPool、LvmThin、LVM、BTRFS）都正是為此實作了這個守門。
+
+- **修正：**實作 `volume_rollback_is_possible()`。它比對 ONTAP 快照建立時間，拒絕任何非「倒回到最新快照」的請求，並透過 PVE 的 `$blockers` 清單回報將被摧毀的快照，讓 Web UI 直接指名。範本的 `__pve_base__` 快照同樣可以構成阻擋，因為 SnapRestore 越過它會摧毀 linked clone 所依賴的基底。ONTAP 時間戳無法解析或相同時，一律視為**阻擋**（fail safe），絕不當作「較舊、所以無害」。
+
+#### 快照刪除現在會偵測鎖住快照的 FlexClone
+
+`PVE::Storage::vdisk_clone($cfg, $volid, $vmid, $snapname)` 是可達路徑（`qm clone ... --snapname X` 且未加 `--full`，以及 LXC 的對應操作），此時 `clone_image()` 會建立一個 parent 為該快照的一般 `pve_*` FlexClone。而 `volume_snapshot_delete()` 只會去找 deterministic 的 `tmpclone_<vol>_<snap>`，因此 ONTAP 以原始錯誤 `Snapshot ... has not expired or is locked` 拒絕刪除，且完全沒有任何訊息告訴操作者是什麼在鎖住它——與 v0.2.13 的 vzdump 事故屬同一症狀類別，只是 clone 來源是這個函式從未查找過的。
+
+- **修正：**在暫存 clone 拆除之後查詢 `volume_get_clone_children()`，若仍有阻擋者則以可行動訊息拒絕，指名每個阻擋的 clone 與其所屬 guest，並說明如何讓它們獨立。Plugin **不會**自動 split 或自動刪除——那些是其他 guest 的線上磁碟。Deterministic 暫存 clone 明確排除在外，因為 ONTAP metadata 可能仍列出剛被刪除的 FlexClone（v0.2.13 的教訓），若因它而阻擋將會使 vzdump CT snapshot 模式路徑回歸故障。
+
+#### 儲存 API 版本協商（真正的 PVE 9.0～9.2 相容性問題）
+
+PVE 的第三方 plugin 載入器會**硬拒絕** `api()` 高於執行中 `PVE::Storage::APIVER` 的 plugin——該 storage 會從節點上靜默消失——而 `api()` 較低時則每次載入都發出警告。Proxmox VE 在 9.1 的 point release **之內**把 `APIVER` 連續 bump 兩次（逐一解包套件驗證）：
+
+| libpve-storage-perl | APIVER | APIAGE | 可接受範圍 |
+|---|---|---|---|
+| 9.0.16～9.1.2 | 13 | 4 | 9～13 |
+| 9.1.3～9.1.5 | 14 | 5 | 9～14 |
+| 9.1.6 以上 | 15 | 6 | 9～15 |
+
+因此硬編碼的 `api() => 13` 會讓 9.1.3 以上的每一次 `pvedaemon`／`pvestatd`／`pveproxy`／`pvesm` 載入都印出 `Plugin ... is implementing an older storage API, an upgrade is recommended`。
+
+- **修正：**`api()` 現在回傳「plugin 有實作、且執行中的 PVE 認得」的最高版本（上限 15、下限 9），在 `PVE::Storage` 未載入時 fallback 為 13。已對所有可取得的 9.0／9.1 儲存函式庫驗證：APIVER 精確吻合，且 9.0.18、9.1.0、9.1.2、9.1.3、9.1.5、9.1.6 全部**零警告**。
+- `volume_resize()` 現在接收 APIVER 14 新增的 `$snapname` 參數並明確拒絕，而不是在被要求調整快照大小時默默調整**當前** volume。
+- 新增 `get_identity()`（APIVER 15，透過 `GET /nodes/{node}/storage/{id}/identity` 提供），回傳 `netappontap://<portal>/<svm>`。刻意排除 aggregate：它只決定新 FlexVol 落在哪裡。
+
+#### ONTAP 管理閘道負載：API client cache 互相踢除
+
+`_get_api()` 以 `$scfg->{storage} // $scfg->{'ontap-portal'}` 作為 client cache 的 key，但 Proxmox VE **從不**設定 `$scfg->{storage}`，所以 key 實際退化成只有 portal，而有效性檢查卻同時比對 portal **與** SVM。因此「共用一個 ONTAP 管理 LIF、但使用不同 SVM」的兩個 `netappontap` storage，會在每一次 `_get_api()` 呼叫時互相踢掉對方的 client。每次重建都會丟棄 keep-alive 連線，使 plugin 退回「每個 REST request 都做新的 TCP + TLS handshake + basic auth」——這正是造成 2026-06-16 mgwd congestion collapse 的行為，也正是 `keep_alive`（v0.2.19）要防止的。
+
+- **修正：**cache key 改為 `(portal, svm, data|status)`。sibling storage 現在各自維持獨立、可重用的連線；而指向相同 portal **與** SVM 的兩筆設定仍共用同一個 client。
+
+#### 從程式碼中移除 `multipath -F`
+
+`Multipath::multipath_flush()` 有一個未帶 device 的分支會執行 `multipath -F`，那會清掉系統上**所有**未使用的 multipath map，包含客戶手動管理的儲存。它雖然是無用程式碼，但讓呼叫點距離一次全叢集事故只差一個誤用的 caller，且違反了本專案自訂的硬規則。依循 v0.2.4 的教訓（有已知風險的無用程式碼要刪掉，而不是留著當陷阱），該分支已移除，函式在未帶 device 時直接 croak。
+
+#### `deactivate_storage()`：補上 v0.2.17 的路徑健康閘門
+
+它會拆除該 storage 每一顆 LUN 的 multipath 裝置與所有 SCSI 路徑，唯一守門是 `is_device_in_use()`——而它**看不到**執行中 VM 由 QEMU 持有的磁碟（開啟的 fd 不是 sysfs holder）。一旦被觸及就會重現 v0.2.17 事故：`multipath -f` 在忙碌的 map 上失敗，`dmsetup remove --force` fallback 直接把它從 QEMU 底下抽掉，guest 隨即出現 I/O error。
+
+- **修正：**以 `multipath_path_health()` 作為拆除前提，並將不確定（`-1`）完全等同於存活（`1`）處理，與 orphan reaper 一致。
+- 同時修正誤導的註解：**Proxmox VE 9.0～9.2 中沒有任何地方呼叫 `PVE::Storage::deactivate_storage()`**（已對整個 `/usr/share/perl5/PVE` 樹驗證），因此不可依賴它來處理 `pvesm set --disable` 或移除 storage 時的清理。
+
+#### `filesystem_path()` 不再以誤導的內部錯誤失敗
+
+它的簽名沒有 `$storeid`，而本 plugin 需要 storage ID 才能推導 ONTAP FlexVol 名稱，因此無法實作。舊的實作傳入永不被設定的 `$scfg->{storage}`，然後以 `storage is required at .../Naming.pm line 213` 失敗。它在 PVE 9.0～9.2 中不可達（所有會呼叫它的 base 方法都已被覆寫，而 `volume_snapshot_info`／`rename_snapshot` 只在 `volume_qemu_snapshot_method` 回傳 `'mixed'` 時才被呼叫，本 plugin 回傳 `'storage'`），但對下一個擴張 external snapshot API 的 PVE 版本而言是個陷阱。
+
+- **修正：**以清楚的 plugin 層級訊息 die，並指向 `path()`。同時覆寫 `volume_snapshot_info()`（現在改由 ONTAP 回答，輸出有序的 `name => {order, timestamp}`）與 `rename_snapshot()`（明確不支援），使兩者都不會落到 base 實作。
+
+#### ONTAP volume recovery queue 佔住已刪除的 clone（由新測試發現）
+
+在對真實 ONTAP 執行新的 31.6 測試時發現，同時也是**對 v0.2.13 診斷的修正**。
+
+一個已經**被刪除**的 FlexClone，只要 ONTAP 還把它留在 **volume recovery queue** 裡，它就仍然算是其 parent 的 clone（該機制預設啟用，保留時間由各 SVM 的 `vserver modify -volume-delete-retention-hours` 決定，預設 12 小時）。被 queue 保留的 volume 會改名為 `<原名>_<id>`，`/storage/volumes` 完全看不到它，但 ONTAP 自己的 clone 檢視仍會回報。後果（兩者都已在真實 ONTAP 上重現）：
+
+- 刪除 parent 的快照失敗，錯誤為 `Snapshot ... has not expired or is locked`
+- 刪除 parent volume 失敗，錯誤為 `it has one or more clones`
+
+而且會持續整個保留期，錯誤訊息完全沒有提到這個 queue。實際情境是：銷毀一個 linked clone VM，接著要刪除來源快照（或來源磁碟）就會失敗 12 小時，而且看不出原因。`free_image()` 舊的「stale clone metadata, retrying…」迴圈撞的正是這件事 —— 它對一個「再怎麼等也不會消失」的狀況重試 5 次，最後給出一個毫無指向性的錯誤訊息。
+
+這同時**修正了 v0.2.13 的根因分析**：當時把 `volume_clone_dependent` owner 遲遲不清除歸因於 eventual consistency 加上 ONTAP 模擬器的特性。真正的機制是 recovery queue，而它在真實 ONTAP 上同樣存在；`volume_clone_split` 之所以有效，是因為 split 會在刪除**之前**把該 volume 去 clone 化，因此它的 queue 項目不再是 clone。
+
+- **修正：**新增 `API::volume_get_clone_children_cli()`（ONTAP 權威的 clone 檢視，含被 queue 保留的 clone）、`recovery_queue_list()` 與 `recovery_queue_purge()`，以及 `_release_recovery_queue_clone_holds()`。`volume_snapshot_delete()` 與 `free_image()` 現在會釋放這類佔用，而不是直接失敗。刻意**不**採用「刪除 linked clone 前先 split」的做法：那會為了丟掉一個 volume 而複製它整份 delta，讓 linked clone 的 `qm destroy` 變成數分鐘到數小時的操作。
+- **安全性：**只有在以下條件全部成立時才會 purge 某個項目 —— ONTAP 回報它是「目前操作對象」的 clone、它**不是**線上 volume、它**確實**在 recovery queue 中，且名稱符合 plugin 自己的命名規則（`pve_*_<id>` 或 `tmpclone_pve_*_<id>`）。線上的 clone 只會回報給操作者處理，絕不 purge；客戶自己建立的 clone 絕不觸碰。purge 僅限於「正在阻擋操作者剛剛要求的刪除」的項目，因此 recovery queue 在其他所有情況下的保護仍然完整，且每次 purge 都會寫入日誌。
+- **可關閉：**新增 `ontap-purge-recovery-queue`（boolean，預設 1）。設為 0 則完全不動該 queue，改為回傳可行動的錯誤，指名被 queue 保留的 volume 與 `volume recovery-queue purge` 指令。
+
+#### 其他正確性與整理修正
+
+- `activate_volume()` 現在接收 Proxmox VE 9.1 傳入的 `$hints` 參數（`Storage.pm:1411`）；先前因簽名過短而被默默丟棄。
+- `volume_size_info()` 現在遵守 PVE 傳入的 `$timeout`（通常為 10 秒）；先前收下卻忽略，導致該呼叫僅受 client 預設的 15 秒 × 2 retry 約束。`API::get()`／`lun_get()` 為此新增 `%opts` 透傳。
+- `parse_volname()` 現在對無法解析的 volume 名稱 die，與所有核心 plugin 一致，而不是回傳 `undef` 讓失敗延後成 `Use of uninitialized value`，且完全看不出是哪個 volume 出問題。
+- `API::volume_get_clone_children()` 現在明確要求 `clone.parent_snapshot.name`，讓呼叫者能判斷每個子 clone 各自釘住哪個 parent 快照。
+- 移除未使用的 `PVE::ProcFSTools` 與 `PVE::Cluster` import；改 import 真正使用到的 `PVE::INotify`。
+- POD：修正 SYNOPSIS 與 CONFIGURATION OPTIONS，先前仍記載 0.2.x 之前的選項名稱（`portal`／`svm`／`aggregate`／`ssl_verify`／`thin`／`igroup_mode`），而非實際的 `ontap-` 前綴——照舊 POD 範例抄進 `storage.cfg` 根本無法運作。並新增 Proxmox VE 相容性章節。
+
+#### 已確認「不是問題」的項目（記錄下來以免重複調查）
+
+- **`-blockdev` 改制（PVE 9.0 最大的變動）：**plugin 未實作 `qemu_blockdev_options()`，而且不需要。base 實作會對 `path()` 回傳的路徑做 `stat()`，判定為 `S_ISBLK`，產出 `{driver => 'host_device', filename => ...}`；`filename` 在 PVE 對該 driver 的允許清單內。
+- **與 multipath-tools 0.11.1 的 `multipathd` CLI 相容性**（Debian 13／PVE 9，PVE 8 為 0.9.x）：`show maps raw format '%n %w'`、`show paths raw format '%m %t %o'` 與 `disablequeueing map` 全部實測可用，且輸出可被 `multipath_path_health()` 正確解析。
+- **`SHARED_STORAGE` 註冊**在 PVE 9.2 仍有效（`shared` 會自動設為 1）。
+- **`status()` 以 double-fork 產生的清理孫程序呼叫 `PVE::Storage::config()`** 並未誤用父程序的 pmxcfs IPC socket：繼承而來的 `$ccache`／`$versions` 足以滿足該次讀取，`ipcc_get_config` 呼叫次數為 **0**（實測）。
+- **執行中 VM 的快照在無 guest agent 時為 crash-consistent**，以及 `volume_snapshot_needs_fsfreeze()` 對 LXC 回傳 0：兩者都與核心 PVE 行為（LVM／LVM-thin）一致，且 `PVE::LXC::sync_container_namespace()` 會在容器的 mount namespace 內執行 `syncfs`。
+- **`volume_export_formats()` 回傳空值**：與 LVM／RBD 相同；`qm move-disk` 透過 `path()` 走 `qemu-img convert`，而 shared storage 在遷移時不需要搬動 volume。
+
+#### 測試
+
+- 新增 `tests/audit_fixes.t`（79 個斷言，不需 ONTAP）：每個 APIVER 各以獨立行程驗證 API 版本協商、ONTAP 時間戳解析、倒回守門、linked clone 鎖定（含暫存 clone 不回歸的守則）、快照資訊排序，以及上述每項修正的靜態守則。
+- `tests/status_timeout.t`：不同的測試 storage 現在以 `ontap-svm` 區分，而非 `storage` key。舊版依賴 `_get_api()` 讀取 `$scfg->{storage}`，那只是重現了它本該防範的 caching bug。
+- `docs/TESTING.md` 與 `docs/TESTING_zh-TW.md`：新增**第 31 節**，涵蓋單元測試套件、跨版本 APIVER 矩陣、PVE 9 API 契約檢查、靜態守則，以及兩項需要 ONTAP 的功能測試（31.5 SnapRestore 破壞性與倒回守門，並依 v0.2.14 規則加上主機端裝置斷言；31.6 linked clone 鎖定）。
+
 ## [0.2.22] - 2026-06-16
 
 ### postinst：醒目的「restart pvestatd（而非 reload）」升級警告

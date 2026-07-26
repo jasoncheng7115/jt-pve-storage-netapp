@@ -142,7 +142,7 @@
     <div class="hero__glow"></div>
     <div class="hero__glow-left"></div>
     <div class="hero__content">
-        <div class="hero__badge">v0.2.22 <span class="hero__badge-sep"></span> MIT License</div>
+        <div class="hero__badge">v0.2.23 <span class="hero__badge-sep"></span> MIT License</div>
         <h1 class="hero__title">jt-pve-storage-netapp</h1>
         <p class="hero__project-desc">
             <span class="lang-en">NetApp ONTAP SAN/iSCSI/FC Storage Plugin for Proxmox VE</span>
@@ -522,7 +522,7 @@
                 <span class="lang-en">Install the plugin package</span>
                 <span class="lang-zh">安裝 plugin 套件</span>
             </div>
-            <pre><span class="cmd">dpkg</span> <span class="flag">-i</span> jt-pve-storage-netapp_0.2.22-1_all.deb</pre>
+            <pre><span class="cmd">dpkg</span> <span class="flag">-i</span> jt-pve-storage-netapp_0.2.23-1_all.deb</pre>
             <p>
                 <span class="lang-en">The plugin automatically configures multipath and reloads Proxmox VE services (pvedaemon, pvestatd, pveproxy).</span>
                 <span class="lang-zh">Plugin 會自動設定 multipath 並重新載入 Proxmox VE 服務（pvedaemon、pvestatd、pveproxy）。</span>
@@ -596,7 +596,7 @@
                 <span class="lang-en">Install new package</span>
                 <span class="lang-zh">安裝新套件</span>
             </div>
-            <pre><span class="cmd">dpkg</span> <span class="flag">-i</span> jt-pve-storage-netapp_0.2.22-1_all.deb</pre>
+            <pre><span class="cmd">dpkg</span> <span class="flag">-i</span> jt-pve-storage-netapp_0.2.23-1_all.deb</pre>
         </div>
     </div>
     <div class="step">
@@ -1436,6 +1436,15 @@
         <span class="lang-en">Version history. For full details see <a href="https://github.com/jasoncheng7115/jt-pve-storage-netapp/blob/main/CHANGELOG.md">CHANGELOG.md</a>.</span>
         <span class="lang-zh">版本紀錄。完整內容請參閱 <a href="https://github.com/jasoncheng7115/jt-pve-storage-netapp/blob/main/CHANGELOG_zh-TW.md">CHANGELOG_zh-TW.md</a>。</span>
     </p>
+
+    <div class="changelog-entry">
+        <div class="changelog-version">v0.2.23 <span class="changelog-tag changelog-tag--fix">Fix</span></div>
+        <div class="changelog-date">2026-07-26</div>
+        <div class="changelog-summary">
+            <span class="lang-en">Proxmox VE 9.0/9.1/9.2 compatibility audit + snapshot safety. <strong>Data safety:</strong> ONTAP SnapRestore deletes every snapshot created after the restore target, but the plugin did not implement <code>volume_rollback_is_possible()</code> — so rolling back to an older snapshot silently destroyed the newer ones on ONTAP while Proxmox VE kept listing them; operators believed they still held restore points that no longer existed. The guard now refuses any rollback that is not to the most recent snapshot and names the snapshots that would be destroyed. <strong>Snapshot delete</strong> now reports which FlexClone locks a snapshot instead of surfacing a raw ONTAP error, and releases holds left by a deleted clone that ONTAP still retains in its volume recovery queue (default 12h) — previously that made the parent's snapshot and volume undeletable for the whole window with no hint about the queue. <strong>API version:</strong> <code>api()</code> is now negotiated against the running <code>PVE::Storage::APIVER</code> instead of being hardcoded, because Proxmox VE bumped APIVER twice inside the 9.1 point releases (libpve-storage-perl 9.0.16-9.1.2 = 13, 9.1.3-9.1.5 = 14, 9.1.6+ = 15); a plugin reporting a version higher than the host's is rejected outright, and a lower one warns on every service load. Adds <code>volume_resize</code>'s APIVER 14 <code>$snapname</code> parameter and the APIVER 15 <code>get_identity()</code>. Also: fixed an API-client cache key that made two storages sharing one ONTAP management LIF evict each other's connection (undoing the v0.2.19 keep-alive benefit), removed a dead <code>multipath -F</code> call path, added the v0.2.17 path-health gate to <code>deactivate_storage()</code>, and made <code>filesystem_path()</code> fail legibly. Requirements relaxed to Proxmox VE 9.0 or later. New <code>ontap-purge-recovery-queue</code> option.</span>
+            <span class="lang-zh">Proxmox VE 9.0／9.1／9.2 相容性稽核 + 快照安全。<strong>資料安全：</strong>ONTAP SnapRestore 會刪除還原目標之後建立的所有快照，但外掛先前未實作 <code>volume_rollback_is_possible()</code>——因此倒回較舊的快照會在 ONTAP 上靜默摧毀較新的快照，而 Proxmox VE 仍然列出它們；操作者以為還有還原點，實際上早已不存在。守門現在會拒絕任何非「倒回最新快照」的請求，並指名將被摧毀的快照。<strong>快照刪除</strong>現在會回報是哪個 FlexClone 鎖住快照，而不是拋出原始的 ONTAP 錯誤；並會釋放「已刪除但仍被 ONTAP volume recovery queue 保留」的 clone 所造成的佔用（預設 12 小時）——先前這會讓 parent 的快照與 volume 在整個保留期內無法刪除，且完全沒有任何關於該 queue 的提示。<strong>API 版本：</strong><code>api()</code> 改為對執行中的 <code>PVE::Storage::APIVER</code> 協商，而非硬編碼，因為 Proxmox VE 在 9.1 的 point release 之內把 APIVER 連續 bump 兩次（libpve-storage-perl 9.0.16～9.1.2 為 13、9.1.3～9.1.5 為 14、9.1.6 以上為 15）；回報版本高於主機的外掛會被直接拒絕載入，較低者則會在每次服務載入時發出警告。並補上 <code>volume_resize</code> 在 APIVER 14 新增的 <code>$snapname</code> 參數與 APIVER 15 的 <code>get_identity()</code>。此外：修正一個 API client cache key 問題，該問題會讓共用同一個 ONTAP 管理 LIF 的兩個 storage 互相踢掉對方的連線（抵銷 v0.2.19 keep-alive 的效益）；移除一條無用的 <code>multipath -F</code> 呼叫路徑；為 <code>deactivate_storage()</code> 補上 v0.2.17 的路徑健康閘門；並讓 <code>filesystem_path()</code> 以清楚訊息失敗。系統需求放寬至 Proxmox VE 9.0 或更新版本。新增 <code>ontap-purge-recovery-queue</code> 選項。</span>
+        </div>
+    </div>
 
     <div class="changelog-entry">
         <div class="changelog-version">v0.2.22 <span class="changelog-tag changelog-tag--fix">Fix</span></div>

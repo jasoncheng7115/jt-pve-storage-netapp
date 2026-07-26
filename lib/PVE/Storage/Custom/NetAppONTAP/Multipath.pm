@@ -359,7 +359,17 @@ sub multipath_reload {
     return 1;
 }
 
-# Flush a specific multipath map (or all unused if no device given).
+# Flush ONE specific multipath map, identified by device path / map name / WWID.
+#
+# A $device argument is MANDATORY. There is deliberately no "flush everything"
+# mode: that would mean `multipath -F` (capital F), which flushes ALL unused
+# multipath maps system-wide -- including the customer's manually managed,
+# non-plugin storage on an otherwise idle node. `multipath -F` is FORBIDDEN in
+# this codebase (see CLAUDE.md); the previous no-argument branch here was
+# unreachable dead code but left the call site one accidental caller away from a
+# cluster-wide incident, so it is gone. Callers that think they want "flush all"
+# want a loop over their OWN WWIDs instead.
+#
 # CRITICAL: multipath -f can hang indefinitely on a device with queue_if_no_path
 # if all paths are failed and there's pending queued I/O. We use a tight timeout
 # and fall back to dmsetup remove --force which bypasses the multipath flush logic.
@@ -367,34 +377,29 @@ sub multipath_flush {
     my ($device, %opts) = @_;
     my $timeout = $opts{timeout} // 10;
 
-    if ($device) {
-        # Try multipath -f with timeout
-        my (undef, undef, $exit) = eval {
-            _run_cmd([MULTIPATH, '-f', $device],
-                allow_nonzero => 1, ignore_errors => 1, timeout => $timeout);
-        };
-        my $err = $@;
+    croak "device is required (refusing to flush all maps -- 'multipath -F' is forbidden)"
+        unless defined $device && length $device;
 
-        # If multipath -f hung or failed, fall back to dmsetup remove --force
-        # which doesn't wait for queued I/O.
-        if ($err || (defined $exit && $exit != 0)) {
-            warn "multipath -f $device failed/timed out, trying dmsetup remove --force\n";
-            my $name = basename($device);
-            my $safe_name = _untaint_device_name($name);
-            if ($safe_name) {
-                eval {
-                    _run_cmd(['/sbin/dmsetup', 'remove', '--force', '--retry', $safe_name],
-                        allow_nonzero => 1, ignore_errors => 1, timeout => 10);
-                };
-                warn "dmsetup remove also failed for $safe_name: $@" if $@;
-            }
-        }
-    } else {
-        # WARNING: multipath -F (capital) flushes ALL unused maps system-wide.
-        # This can affect other storage. Use with extreme caution.
-        # We DO NOT recommend calling this without a device argument.
-        _run_cmd([MULTIPATH, '-F'],
+    # Try multipath -f with timeout
+    my (undef, undef, $exit) = eval {
+        _run_cmd([MULTIPATH, '-f', $device],
             allow_nonzero => 1, ignore_errors => 1, timeout => $timeout);
+    };
+    my $err = $@;
+
+    # If multipath -f hung or failed, fall back to dmsetup remove --force
+    # which doesn't wait for queued I/O.
+    if ($err || (defined $exit && $exit != 0)) {
+        warn "multipath -f $device failed/timed out, trying dmsetup remove --force\n";
+        my $name = basename($device);
+        my $safe_name = _untaint_device_name($name);
+        if ($safe_name) {
+            eval {
+                _run_cmd(['/sbin/dmsetup', 'remove', '--force', '--retry', $safe_name],
+                    allow_nonzero => 1, ignore_errors => 1, timeout => 10);
+            };
+            warn "dmsetup remove also failed for $safe_name: $@" if $@;
+        }
     }
 
     return 1;

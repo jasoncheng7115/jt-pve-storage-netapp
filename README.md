@@ -119,7 +119,7 @@ You do **not** need to manually clean stale devices after upgrading to v0.2.2. T
 
 ### Proxmox VE
 
-- **Proxmox VE 9.1 or later** (Storage API version 13 required)
+- **Proxmox VE 9.0 or later** (Storage API version 9-15; the plugin negotiates the API version against the running Proxmox VE, so 9.0, 9.1 and 9.2 are all supported)
 - Tested on: PVE 9.1
 
 | PVE Version | Storage API | Compatibility |
@@ -178,7 +178,7 @@ systemctl enable --now multipathd
 
 # Step 4: Install the plugin package
 # (Automatically configures multipath and restarts PVE services)
-dpkg -i jt-pve-storage-netapp_0.2.22-1_all.deb
+dpkg -i jt-pve-storage-netapp_0.2.23-1_all.deb
 ```
 
 > **Note:** The plugin automatically:
@@ -223,7 +223,7 @@ apt install -y open-iscsi multipath-tools sg3-utils psmisc \
 systemctl enable --now iscsid multipathd
 
 # Install plugin (auto-configures multipath and restarts PVE services)
-dpkg -i jt-pve-storage-netapp_0.2.22-1_all.deb
+dpkg -i jt-pve-storage-netapp_0.2.23-1_all.deb
 ```
 
 **Installation Order for Clusters:**
@@ -276,7 +276,7 @@ done
 
 ```bash
 # Update plugin package
-dpkg -i jt-pve-storage-netapp_0.2.22-1_all.deb
+dpkg -i jt-pve-storage-netapp_0.2.23-1_all.deb
 ```
 
 The postinst will automatically:
@@ -987,7 +987,7 @@ storage: No such storage
 **Solution:**
 ```bash
 # Install on the affected node
-dpkg -i jt-pve-storage-netapp_0.2.22-1_all.deb
+dpkg -i jt-pve-storage-netapp_0.2.23-1_all.deb
 apt install -f
 systemctl restart pvedaemon pveproxy
 ```

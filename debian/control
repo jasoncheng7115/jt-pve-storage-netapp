@@ -9,7 +9,7 @@ Homepage: https://github.com/jasoncheng7115/jt-pve-storage-netapp
 Package: jt-pve-storage-netapp
 Architecture: all
 Depends: ${misc:Depends},
-         proxmox-ve (>= 9.1) | pve-manager (>= 9.1),
+         proxmox-ve (>= 9.0) | pve-manager (>= 9.0),
          libwww-perl,
          libjson-perl,
          liburi-perl,

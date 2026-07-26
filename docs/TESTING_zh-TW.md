@@ -1971,6 +1971,226 @@ grep -c "serial_number" lib/PVE/Storage/Custom/NetAppONTAP/API.pm               
 
 ---
 
+## 31. Proxmox VE 9.0／9.1／9.2 相容性稽核修正（v0.2.23）
+
+對應針對 Proxmox VE 9.2（proxmox-ve 9.2.0／pve-manager 9.2.5／libpve-storage-perl 9.1.2）所做的儲存 API 稽核。31.1～31.4 不需要 ONTAP；31.5 與 31.6 需要模擬器。
+
+### 31.1 單元測試套件（不需 ONTAP，核心）
+
+```bash
+perl -Ilib tests/audit_fixes.t
+# 預期：105/105 PASS。涵蓋：
+#  - api() 對 PVE::Storage::APIVER 的協商（13／14／15／16／9 與 fallback）
+#  - _parse_ontap_time（Z、+HH:MM、+HHMM、小數秒、垃圾輸入回 undef 而非 0）
+#  - volume_rollback_is_possible：最新可倒回、較舊被拒、列出 blockers
+#  - volume_snapshot_delete：偵測 linked clone 鎖定；暫存 clone 絕不阻擋
+#  - volume_snapshot_info 排序；filesystem_path／rename_snapshot 明確 die
+#  - get_identity；volume_resize 拒絕 $snapname；parse_volname 改為 die
+#  - multipath_flush 未帶 device 時拒絕執行
+#  - recovery queue clone 佔用：purge 自己已刪除的 clone、絕不動 live 的、
+#    絕不動客戶命名的、遵守 ontap-purge-recovery-queue 0
+```
+
+### 31.2 跨所有 PVE 9 儲存函式庫的 API 版本協商（核心）
+
+載入器會**硬拒絕** `api()` 高於執行中 `APIVER` 的 plugin；低於時則每次載入都發出警告。Proxmox VE 在 9.1 的 point release 中把 `APIVER` 連續 bump 兩次，所以 `api()` 必須逐一精確吻合。
+
+```bash
+mkdir -p /tmp/apiver && cd /tmp/apiver
+for v in 9.0.18 9.1.0 9.1.2 9.1.3 9.1.5 9.1.6; do
+    apt-get download libpve-storage-perl=$v >/dev/null 2>&1
+done
+for v in 9.0.18 9.1.0 9.1.2 9.1.3 9.1.5 9.1.6; do
+    rm -rf t; mkdir t; dpkg-deb -x libpve-storage-perl_${v}_all.deb t
+    AV=$(grep -oP 'APIVER => \K\d+' t/usr/share/perl5/PVE/Storage.pm)
+    OUT=$(perl -I/tmp/apiver/t/usr/share/perl5 -I/root/jt-pve-storage-netapp/lib \
+          -MPVE::Storage -e 'print PVE::Storage::Custom::NetAppONTAPPlugin->api();' 2>&1)
+    W=$(echo "$OUT" | grep -c 'NetAppONTAPPlugin.*older storage API')
+    echo "$v APIVER=$AV api=$(echo "$OUT" | tail -c 3) warnings=$W"
+done
+# 預期每一列：api 等於 APIVER，且 warnings 為 0。
+#   9.0.18／9.1.0／9.1.2 -> APIVER 13，api 13
+#   9.1.3 ／9.1.5        -> APIVER 14，api 14
+#   9.1.6 以上           -> APIVER 15，api 15
+# 若某列 warnings=1，代表 plugin 會在每次 pvedaemon／pvestatd／pveproxy／pvesm
+# 載入時噴出「implementing an older storage API」警告。
+```
+
+### 31.3 PVE 9 儲存 API 契約檢查（核心）
+
+```bash
+cd /root/jt-pve-storage-netapp
+perl -Ilib -MPVE::Storage -e '
+my $p = "PVE::Storage::Custom::NetAppONTAPPlugin";
+my $cfg = PVE::Storage::config(); my $scfg = $cfg->{ids}{netapp1};
+print "loaded_from=$INC{\"PVE/Storage/Custom/NetAppONTAPPlugin.pm\"}\n";
+print "shared=", ($cfg->{ids}{netapp1}{shared}//"UNDEF"), "\n";
+print "snap_method=", $p->volume_qemu_snapshot_method("netapp1",$scfg,"vm-100-disk-0"), "\n";
+print "format=", ($p->parse_volname("vm-100-disk-0"))[6], "\n";
+print "default_format=", $p->get_formats($scfg,"netapp1")->{default}, "\n";
+print "identity=", $p->get_identity($scfg,"netapp1"), "\n";'
+# 預期：
+#   loaded_from   = 受測的 lib/ 路徑（不是 /usr/share/perl5）
+#   shared        = 1            （SHARED_STORAGE 註冊在 PVE 9 仍有效）
+#   snap_method   = storage      （不可為 qemu／mixed，否則 PVE 會要求
+#                                 volume_snapshot_info 與 backing-chain blockdev）
+#   format        = raw
+#   default_format= raw
+#   identity      = netappontap://<portal>/<svm>
+```
+
+### 31.4 靜態 regression 守則
+
+```bash
+P=lib/PVE/Storage/Custom/NetAppONTAPPlugin.pm
+M=lib/PVE/Storage/Custom/NetAppONTAP/Multipath.pm
+
+# api() 不可再退回硬編碼常數。
+grep -Pzc 'sub api \{\s*\n\s*return APIVERSION;\s*\n\}' "$P"          # 預期：0
+
+# N1：SnapRestore 守門必須存在。
+grep -c '^sub volume_rollback_is_possible' "$P"                        # 預期：1
+
+# N4：filesystem_path 不可再默默依賴永不被設定的 $scfg->{storage}。
+grep -v '^\s*#' "$P" | grep -c 'path($scfg, $volname, $scfg->{storage}'  # 預期：0
+
+# N5：multipath -F 不可出現為任何實際呼叫。
+grep -v '^\s*#' "$M" | grep -c "MULTIPATH, '-F'"                       # 預期：0
+
+# N6：deactivate_storage 必須以路徑健康為前提才拆除。
+sed -n '/^sub deactivate_storage/,/^}/p' "$P" | grep -c multipath_path_health  # >= 1
+
+# N7：API client cache key 必須含 SVM，不能只有 portal。
+grep -v '^\s*#' "$P" | grep -c "\$scfg->{storage} // \$scfg->{'ontap-portal'}"  # 預期：0
+
+# N8：activate_volume 必須接收 PVE 9.1 的 $hints 參數。
+grep -A2 '^sub activate_volume' "$P" | grep -c '\$cache, \$hints'      # 預期：1
+
+# N11：不可有未使用的 PVE import；真正用到的必須 import。
+grep -c '^use PVE::ProcFSTools' "$P"                                   # 預期：0
+grep -c '^use PVE::Cluster' "$P"                                       # 預期：0
+grep -c '^use PVE::INotify;' "$P"                                      # 預期：1
+```
+
+### 31.5／31.6／31.7 對真實 ONTAP 的快照安全測試（模擬器，需要 ONTAP）
+
+由 `tests/sim_snapshot_safety.pl` 驅動，它使用 DEV lib（`perl -Ilib`），因此不論 `/usr/share/perl5` 底下安裝的是哪一版，測到的都是**新程式碼**。每次 `free_image` 之後都套用主機端裝置殘留斷言（v0.2.14 規則）。使用可丟棄的 VMID 999010～999012，失敗時也會清理。
+
+```bash
+perl -Ilib tests/sim_snapshot_safety.pl
+# 預期：34/34 PASS。
+```
+
+**31.5 —— ONTAP SnapRestore 破壞性與倒回守門。** Part A 先在真實 ONTAP 上**證明前提**，而不是採信原廠文件（CLAUDE.md 的「向原廠驗證」規則）：建立 snapA／snapB／snapC，然後**繞過守門**執行守門本來要阻止的那次 SnapRestore。斷言：
+
+- 守門**允許**倒回到最新快照，且無 blockers
+- 守門**拒絕**倒回到最舊快照，訊息含 `not the most recent snapshot`、`SnapRestore would DELETE`，且 blockers 恰為 `snapB, snapC`
+- 拒絕之後三個快照在 ONTAP 上**全都還在**（沒有任何東西被摧毀）
+- 刻意繞過守門執行 SnapRestore 之後，**只剩下 snapA** —— 也就是 ONTAP 確實刪掉了 snapB 與 snapC，而 Proxmox VE 的 config 仍然列著它們。若這條斷言哪天失敗，代表整個修正的前提已改變，守門需要重新評估。
+
+**31.6 —— linked clone 鎖住其 parent 快照。** Part B 從 `snap1` 建立 linked clone（`clone_image` 帶 `$snap`，即 `qm clone --snapname` 走的路徑），然後斷言 `volume_snapshot_delete` 被拒絕，且訊息會指名阻擋的 clone、其所屬 guest，以及 `volume clone split start` 的處理方式，並且**不是** ONTAP 原始的 `has not expired or is locked`。
+
+**31.7 —— ONTAP volume recovery queue 佔住已刪除的 clone。** 仍在 Part B：clone 被釋放之後，快照刪除必須**成功**。這是 N12 發現的回歸守則 —— 已刪除的 FlexClone 只要還在 ONTAP 的 volume recovery queue 裡，就仍算是其 parent 的 clone，因此若不 purge，快照會在整個保留期（預設 12 小時）內持續被鎖住，而 parent volume 也會變成無法刪除。輸出中應出現這兩行：
+
+```
+Purging deleted FlexClone 'pve_..._1036' from the ONTAP volume recovery queue: ...
+Released 1 recovery-queue clone hold(s) on 'pve_netapp1_999011_disk0': ...
+```
+
+要直接檢視該 queue（不需要 ONTAP CLI／SSH，走 REST passthrough）：
+
+```bash
+# 依你的環境設定；切勿把密碼寫死在檔案裡。
+export ONTAP_HOST=<ontap-mgmt-ip> ONTAP_SVM=<svm> ONTAP_USER=admin
+read -rsp 'ONTAP 密碼： ' ONTAP_PASS; export ONTAP_PASS; echo
+
+perl -Ilib -e '
+use JSON; use PVE::Storage::Custom::NetAppONTAP::API;
+my $api = PVE::Storage::Custom::NetAppONTAP::API->new(
+    host => $ENV{ONTAP_HOST}, username => $ENV{ONTAP_USER},
+    password => $ENV{ONTAP_PASS}, svm => $ENV{ONTAP_SVM},
+    aggregate => "aggr1", ssl_verify => 0);
+print "queue: ", encode_json($api->recovery_queue_list()), "\n";
+print "clones of parent: ", encode_json($api->volume_get_clone_children_cli("pve_netapp1_999011_disk0")), "\n";'
+# 被 queue 佔住的 clone 名稱形如 "<原名>_<id>"（例如 pve_netapp1_999012_disk0_1036），
+# 即使 /storage/volumes 已經看不到它，CLI 的 clone 檢視仍然會回報它。
+```
+
+### 31.8 透過 qm 的端到端測試（需要 ONTAP，且 plugin 必須已安裝）
+
+31.5～31.7 是直接驅動 plugin。這一節走 `qm` → pvedaemon → **已安裝的** plugin，因此只有在本機執行 `make deb` 並安裝之後才測得到新程式碼。請作為發佈前的最後一道關卡執行。
+
+```bash
+STORAGE=netapp1; VMID=9920
+qm create $VMID --name snaprestore-test --memory 512
+qm set $VMID --scsi0 $STORAGE:1
+qm snapshot $VMID snapA; sleep 1
+qm snapshot $VMID snapB; sleep 1
+qm snapshot $VMID snapC
+
+qm rollback $VMID snapA
+# 預期：失敗，訊息含 "can't rollback, 'snapA' is not the most recent snapshot"
+#   與 "ONTAP SnapRestore would DELETE these newer snapshot(s): snapB, snapC"。
+# 預期：ONTAP 上三個快照全都還在。
+qm rollback $VMID snapC          # 預期：成功
+
+# 主機端殘留斷言（v0.2.14 規則）
+WWID=$(pvesm path $STORAGE:vm-$VMID-disk-0 | xargs basename)
+SLAVES=$(ls /sys/block/$(readlink -f /dev/mapper/$WWID | xargs basename)/slaves/ 2>/dev/null)
+qm destroy $VMID --purge
+test -e /dev/mapper/$WWID && echo "FAIL: /dev/mapper/$WWID 仍存在" || echo "OK: mapper 已移除"
+for s in $SLAVES; do
+    test -e /sys/block/$s && echo "FAIL: sd $s 仍存在" || echo "OK: $s 已移除"
+done
+
+# linked clone 鎖定 + recovery queue，端到端
+VMID=9921; CLONEID=9922
+qm create $VMID --name linkedclone-test --memory 512
+qm set $VMID --scsi0 $STORAGE:1
+qm snapshot $VMID snap1
+
+# 注意：這裡**不要**用 `qm template` —— Proxmox VE 會拒絕把有快照的 VM 轉成範本
+#（"unable to create template, because VM contains snapshots"）。
+# 而且對**非範本**來源，`full` 預設為 1，所以不加 --full 0 會變成 qemu-img 全複製，
+# clone_image() 根本不會被呼叫。--full 0 才會走到 linked clone 路徑
+#（PVE::Storage::vdisk_clone 帶 $snapname）。請確認日誌出現
+# "create linked clone of drive scsi0"，而不是 "transferred ..." 的進度。
+qm clone $VMID $CLONEID --snapname snap1 --full 0
+
+qm delsnapshot $VMID snap1
+# 預期：失敗（單行），並同時指名 clone 與其 guest：
+#   "... is locked by 1 dependent FlexClone(s): pve_netapp1_9922_disk0 (guest 9922)."
+# 預期：該快照在 ONTAP 上與 `qm listsnapshot $VMID` 中都還存在。
+
+qm destroy $CLONEID --purge
+
+# 此時 clone volume 已被刪除，但 ONTAP 仍把它留在 volume recovery queue 中，
+# 而它在那裡**仍然算是** parent 的 clone。確認這個落差：
+perl -Ilib -e 'use PVE::Storage::Custom::NetAppONTAP::API;
+my $a = PVE::Storage::Custom::NetAppONTAP::API->new(
+    host => $ENV{ONTAP_HOST}, username => $ENV{ONTAP_USER},
+    password => $ENV{ONTAP_PASS}, svm => $ENV{ONTAP_SVM},
+    aggregate => "aggr1", ssl_verify => 0);
+print "REST clone children: ", scalar(@{$a->volume_get_clone_children("pve_netapp1_9921_disk0")}), "\n";
+print "CLI clone view:      ", join(",", map { $_->{flexclone} }
+    @{$a->volume_get_clone_children_cli("pve_netapp1_9921_disk0")}), "\n";'
+# 預期：REST = 0，CLI = pve_netapp1_9922_disk0_<id>  ← 就是 recovery queue 的佔用
+
+# 被拒絕的 delsnapshot 會在 config 上留下 PVE 自己的 'lock: snapshot-delete'
+#（這是任何快照刪除失敗後的 PVE 標準行為，與本 plugin 無關）。重試前先清除。
+qm unlock $VMID
+qm delsnapshot $VMID snap1
+# 預期：成功，且工作日誌出現：
+#   "Purging deleted FlexClone 'pve_netapp1_9922_disk0_<id>' from the ONTAP volume
+#    recovery queue: ..."
+#   "Released 1 recovery-queue clone hold(s) on 'pve_netapp1_9921_disk0': ..."
+# 預期：ONTAP volume 上剩下 0 個 pve_snap_* 快照。
+
+qm destroy $VMID --purge
+```
+
+---
+
 ## 清除
 
 ```bash
@@ -1979,6 +2199,12 @@ qm destroy 9900 --purge 2>/dev/null
 qm destroy 9901 --purge 2>/dev/null
 qm destroy 9902 --purge 2>/dev/null
 qm destroy 9903 --purge 2>/dev/null
+qm destroy 9904 --purge 2>/dev/null
+qm destroy 9905 --purge 2>/dev/null
+qm destroy 9906 --purge 2>/dev/null
+qm destroy 9920 --purge 2>/dev/null
+qm destroy 9921 --purge 2>/dev/null
+qm destroy 9922 --purge 2>/dev/null
 pct destroy 9910 --purge 2>/dev/null
 
 # 驗證 ONTAP 上無殘留 volume
@@ -1990,6 +2216,59 @@ pvesm list $STORAGE
 ## 發佈測試結果
 
 每次發佈前都必須通過上述所有測試。結果記錄如下。
+
+### v0.2.23-1 Proxmox VE 9.0／9.1／9.2 相容性稽核 + 快照安全（2026-07-26）
+
+**狀態：所有可執行的測試皆 PASS，尚未發佈** —— `make deb`、在節點上安裝、第 31.8 節（`qm` 層級端到端）、`github/` 同步、README 的 deb 檔名與 tag 都還沒做。
+
+**環境：** proxmox-ve 9.2.0／pve-manager 9.2.5／libpve-storage-perl 9.1.2（APIVER 13）／qemu-server 9.1.16／pve-container 6.1.12／multipath-tools 0.11.1／open-iscsi 2.1.11／kernel 7.0.2-7-pve。ONTAP 模擬器 svm1 @ 192.168.1.194，aggregate aggr1，2 個 iSCSI LIF。
+
+| 測試套件 | 結果 |
+|---------|------|
+| `make test`（Perl 語法，6 個模組） | 6/6 PASS |
+| 主 plugin 的 `podchecker` | PASS |
+| `tests/audit_fixes.t` | 105/105 PASS |
+| `tests/status_timeout.t` | 20/20 PASS |
+| `tests/stale_sd_reaper.t` | 20/20 PASS |
+| `tests/activate_budget.t` | 8/8 PASS |
+| `tests/sim_snapshot_safety.pl`（真實 ONTAP，31.5～31.7） | 34/34 PASS |
+| `tests/sim_functional.pl`（真實 ONTAP） | 13/13 PASS |
+| `tests/cleanup_load.pl`（真實 ONTAP） | 6/6 PASS |
+| 第 31.2 節 APIVER 矩陣（6 個儲存函式庫） | 6/6 PASS，零警告 |
+| 第 31.4 節靜態 regression 守則 | 11/11 PASS |
+| 第 31.8 節 `qm` 層級端到端（plugin 已安裝於 pc-pve1） | PASS |
+| **總計** | **153 項單元 + 53 項功能，0 失敗** |
+
+**第 31.8 節（`qm` 層級，在 pc-pve1 上安裝 0.2.23-1 後執行）：**
+
+- `dpkg -i` 乾淨（`ii`），v0.2.22 的「restart pvestatd（而非 reload）」警告正確顯示，`systemctl restart pvestatd` 與 `pvedaemon` 的 PID 都有改變，`pvesm status` 顯示兩個 netappontap storage 皆 `active`，pvestatd journal 無 plugin 警告。
+- `qm rollback 9920 snapA`（snapA／snapB／snapC 中最舊者）被**拒絕**，並指名 snapB 與 snapC；事後三個快照在 ONTAP 上全都還在。`qm rollback 9920 snapC`（最新）成功。
+- `qm clone 9921 9922 --snapname snap1 --full 0` 產生真正的 linked clone（`create linked clone of drive scsi0`），且 ONTAP 回報 `pve_netapp1_9922_disk0` 釘在 `pve_snap_snap1` 上。
+- `qm delsnapshot 9921 snap1` 被**拒絕**，指名 `pve_netapp1_9922_disk0 (guest 9922)`；快照存活。`qm destroy 9922 --purge` 之後，REST 回報 0 個 clone children，而 CLI 檢視仍顯示 recovery queue 項目 `pve_netapp1_9922_disk0_1052`；重試時自動 purge 掉它，快照刪除隨即成功（剩 0 個快照）。
+- 每次 destroy 的主機端殘留斷言全部通過（mapper 裝置消失、所有 `sd` slave 從 `/sys/block` 移除），ONTAP 0 殘留 volume，0 個 NETAPP multipath map。
+
+**在 APIVER 15 上原生重新驗證（2026-07-26，全節點升級後）：** pc-pve1 升到 libpve-storage-perl **9.1.6（APIVER 15）** 與 qemu-server **9.2.1** 之後，整套測試重跑一次 —— 也就是直接對最新的儲存 API，而不只是對解包出來的套件樹。`make test` 6/6、單元 **153/153**、功能 **53/53**，第 31.8 節在該組合上重跑 **12/12**。該節點的 `api()` 回傳 15 且零警告，而 pc-pve1 先前在 APIVER 13 時回傳 13 —— 同一個 plugin binary，逐節點協商。
+
+Rollout 後的叢集狀態：三個節點皆 plugin 0.2.23-1；pc-pve1／2／3 全部為 proxmox-ve 9.2.0／pve-manager 9.2.5／libpve-storage-perl 9.1.6，`api()` 一律為 15，零「older storage API」警告。值得一提的是 pc-pve1 上其他第三方 plugin（PureStorage、DellPowerFlex、DellPowerStore、DellPowerVault）在 APIVER 15 下**都會**發出該警告 —— 只有本 plugin 不會，這正是把 `api()` 改為協商而非硬編碼的實際效益。
+
+**第 31.8 節迫使做出的兩項修正（皆已修好）：**
+
+1. 31.8 最初的草稿使用 `qm template` + `qm clone --snapname`。Proxmox VE 會拒絕把有快照的 VM 轉成範本，而對非範本來源 `full` 預設為 1 —— 因此那個流程其實默默做出了**全複製** clone，完全沒有觸及 `clone_image()`。真正可達的 linked clone 路徑是 `--full 0`（它沒有範本限制：`API2/Qemu.pm` 只做 `my $full = $param->{full} // !is_template($conf)`）。測試計畫已改用 `--full 0`，並斷言 "create linked clone" 這行日誌。
+2. Proxmox VE 會把工作／CLI 錯誤輸出中的換行壓成空白，因此多行的 `die` 訊息在 `qm rollback`／`qm delsnapshot` 中會變成難以閱讀的連續段落。四則新錯誤訊息全部改為單行，並以核心 plugin 慣用的措辭開頭。重新安裝後已透過 `qm` 再次驗證。
+3. 被拒絕的 `delsnapshot` 會在 guest config 上留下 PVE 自己的 `lock: snapshot-delete`，因此重試前需先 `qm unlock <vmid>`。這是任何快照刪除失敗後的 PVE 標準行為（與本 plugin 無關），現已記入 31.8。
+
+**在真實 ONTAP 上的關鍵確認：**
+
+- **SnapRestore 破壞性前提已確認。** 在 snapA／snapB／snapC 都存在的情況下，繞過守門倒回 snapA 之後，ONTAP 上只剩下 snapA —— snapB 與 snapC 被摧毀，而 Proxmox VE 的 config 仍會列著它們。這驗證了最高嚴重度的修正，而非僅採信原廠文件。
+- **倒回守門雙向都正確：** 倒回最新快照被允許；倒回較舊快照被拒絕，且較新的快照會被列為 blockers，而被拒絕的那次嘗試不會摧毀任何東西。
+- **新發現 N12（ONTAP volume recovery queue）** 由第 31.6 節測試發現，並在本次發佈中修正。已刪除的 FlexClone 只要還被 ONTAP 保留在 recovery queue 中，就仍算是其 parent 的 clone，會使 parent 的快照刪除最長被阻擋 12 小時。這同時修正了 v0.2.13 的根因分析 —— 當時把 `volume_clone_dependent` owner 遲遲不清除歸因於 eventual consistency 加上模擬器特性。
+- `free_image` 與 `volume_snapshot_delete` 的變更**未造成** `sim_functional`／`cleanup_load` 回歸。
+- 測試後 ONTAP 保持乾淨：0 個線上 `pve_*` volume。剩餘的 17 筆 volume recovery queue 項目是 ONTAP 對測試所刪除 volume 的正常保護機制；本次修正刻意不 purge 未造成阻擋的項目，它們會自行過期。
+
+**已跳過的項目及原因：**
+
+- 第 31.8 節已執行，但**只在 pc-pve1 上**（plugin 只裝在該節點；pc-pve2 與 pc-pve3 仍是 0.2.18-1）。發佈前請在其餘節點安裝並各自 `systemctl restart pvestatd`。
+- 第 1～30 節未全部重跑；本次變更集中在儲存 API 介面、快照／倒回路徑與 API client cache，而三個功能測試套件加上 153 項單元斷言已涵蓋這些路徑。第 10 節（ONTAP 協調的失效測試）需要 ONTAP 管理 agent 配合。
 
 ### v0.2.22-1 postinst restart-pvestatd 警告 Release (2026-06-16)
 

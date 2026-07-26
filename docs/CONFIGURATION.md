@@ -275,6 +275,33 @@ netappontap: <storage-id>
 - An in-progress login is never interrupted, and the loop never skips while zero paths are up (it must obtain at least one path or fail honestly) — so it cannot mark a slow-but-reachable storage inactive.
 - Skipped portals are picked up on a later activation; multipath redundancy self-heals.
 
+### ontap-purge-recovery-queue
+
+**Type:** boolean
+**Default:** 1 (enabled)
+**Description:** Allow the plugin to purge its **own** already-deleted FlexClones from ONTAP's volume recovery queue when they block a snapshot or volume delete.
+
+```bash
+--ontap-purge-recovery-queue 1   # Default
+--ontap-purge-recovery-queue 0   # Never touch the recovery queue; error out instead
+```
+
+**Why this exists:** ONTAP retains deleted volumes in a volume recovery queue (on by default; retention is per-SVM via `vserver modify -volume-delete-retention-hours`, default 12 hours). A deleted FlexClone in that queue **still counts as a clone of its parent**, which makes:
+
+- deleting the parent's snapshot fail with `Snapshot ... has not expired or is locked`
+- deleting the parent volume fail with `it has one or more clones`
+
+...for the remainder of the retention window, with an error that never mentions the queue. In practice: destroy a linked-clone VM, then try to delete the source snapshot and it fails for up to 12 hours for no visible reason.
+
+**Notes:**
+- Purging is **narrowly scoped**. An entry is removed only when ONTAP reports it as a clone of the volume being operated on, it is no longer a live volume, it is present in the recovery queue, and its name matches the plugin's own scheme (`pve_*_<id>` or `tmpclone_pve_*_<id>`). A **live** clone is reported for you to resolve, never purged. A clone you created yourself is never touched.
+- Only entries actively blocking the delete you just requested are purged, so the recovery queue's protection is preserved everywhere else. Every purge is logged.
+- With `0`, you get an actionable error naming the queued volume and the command to clear it yourself:
+  ```
+  volume recovery-queue purge -vserver <svm> -volume <name>
+  ```
+- To inspect the queue: `volume recovery-queue show` on the ONTAP CLI.
+
 ## Standard PVE Options
 
 ### content

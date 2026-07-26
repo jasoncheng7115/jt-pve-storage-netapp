@@ -119,7 +119,7 @@ Plugin 安裝時會偵測這些設定並顯示醒目警告。詳見 [docs/CONFIG
 
 ### Proxmox VE
 
-- **Proxmox VE 9.1 或更新版本**（需要 Storage API 版本 13）
+- **Proxmox VE 9.0 或更新版本**（Storage API 版本 9～15；plugin 會針對執行中的 Proxmox VE 協商 API 版本，因此 9.0、9.1、9.2 皆支援）
 - 已測試版本：PVE 9.1
 
 | PVE 版本 | Storage API | 相容性 |
@@ -178,7 +178,7 @@ systemctl enable --now multipathd
 
 # 步驟 4：安裝外掛程式套件
 # （自動配置 multipath 並重新啟動 PVE 服務）
-dpkg -i jt-pve-storage-netapp_0.2.22-1_all.deb
+dpkg -i jt-pve-storage-netapp_0.2.23-1_all.deb
 ```
 
 > **注意：** 外掛程式會自動：
@@ -223,7 +223,7 @@ apt install -y open-iscsi multipath-tools sg3-utils psmisc \
 systemctl enable --now iscsid multipathd
 
 # 安裝外掛程式（自動配置 multipath 並重新啟動 PVE 服務）
-dpkg -i jt-pve-storage-netapp_0.2.22-1_all.deb
+dpkg -i jt-pve-storage-netapp_0.2.23-1_all.deb
 ```
 
 **叢集安裝順序：**
@@ -276,7 +276,7 @@ done
 
 ```bash
 # 升級 plugin 套件
-dpkg -i jt-pve-storage-netapp_0.2.22-1_all.deb
+dpkg -i jt-pve-storage-netapp_0.2.23-1_all.deb
 ```
 
 postinst 會自動：
@@ -977,7 +977,7 @@ storage: No such storage
 **解決方案：**
 ```bash
 # 在受影響的節點上安裝
-dpkg -i jt-pve-storage-netapp_0.2.22-1_all.deb
+dpkg -i jt-pve-storage-netapp_0.2.23-1_all.deb
 apt install -f
 systemctl restart pvedaemon pveproxy
 ```

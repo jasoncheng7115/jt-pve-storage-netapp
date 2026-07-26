@@ -159,8 +159,12 @@ sub _request {
 }
 
 # GET request
+#
+# %opts is forwarded verbatim to _request(), so callers can override the
+# per-call timeout (e.g. volume_size_info() honouring the $timeout PVE passes
+# in). Omitting it keeps the client's configured timeout + retry behaviour.
 sub get {
-    my ($self, $endpoint, $params) = @_;
+    my ($self, $endpoint, $params, %opts) = @_;
 
     if ($params && %$params) {
         my $uri = URI->new($endpoint);
@@ -168,7 +172,7 @@ sub get {
         $endpoint = $uri->as_string;
     }
 
-    return $self->_request('GET', $endpoint);
+    return $self->_request('GET', $endpoint, undef, %opts);
 }
 
 # Fetch ALL records for a collection GET, following ONTAP REST pagination.
@@ -545,11 +549,78 @@ sub volume_get_clone_children {
     my ($self, $parent_name) = @_;
 
     my $svm_uuid = $self->get_svm_uuid();
+    # Ask for clone.parent_snapshot.name EXPLICITLY (not just 'clone'): callers
+    # need to know WHICH parent snapshot each child clone pins, so they can tell
+    # "this clone blocks the snapshot you are deleting / rolling back past" from
+    # "this clone hangs off an older snapshot and is irrelevant".
     return $self->_get_all_records('/storage/volumes', {
         'svm.uuid'            => $svm_uuid,
         'clone.is_flexclone'  => 'true',
         'clone.parent_volume.name' => $parent_name,
-        fields => 'name,uuid,clone',
+        fields => 'name,uuid,clone,clone.parent_snapshot.name,clone.parent_volume.name',
+    });
+}
+
+# Clone children of $parent_name AS ONTAP ITSELF SEES THEM, including clones
+# that have been deleted but are still held in the volume recovery queue.
+#
+# WHY THIS EXISTS (v0.2.23): volume_get_clone_children() queries
+# /storage/volumes, which only lists LIVE volumes. ONTAP's volume recovery queue
+# (enabled by default, retention set per-SVM by
+# 'vserver modify -volume-delete-retention-hours', default 12h) keeps a deleted
+# volume around under the name "<original>_<id>" -- and a deleted FlexClone in
+# that queue REMAINS A CLONE OF ITS PARENT. Consequences, both reproduced on
+# real ONTAP:
+#   - the parent snapshot keeps its 'volume_clone_dependent' owner, so
+#     snapshot_delete fails with "has not expired or is locked"
+#   - the parent volume cannot be deleted: "it has one or more clones"
+# ...for up to the retention window, with an error that never mentions the queue.
+# The CLI clone view below is the only place this is visible.
+#
+# This also corrects the v0.2.13 diagnosis, which attributed the sticky
+# 'volume_clone_dependent' owner to eventual consistency / a simulator quirk. The
+# real mechanism is the recovery queue, and volume_clone_split() worked around it
+# by de-cloning the volume BEFORE deletion, so its queue entry is no longer a
+# clone.
+#
+# Returns an arrayref of { flexclone => <name>, parent_volume => ... }.
+sub volume_get_clone_children_cli {
+    my ($self, $parent_name) = @_;
+
+    my $resp = $self->get('/private/cli/volume/clone', {
+        'parent-vserver' => $self->{svm},
+        'parent-volume'  => $parent_name,
+    });
+
+    return $resp->{records} // [];
+}
+
+# Volumes currently held in this SVM's volume recovery queue.
+# Returns an arrayref of { volume => "<original>_<id>", vserver => ... }.
+sub recovery_queue_list {
+    my ($self) = @_;
+
+    my $resp = $self->get('/private/cli/volume/recovery-queue', {
+        vserver => $self->{svm},
+    });
+
+    return $resp->{records} // [];
+}
+
+# Permanently purge ONE volume from the recovery queue.
+#
+# DESTRUCTIVE: this gives up the ability to recover that volume. Callers MUST
+# restrict themselves to volumes the plugin itself just deleted and which are
+# actively blocking the operation the operator asked for -- never a volume merely
+# present in the queue, and never one outside the plugin's own naming scheme.
+sub recovery_queue_purge {
+    my ($self, $queued_volume) = @_;
+
+    croak "queued_volume is required" unless $queued_volume;
+
+    return $self->post('/private/cli/volume/recovery-queue/purge', {
+        vserver => $self->{svm},
+        volume  => $queued_volume,
     });
 }
 
@@ -666,14 +737,14 @@ sub lun_create {
 
 # Get LUN by path
 sub lun_get {
-    my ($self, $lun_path) = @_;
+    my ($self, $lun_path, %opts) = @_;
 
     my $svm_uuid = $self->get_svm_uuid();
     my $resp = $self->get('/storage/luns', {
         name       => $lun_path,
         'svm.uuid' => $svm_uuid,
         fields     => 'uuid,name,serial_number,space,lun_maps',
-    });
+    }, %opts);
 
     if ($resp->{records} && @{$resp->{records}}) {
         return $resp->{records}[0];

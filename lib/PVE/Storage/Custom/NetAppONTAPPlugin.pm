@@ -10,8 +10,8 @@ use PVE::Tools qw(run_command);
 use PVE::JSONSchema qw(get_standard_option);
 use Fcntl qw(:flock);
 use POSIX qw();
-use PVE::Cluster qw(cfs_read_file);
-use PVE::ProcFSTools;
+use Time::Local qw();
+use PVE::INotify;
 
 use PVE::Storage::Custom::NetAppONTAP::API;
 use PVE::Storage::Custom::NetAppONTAP::Naming qw(
@@ -61,9 +61,48 @@ use PVE::Storage::Custom::NetAppONTAP::FC qw(
     rescan_fc_hosts
 );
 
-# Plugin API version - bump for compatibility
+# Plugin API version.
+#
+# APIVERSION_MAX is the highest PVE storage-plugin API version this plugin
+# actually implements. APIVERSION_MIN is the lowest it is known to work against.
+#
+# api() must NOT return a fixed number, because PVE's custom-plugin loader
+# (PVE::Storage, "load third-party plugins") treats the two directions very
+# differently:
+#
+#   $version > APIVER            -> HARD REJECT. The plugin is not loaded at all
+#                                   and the storage silently disappears from the
+#                                   node (every VM on it becomes unusable).
+#   $version < APIVER - APIAGE   -> HARD REJECT ("API version too old").
+#   $version != APIVER           -> loads, but PVE warns
+#                                   "implementing an older storage API, an
+#                                   upgrade is recommended" on EVERY load of
+#                                   PVE::Storage (pvedaemon / pvestatd /
+#                                   pveproxy / every pvesm invocation).
+#
+# Proxmox VE 9 bumped APIVER twice *within* the 9.1 point releases, and the
+# supported range differs per package version (verified by unpacking each
+# libpve-storage-perl from the official repository):
+#
+#   libpve-storage-perl 9.0.16 - 9.1.2 : APIVER 13, APIAGE 4  (accepts 9..13)
+#   libpve-storage-perl 9.1.3  - 9.1.5 : APIVER 14, APIAGE 5  (accepts 9..14)
+#   libpve-storage-perl 9.1.6+         : APIVER 15, APIAGE 6  (accepts 9..15)
+#
+# A hardcoded 15 would be REJECTED on PVE 9.0/9.1.0-9.1.5; a hardcoded 13 loads
+# everywhere in 9.0-9.2 but spams the "older storage API" warning on 9.1.3+.
+# So report the highest version we implement that the running PVE understands.
+# This is safe because api() is only a load-time gate plus a warning: PVE always
+# calls plugin methods with its own current signature regardless of what api()
+# returned, and the APIVER 14/15 deltas relevant to this plugin (volume_resize's
+# $snapname parameter, get_identity) are both implemented below.
+use constant APIVERSION_MAX => 15;
+use constant APIVERSION_MIN => 9;
+
+# Kept for backwards compatibility with anything that referenced the old
+# constants. APIVERSION is the value used when the running PVE's APIVER cannot
+# be determined; 13 is accepted by every Proxmox VE 9.0/9.1/9.2 storage library.
 use constant APIVERSION => 13;
-use constant MIN_APIVERSION => 9;
+use constant MIN_APIVERSION => APIVERSION_MIN;
 
 # Mark as shared storage (accessible from multiple nodes)
 push @PVE::Storage::Plugin::SHARED_STORAGE, 'netappontap';
@@ -73,7 +112,22 @@ push @PVE::Storage::Plugin::SHARED_STORAGE, 'netappontap';
 #
 
 sub api {
-    return APIVERSION;
+    # PVE::Storage is mid-compilation while it require()s us, but its APIVER /
+    # APIAGE constants are established before the third-party plugin loop runs,
+    # so they are readable here. Guard anyway for standalone use (unit tests,
+    # `perl -c`), where we fall back to APIVERSION (13) -- accepted by every
+    # Proxmox VE 9.0/9.1/9.2 storage library.
+    return APIVERSION if !defined(&PVE::Storage::APIVER);
+
+    my $pve_apiver = eval { PVE::Storage::APIVER() };
+    return APIVERSION if !defined($pve_apiver) || $pve_apiver !~ /^\d+$/;
+
+    # Never claim more than we implement (that would be dishonest and, on a
+    # future PVE, still rejected), and never claim less than our floor.
+    my $ver = $pve_apiver > APIVERSION_MAX ? APIVERSION_MAX : $pve_apiver;
+    $ver = APIVERSION_MIN if $ver < APIVERSION_MIN;
+
+    return $ver;
 }
 
 sub type {
@@ -191,6 +245,24 @@ sub properties {
             maximum => 120,
             default => 30,
         },
+        'ontap-purge-recovery-queue' => {
+            description => "Allow the plugin to purge its OWN already-deleted"
+                . " FlexClones from ONTAP's volume recovery queue when they block"
+                . " a snapshot or volume delete. A FlexClone that has been deleted"
+                . " still counts as a clone of its parent while ONTAP retains it in"
+                . " the recovery queue (per-SVM"
+                . " 'volume-delete-retention-hours', default 12h), which makes"
+                . " deleting the parent's snapshot fail with \"has not expired or is"
+                . " locked\" and deleting the parent volume fail with \"it has one or"
+                . " more clones\" -- with no hint about the queue. Only entries that"
+                . " ONTAP reports as clones of the volume being operated on, that are"
+                . " no longer live, and whose names match the plugin's own scheme are"
+                . " ever purged. Set to 0 to keep the recovery queue untouched and"
+                . " receive an actionable error instead (you then purge manually with"
+                . " 'volume recovery-queue purge').",
+            type => 'boolean',
+            default => 1,
+        },
     };
 }
 
@@ -210,6 +282,7 @@ sub options {
         'ontap-portal-probe-timeout' => { optional => 1 },
         'ontap-status-timeout' => { optional => 1 },
         'ontap-activate-deadline' => { optional => 1 },
+        'ontap-purge-recovery-queue' => { optional => 1 },
         nodes                => { optional => 1 },
         disable              => { optional => 1 },
         content              => { optional => 1 },
@@ -311,8 +384,6 @@ sub _translate_limit_error {
 sub _get_api {
     my ($scfg, %opts) = @_;
 
-    my $storeid = $scfg->{storage} // $scfg->{'ontap-portal'} // 'unknown';
-
     # status_path: a short-timeout, single-attempt client for the pvestatd
     # health path (activate_storage/status). A degraded ONTAP must fail fast
     # here so it cannot back up pvestatd's sequential storage loop and starve
@@ -320,14 +391,32 @@ sub _get_api {
     # path keeps the resilient default client (longer timeout + retries).
     # Cached under a separate key so the two clients never clobber each other.
     my $status_path = $opts{status_path} ? 1 : 0;
-    my $cache_key   = $status_path ? "$storeid\0status" : $storeid;
+
+    # Cache key MUST include the SVM, not just the portal.
+    #
+    # PVE never populates $scfg->{storage} (verified: no PVE code path sets it),
+    # so the old `$scfg->{storage} // $scfg->{'ontap-portal'}` key degraded to
+    # "portal only". The cache-validity check below then compared host AND svm,
+    # so the very common layout "one ONTAP cluster / one management LIF, two
+    # SVMs, two netappontap storages on the same node" made each storage evict
+    # the other's client on every single _get_api() call. Rebuilding the client
+    # throws away its keep-alive connection, which puts us straight back into the
+    # "new TCP + TLS handshake + basic auth on every REST request" behaviour that
+    # caused the 2026-06-16 ONTAP mgwd congestion collapse (v0.2.19). Keying on
+    # (portal, svm, path) keeps sibling storages on independent, reused
+    # connections.
+    my $cache_key = join("\0",
+        $scfg->{'ontap-portal'} // 'unknown',
+        $scfg->{'ontap-svm'} // 'unknown',
+        $status_path ? 'status' : 'data',
+    );
 
     # Return cached client if available, config hasn't changed, and cache is fresh
     if (my $cached = $api_cache{$cache_key}) {
         my $cache_age = time() - ($cached->{timestamp} // 0);
         if ($cache_age < API_CACHE_TTL &&
-            $cached->{host} eq $scfg->{'ontap-portal'} &&
-            $cached->{svm} eq $scfg->{'ontap-svm'}) {
+            ($cached->{host} // '') eq ($scfg->{'ontap-portal'} // '') &&
+            ($cached->{svm} // '') eq ($scfg->{'ontap-svm'} // '')) {
             return $cached->{api};
         }
     }
@@ -691,8 +780,27 @@ sub activate_storage {
 sub deactivate_storage {
     my ($class, $storeid, $scfg, $cache) = @_;
 
-    # Cleanup iSCSI sessions and multipath devices for this storage
-    # This is called when storage is disabled or removed
+    # Tear down this storage's host-side state: multipath devices + SCSI paths
+    # for every LUN of this storage, plus the iSCSI sessions to its SVM.
+    #
+    # NOTE ON WHEN THIS RUNS: nothing in Proxmox VE 9.0/9.1/9.2 calls
+    # PVE::Storage::deactivate_storage() (verified across the whole
+    # /usr/share/perl5/PVE tree: only the dispatcher at Storage.pm and the per-
+    # plugin implementations exist). The earlier comment here claimed it runs
+    # "when storage is disabled or removed", which is not true on PVE 9 -- do not
+    # rely on this function for cleanup on `pvesm set --disable` or storage
+    # removal. It is effectively operator/manual territory today.
+    #
+    # Because it IS destructive and could be reached manually (or by a future PVE
+    # release), it must obey the same safety rule as the orphan reaper: never tear
+    # down a device that still has an active multipath path. is_device_in_use()
+    # alone is NOT sufficient -- a QEMU-held disk of a running VM is an open fd,
+    # not a sysfs holder, so is_device_in_use() does not see it (v0.2.17 lesson).
+    # Without the path-health gate this function would reproduce the v0.2.17
+    # incident: multipath -f fails on the busy map, the dmsetup remove --force
+    # fallback rips it out from under QEMU, and the running guest takes I/O
+    # errors. v0.2.18's Step 8 sweep would additionally remove every sd path for
+    # the WWID.
 
     warn "Deactivating storage '$storeid': cleaning up connections...\n";
 
@@ -736,6 +844,21 @@ sub deactivate_storage {
             # Check if device is in use
             if (is_device_in_use($device)) {
                 warn "  [SKIP] $vol->{name}: device $device still in use\n";
+                $skip_count++;
+                next;
+            }
+
+            # Path-health gate (see the rationale at the top of this function).
+            # 1 = at least one active path -> live, do NOT touch.
+            # -1 = indeterminate (multipathd unreachable / unparseable output) ->
+            #      also do NOT touch; a false "it's dead" costs data availability,
+            #      a false "it's alive" only leaves a stale device for later.
+            # 0 = map exists and ALL paths failed -> genuinely safe to tear down.
+            my $health = eval { multipath_path_health($wwid); };
+            if (!defined $health || $health != 0) {
+                warn "  [SKIP] $vol->{name}: device $device still has active "
+                   . "path(s) or path state is indeterminate; refusing to tear "
+                   . "down a live device\n";
                 $skip_count++;
                 next;
             }
@@ -1926,8 +2049,40 @@ sub free_image {
                     "Dependent volumes: " . join(', ', map { $_->{name} } @$children);
             }
 
-            # Stale metadata - wait and retry
-            warn "Volume delete failed (attempt $attempt/$max_retries): stale clone metadata, retrying...\n"
+            # No LIVE clone children, yet ONTAP insists there are clones. The
+            # cause is almost always a clone that was already deleted but is
+            # still held in ONTAP's volume recovery queue -- it remains a clone
+            # of this volume for the whole retention window (default 12h), so
+            # retrying/sleeping can NEVER succeed on its own. That is what the
+            # old "stale clone metadata, retrying..." loop was really hitting;
+            # it burned 5 attempts and then failed with a message that pointed
+            # nowhere. Release those holds, then let the loop retry for real.
+            my ($purged, $live, $refused) =
+                _release_recovery_queue_clone_holds($api, $scfg, $ontap_volname);
+
+            if (@$purged) {
+                warn "Volume delete blocked by " . scalar(@$purged) . " deleted-but-queued "
+                   . "clone(s); purged from the recovery queue: "
+                   . join(', ', @$purged) . ". Retrying delete.\n";
+                next;    # retry immediately, the blocker is gone
+            }
+
+            if (@$live || @$refused) {
+                # One line: PVE flattens newlines in task/CLI errors into spaces.
+                die "Cannot delete volume '$volname': ONTAP reports clone(s) of "
+                  . "'$ontap_volname' that the plugin will not remove: "
+                  . _clone_hold_hint($live, $refused, $scfg->{'ontap-svm'}) . "."
+                  . " A clone that has ALREADY BEEN DELETED still counts while ONTAP"
+                  . " retains it in the volume recovery queue (see"
+                  . " 'volume recovery-queue show' and the SVM's"
+                  . " volume-delete-retention-hours, default 12h). Purge it with:"
+                  . " 'volume recovery-queue purge -vserver $scfg->{'ontap-svm'} -volume <name>'.\n";
+            }
+
+            # Nothing identifiable to release -- fall back to the original
+            # wait-and-retry in case this really is a transient ONTAP state.
+            warn "Volume delete failed (attempt $attempt/$max_retries): ONTAP reports a "
+               . "clone dependency but none is visible; retrying...\n"
                 if $attempt < $max_retries;
             sleep($retry_delay);
         } else {
@@ -2077,7 +2232,13 @@ sub volume_size_info {
     my $ontap_volname = pve_volname_to_ontap($storeid, $volname);
     my $lun_path = encode_lun_path($ontap_volname);
 
-    my $lun = $api->lun_get($lun_path);
+    # Honour the $timeout PVE passes in (commonly 10s). Previously it was
+    # accepted and ignored, so the call was bounded only by the client default
+    # (15s x 2 retries = ~32s) -- longer than the caller asked for.
+    my %opts;
+    $opts{timeout} = $timeout if $timeout && $timeout =~ /^\d+$/;
+
+    my $lun = $api->lun_get($lun_path, %opts);
     die "LUN '$lun_path' not found" unless $lun;
 
     return wantarray ?
@@ -2086,7 +2247,17 @@ sub volume_size_info {
 }
 
 sub volume_resize {
-    my ($class, $scfg, $storeid, $volname, $size, $running) = @_;
+    my ($class, $scfg, $storeid, $volname, $size, $running, $snapname) = @_;
+
+    # $snapname was added to this method in storage APIVER 14 (libpve-storage-perl
+    # 9.1.3+), where a non-undef value means "the snapshot itself is the resize
+    # target". PVE only passes it for storages using 'snapshot-as-volume-chain',
+    # which this plugin does not declare -- but accept and reject it explicitly
+    # rather than silently resizing the CURRENT volume, which would be a
+    # data-corrupting misinterpretation of the caller's intent.
+    die "resizing a snapshot is not supported by the NetApp ONTAP plugin "
+      . "(volume '$volname', snapshot '$snapname')\n"
+        if defined $snapname && length $snapname;
 
     my $api = _get_api($scfg);
     my $ontap_volname = pve_volname_to_ontap($storeid, $volname);
@@ -2163,8 +2334,13 @@ sub volume_resize {
 # Volume activation
 #
 
+# $hints is passed through by PVE::Storage::activate_volumes (Storage.pm:1411) on
+# Proxmox VE 9.1+. Currently only 'guest-is-windows' and
+# 'plugin-may-deactivate-volume' exist, neither of which changes anything for a SAN
+# LUN, so we accept and ignore them -- but the parameter is named in the signature
+# so a future hint cannot be silently swallowed by a too-short one.
 sub activate_volume {
-    my ($class, $storeid, $scfg, $volname, $snapname, $cache) = @_;
+    my ($class, $storeid, $scfg, $volname, $snapname, $cache, $hints) = @_;
 
     my $api = _get_api($scfg);
     my $ontap_volname = pve_volname_to_ontap($storeid, $volname);
@@ -2582,11 +2758,106 @@ sub path {
     return ($device, $parsed->{vmid}, 'raw');
 }
 
+# filesystem_path() cannot be implemented by this plugin.
+#
+# Its signature carries no $storeid, and this plugin needs the storage ID to
+# derive the ONTAP FlexVol name (pve_{storage}_{vmid}_disk{N}); the volname alone
+# is not sufficient. The previous implementation passed $scfg->{storage}, which
+# PVE NEVER populates (no code path in the PVE 9 storage layer sets that key), so
+# it did not fall back gracefully -- it died with the misleading low-level error
+# "storage is required at .../Naming.pm line 213".
+#
+# Nothing in Proxmox VE 9.0/9.1/9.2 reaches it today: every base-class method
+# that calls filesystem_path() is either overridden here, or (volume_snapshot_info
+# / rename_snapshot) only invoked when volume_qemu_snapshot_method() returns
+# 'mixed', while this plugin returns 'storage'. Both of those are now overridden
+# below as well. Fail loudly and legibly instead of leaving a booby trap for the
+# next PVE release that widens the external-snapshot API.
 sub filesystem_path {
     my ($class, $scfg, $volname, $snapname) = @_;
 
-    my ($path, $vmid, $format) = $class->path($scfg, $volname, $scfg->{storage}, $snapname);
-    return wantarray ? ($path, $vmid, $format) : $path;
+    die "filesystem_path() is not supported by the NetApp ONTAP plugin: the "
+      . "ONTAP FlexVol name cannot be derived without a storage ID. Use "
+      . "PVE::Storage::path()/\$plugin->path(\$scfg, \$volname, \$storeid, "
+      . "\$snapname) instead (volume '$volname').\n";
+}
+
+# Snapshot metadata for PVE.
+#
+# PVE uses this for two things, neither of which applies to this plugin:
+#   - 'snapshot-as-volume-chain' external snapshots (needs file/volid/parent/child)
+#   - storage replication (currently native ZFS only; we do not implement
+#     storage_can_replicate, so PVE never asks us to replicate)
+#
+# The base implementation shells out to qemu-img against filesystem_path(), which
+# this plugin cannot provide. Implement the plain (non-volume-chain) shape from
+# ONTAP instead -- name => { order, timestamp } -- so any present or future caller
+# gets truthful data rather than a die or an empty hash.
+sub volume_snapshot_info {
+    my ($class, $scfg, $storeid, $volname) = @_;
+
+    my $api = _get_api($scfg);
+    my $ontap_volname = pve_volname_to_ontap($storeid, $volname);
+
+    my $snapshots = eval { $api->snapshot_list($ontap_volname, 'pve_snap_*'); } // [];
+
+    my @decoded;
+    for my $s (@$snapshots) {
+        my $pve_name = decode_snapshot_name($s->{name} // '');
+        next unless $pve_name;
+        push @decoded, {
+            name => $pve_name,
+            ts   => _parse_ontap_time($s->{create_time}),
+        };
+    }
+
+    # 'order' must be monotonic oldest -> newest. Snapshots with an unparseable
+    # timestamp sort last but keep a stable relative order by name.
+    @decoded = sort {
+        (defined $a->{ts} && defined $b->{ts}) ? ($a->{ts} <=> $b->{ts})
+      : (defined $a->{ts}) ? -1
+      : (defined $b->{ts}) ?  1
+      : ($a->{name} cmp $b->{name})
+    } @decoded;
+
+    my $info = {};
+    my $order = 0;
+    for my $s (@decoded) {
+        $info->{ $s->{name} }{order} = $order++;
+        $info->{ $s->{name} }{timestamp} = $s->{ts} if defined $s->{ts};
+    }
+
+    return $info;
+}
+
+# ONTAP has no in-place snapshot rename that preserves the FlexClone/LUN
+# relationships PVE would expect here, and PVE only calls this from the
+# 'external' (volume-chain) snapshot-delete path, which this plugin never
+# selects. Fail explicitly rather than inheriting the base implementation, which
+# would call the unsupported filesystem_path().
+sub rename_snapshot {
+    my ($class, $scfg, $storeid, $volname, $source_snap, $target_snap) = @_;
+
+    die "renaming a snapshot is not supported by the NetApp ONTAP plugin "
+      . "(volume '$volname', '$source_snap' -> '$target_snap')\n";
+}
+
+# Unique identity for this storage instance (storage APIVER 15,
+# libpve-storage-perl 9.1.6+; exposed via GET /nodes/{node}/storage/{id}/identity).
+# The SVM is the real administrative boundary on ONTAP -- two PVE storages that
+# share a portal but use different SVMs are genuinely different backing stores,
+# and two that share portal+SVM are the same one. The aggregate is deliberately
+# excluded: it only decides where new FlexVols are placed and can be changed
+# without the underlying store becoming a different thing.
+sub get_identity {
+    my ($class, $scfg, $storeid) = @_;
+
+    my $portal = $scfg->{'ontap-portal'}
+        or die "cannot determine identity: 'ontap-portal' is not set for storage '$storeid'\n";
+    my $svm = $scfg->{'ontap-svm'}
+        or die "cannot determine identity: 'ontap-svm' is not set for storage '$storeid'\n";
+
+    return "netappontap://$portal/$svm";
 }
 
 #
@@ -2699,9 +2970,321 @@ sub volume_snapshot_delete {
         };
     }
 
+    # Any OTHER FlexClone still pinned to this snapshot also locks it, and the
+    # deterministic-temp-clone handling above cannot see those.
+    #
+    # Reachable path: PVE::Storage::vdisk_clone($cfg, $volid, $vmid, $snapname)
+    # -- i.e. a LINKED clone taken from a named snapshot (`qm clone ... --snapname
+    # X` without --full, and the LXC equivalent in API2/LXC.pm). clone_image()
+    # then creates a normal pve_<store>_<vmid>_disk<N> FlexClone whose parent IS
+    # this snapshot, and deliberately does not split it (that is the whole point
+    # of a linked clone). ONTAP therefore refuses the snapshot delete with
+    # "Snapshot ... has not expired or is locked" -- the same symptom class as the
+    # v0.2.13 vzdump incident, but from a clone this function never looked for, so
+    # the operator got a raw ONTAP error with no indication of what was holding it.
+    #
+    # We must NOT auto-split or auto-delete here: that clone is a live VM/CT disk
+    # belonging to another guest. Fail with an actionable message instead.
+    my $blocking_clones = eval { $api->volume_get_clone_children($ontap_volname); } // [];
+    my @locked_by;
+    for my $child (@$blocking_clones) {
+        my $parent_snap = $child->{clone} && $child->{clone}{parent_snapshot}
+            ? ($child->{clone}{parent_snapshot}{name} // '') : '';
+        next unless $parent_snap eq $ontap_snapname;
+
+        # NEVER block on the deterministic temp clone: it was just torn down
+        # above (or confirmed absent), and _remove_temp_clone() already dies
+        # loudly if that failed. ONTAP metadata can lag behind a completed
+        # volume delete (the v0.2.13 lesson: "wait_for_job success does NOT imply
+        # downstream-visible side effects are complete"), so a stale entry here is
+        # expected. Blocking on it would break exactly the vzdump CT
+        # snapshot-mode path that v0.2.13/v0.2.14 fixed. The temp clone name is
+        # derived from volume+snapshot, so it is the ONLY tmpclone that can
+        # legitimately point at this snapshot.
+        next if $child->{name} eq $temp_clone_name;
+
+        push @locked_by, $child->{name};
+    }
+    # Second source of truth: ONTAP's CLI clone view, which ALSO reports clones
+    # that were deleted but are still held in the volume recovery queue. Those
+    # keep the parent snapshot's 'volume_clone_dependent' owner set, so
+    # snapshot_delete fails with "has not expired or is locked" -- for up to the
+    # SVM's volume-delete-retention window (default 12h) -- even though
+    # /storage/volumes reports no clone children at all. Reproduced on real ONTAP
+    # by deleting a linked clone and then its source snapshot.
+    #
+    # Deleted-but-queued clones are purged (the operator already deleted them);
+    # live ones are reported so the operator can act.
+    if (!@locked_by) {
+        my ($purged, $live, $refused) =
+            _release_recovery_queue_clone_holds($api, $scfg, $ontap_volname);
+
+        if (@$purged) {
+            warn "Released " . scalar(@$purged) . " recovery-queue clone hold(s) on "
+               . "'$ontap_volname': " . join(', ', @$purged) . "\n";
+        }
+
+        if (@$live || @$refused) {
+            # One line: PVE flattens newlines in task/CLI errors into spaces.
+            die "Cannot delete snapshot '$snap' of '$volname': ONTAP snapshot "
+              . "'$ontap_snapname' is still held by clone(s) of this volume: "
+              . _clone_hold_hint($live, $refused, $scfg->{'ontap-svm'}) . "."
+              . " A FlexClone keeps its parent snapshot locked, and one that has ALREADY"
+              . " BEEN DELETED still counts while ONTAP retains it in the volume recovery"
+              . " queue (see 'volume recovery-queue show' and the SVM's"
+              . " volume-delete-retention-hours, default 12h)."
+              . " Delete the guest(s) owning any live clone, or purge the queued entry:"
+              . " 'volume recovery-queue purge -vserver $scfg->{'ontap-svm'} -volume <name>'"
+              . " (the plugin does this automatically unless"
+              . " 'ontap-purge-recovery-queue' is set to 0).\n";
+        }
+    }
+
+    if (@locked_by) {
+        my @hints;
+        for my $c (@locked_by) {
+            my $decoded = decode_volume_name($c);
+            if ($decoded && defined $decoded->{vmid}) {
+                push @hints, "$c (guest $decoded->{vmid})";
+            } else {
+                push @hints, $c;
+            }
+        }
+        # One line: PVE flattens newlines in task/CLI errors into spaces.
+        die "Cannot delete snapshot '$snap' of '$volname': ONTAP snapshot "
+          . "'$ontap_snapname' is locked by " . scalar(@locked_by) . " dependent "
+          . "FlexClone(s): " . join(', ', @hints) . "."
+          . " These are linked clones of this snapshot (e.g. 'qm clone <vmid> <newid>"
+          . " --snapname $snap --full 0'); ONTAP will not release a snapshot while a"
+          . " clone still has it as parent."
+          . " Delete the guest(s) owning them, or make them independent"
+          . " ('volume clone split start -vserver $scfg->{'ontap-svm'} -flexclone <name>')."
+          . " The plugin will not split or delete them for you -- they are live disks"
+          . " belonging to other guests.\n";
+    }
+
     $api->snapshot_delete($ontap_volname, $ontap_snapname);
 
     return 1;
+}
+
+# Release ONTAP volume-recovery-queue clone holds on $ontap_volname.
+#
+# See API::volume_get_clone_children_cli() for the mechanism. Short version: a
+# FlexClone that has been deleted but is still in ONTAP's recovery queue REMAINS a
+# clone of its parent, which blocks both `snapshot_delete` on the parent's
+# snapshot ("has not expired or is locked") and `volume_delete` on the parent
+# ("it has one or more clones") for the whole retention window (default 12h),
+# with an error that never mentions the queue.
+#
+# SAFETY -- an entry is purged only when ALL of these hold:
+#   1. ONTAP's own CLI clone view reports it as a clone of $ontap_volname (so it
+#      is genuinely what is blocking us),
+#   2. it is NOT a live volume (volume_get returns undef) -- we never purge
+#      something still in use; a live clone is the operator's problem to resolve
+#      and callers report it instead,
+#   3. it is present in the recovery queue, and
+#   4. its name is plugin-managed: "<one of our volume names>_<digits>", i.e. it
+#      derives from a pve_* volume of a netappontap storage. A customer's
+#      manually created clone is never touched.
+#
+# Purging is limited to entries blocking the operation the operator just
+# requested, so the recovery queue's safety net is preserved for everything else.
+# Set 'ontap-purge-recovery-queue 0' to disable and get an actionable error
+# instead.
+#
+# Returns (\@purged, \@live_blockers, \@refused).
+sub _release_recovery_queue_clone_holds {
+    my ($api, $scfg, $ontap_volname) = @_;
+
+    my (@purged, @live, @refused);
+
+    my $cli_children = eval { $api->volume_get_clone_children_cli($ontap_volname); } // [];
+    return (\@purged, \@live, \@refused) unless @$cli_children;
+
+    my $queue_entries = eval { $api->recovery_queue_list(); } // [];
+    my %queued = map { ($_->{volume} // '') => 1 } @$queue_entries;
+
+    my $purge_enabled = $scfg->{'ontap-purge-recovery-queue'} // 1;
+
+    for my $child (@$cli_children) {
+        my $name = $child->{flexclone} // next;
+
+        # (2) Live volumes are never purged -- the caller reports them instead.
+        if (eval { $api->volume_get($name); }) {
+            push @live, $name;
+            next;
+        }
+
+        # (4) Plugin-managed naming only: "<pve_*_volume>_<digits>", or one of our
+        # temp FlexClones. Anything else may be a customer-created clone and is
+        # left strictly alone.
+        my ($base) = $name =~ /^(.+)_\d+$/;
+        if (!$base || !(is_pve_managed_volume($base) || $base =~ /^tmpclone_pve_/)) {
+            push @refused, "$name (not a plugin-managed volume name)";
+            next;
+        }
+
+        # (3) Must actually be in the recovery queue.
+        if (!$queued{$name}) {
+            push @refused, "$name (not found in the volume recovery queue)";
+            next;
+        }
+
+        if (!$purge_enabled) {
+            push @refused, "$name (queued clone; 'ontap-purge-recovery-queue' is disabled)";
+            next;
+        }
+
+        warn "Purging deleted FlexClone '$name' from the ONTAP volume recovery "
+           . "queue: it was already deleted but still counts as a clone of "
+           . "'$ontap_volname', which blocks snapshot/volume deletion for the "
+           . "remainder of the SVM's volume-delete-retention window.\n";
+
+        eval { $api->recovery_queue_purge($name); };
+        if ($@) {
+            push @refused, "$name (purge failed: $@)";
+        } else {
+            push @purged, $name;
+        }
+    }
+
+    return (\@purged, \@live, \@refused);
+}
+
+# Build the operator-facing explanation for clones that still block $ontap_snapname.
+sub _clone_hold_hint {
+    my ($live, $refused, $svm) = @_;
+
+    my @hints;
+    for my $c (@$live) {
+        my $decoded = decode_volume_name($c);
+        push @hints, (($decoded && defined $decoded->{vmid})
+            ? "$c (live, guest $decoded->{vmid})" : "$c (live)");
+    }
+    push @hints, @$refused;
+
+    return join(', ', @hints);
+}
+
+# Guard the destructive half of snapshot rollback.
+#
+# ONTAP's SnapRestore (PATCH /storage/volumes/{uuid} with restore_to.snapshot,
+# see API::snapshot_rollback) reverts the volume to the chosen snapshot AND
+# DELETES every snapshot created after it. PVE does not know that:
+#
+#   - PVE::Storage::Plugin::volume_rollback_is_possible() returns 1 immediately
+#     unless the storage uses 'snapshot-as-volume-chain', which we do not.
+#   - PVE::AbstractConfig::snapshot_rollback() does NOT remove the newer
+#     snapshots from the guest config (it only applies the snapshot's config via
+#     __snapshot_apply_config).
+#
+# So without this method, rolling back to snap1 while snap2/snap3 exist silently
+# destroys snap2 and snap3 on ONTAP while PVE keeps listing them in the config
+# and in the web UI. The operator believes they still hold three restore points
+# and only finds out when a later rollback/delete of snap2 fails. Every core
+# plugin whose rollback is likewise destructive (ZFSPool, LvmThin, LVM, BTRFS)
+# implements this method for exactly this reason.
+#
+# Contract (PVE::Storage::volume_rollback_is_possible): die if rollback is not
+# possible, and push the names of the blocking snapshots into $blockers (which
+# may be undef -- Storage.pm calls us both ways) so the caller can show them.
+sub volume_rollback_is_possible {
+    my ($class, $scfg, $storeid, $volname, $snap, $blockers) = @_;
+
+    $blockers //= [];
+
+    my $api = _get_api($scfg);
+    my $ontap_volname = pve_volname_to_ontap($storeid, $volname);
+    my $target = encode_snapshot_name($snap);
+
+    # Query ALL snapshots, not just pve_snap_*: a template's '__pve_base__'
+    # snapshot (which linked clones depend on) would also be destroyed by a
+    # SnapRestore that reverts past it, so it must be able to act as a blocker.
+    my $snapshots = $api->snapshot_list($ontap_volname);
+
+    my %by_name;
+    my $target_ts;
+    for my $s (@$snapshots) {
+        my $name = $s->{name};
+        next unless defined $name;
+        my $ts = _parse_ontap_time($s->{create_time});
+        $by_name{$name} = $ts;
+        $target_ts = $ts if $name eq $target;
+    }
+
+    die "can't rollback, snapshot '$snap' does not exist on '$volname'\n"
+        if !exists $by_name{$target};
+
+    # If ONTAP gave us an unparseable timestamp for the target we cannot order
+    # anything safely. Refuse rather than risk destroying newer snapshots.
+    die "can't rollback '$volname' to '$snap': ONTAP did not report a usable "
+      . "creation time for snapshot '$target', so the plugin cannot prove that "
+      . "no newer snapshots would be destroyed by SnapRestore.\n"
+        if !defined $target_ts;
+
+    for my $name (sort keys %by_name) {
+        next if $name eq $target;
+        my $ts = $by_name{$name};
+
+        # Unknown timestamp, or created at/after the target: treat as blocking.
+        # Ties are deliberately treated as blockers -- a false block is an
+        # inconvenience, a false "safe to roll back" silently destroys a restore
+        # point. (A tie needs two snapshots of the SAME volume in the same
+        # second, which PVE cannot produce.)
+        next if defined $ts && $ts < $target_ts;
+
+        push $blockers->@*, (decode_snapshot_name($name) // $name);
+    }
+
+    if (scalar($blockers->@*) > 0) {
+        # Keep this to ONE line. Proxmox VE collapses newlines in task/CLI error
+        # output into spaces, so a multi-line explanation renders as an unreadable
+        # run-on paragraph (observed in `qm rollback`). Lead with the same wording
+        # the core plugins use, then the essential consequence.
+        die "can't rollback, '$snap' is not the most recent snapshot on '$volname'"
+          . " -- ONTAP SnapRestore would DELETE these newer snapshot(s): "
+          . join(', ', $blockers->@*)
+          . " (Proxmox VE would still list them). Delete them first, newest first,"
+          . " if you really want to roll back to '$snap'.\n";
+    }
+
+    # A dependent FlexClone pinned to a snapshot that SnapRestore would remove
+    # is caught by the blocker loop above (that snapshot is itself newer than the
+    # target). Nothing further to check here.
+
+    return 1;
+}
+
+# Parse an ONTAP REST timestamp ("2026-07-26T10:15:30+08:00", "...Z", optional
+# fractional seconds) into epoch seconds. Returns undef if unparseable -- callers
+# MUST treat undef as "unknown", never as 0.
+sub _parse_ontap_time {
+    my ($str) = @_;
+
+    return undef unless defined $str && length $str;
+
+    my ($y, $mo, $d, $h, $mi, $s, $tz) = $str =~ m{
+        ^(\d{4})-(\d{2})-(\d{2})
+        [T ](\d{2}):(\d{2}):(\d{2})
+        (?:\.\d+)?
+        (Z|[+-]\d{2}:?\d{2})?$
+    }x;
+    return undef unless defined $y;
+
+    my $epoch = eval { Time::Local::timegm($s, $mi, $h, $d, $mo - 1, $y); };
+    return undef if $@ || !defined $epoch;
+
+    # Convert the local-with-offset reading back to true UTC.
+    if (defined $tz && $tz ne 'Z') {
+        my ($sign, $oh, $om) = $tz =~ /^([+-])(\d{2}):?(\d{2})$/;
+        if (defined $sign) {
+            my $off = ($oh * 3600) + ($om * 60);
+            $epoch += ($sign eq '+') ? -$off : $off;
+        }
+    }
+
+    return $epoch;
 }
 
 sub volume_snapshot_rollback {
@@ -2826,7 +3409,13 @@ sub parse_volname {
     my ($class, $volname) = @_;
 
     my $parsed = _parse_volname($volname);
-    return undef unless $parsed;
+
+    # Every core PVE plugin dies on an unparseable volume name. Returning undef
+    # (the old behaviour) makes the caller's list assignment yield an empty list,
+    # so $vtype/$format come back undefined and the real failure surfaces much
+    # later as "Use of uninitialized value" somewhere in PVE, with no hint about
+    # which volume was at fault.
+    die "unable to parse NetApp ONTAP volume name '$volname'\n" unless $parsed;
 
     # Return format: ($vtype, $name, $vmid, $basename, $basevmid, $isBase, $format)
     if ($parsed->{type} eq 'disk') {
@@ -3114,12 +3703,13 @@ PVE::Storage::Custom::NetAppONTAPPlugin - NetApp ONTAP SAN/iSCSI Storage Plugin 
 Add storage configuration in /etc/pve/storage.cfg:
 
     netappontap: netapp1
-        portal 192.168.1.100
-        svm svm0
-        aggregate aggr1
-        username admin
-        password secret
-        content images
+        ontap-portal 192.168.1.100
+        ontap-svm svm0
+        ontap-aggregate aggr1
+        ontap-username admin
+        ontap-password secret
+        content images,rootdir
+        shared 1
 
 =head1 DESCRIPTION
 
@@ -3144,25 +3734,52 @@ Key features:
 
 =head1 CONFIGURATION OPTIONS
 
+All plugin-specific options carry the C<ontap-> prefix. See properties() for the
+authoritative schema, and docs/CONFIGURATION.md for full descriptions.
+
 =over 4
 
-=item B<portal> - ONTAP management IP/hostname (required)
+=item B<ontap-portal> - ONTAP management IP/hostname (required)
 
-=item B<svm> - Storage Virtual Machine name (required)
+=item B<ontap-svm> - Storage Virtual Machine name (required)
 
-=item B<aggregate> - Aggregate for volume creation (required)
+=item B<ontap-aggregate> - Aggregate for volume creation (required)
 
-=item B<username> - API username (required)
+=item B<ontap-username> - API username (required)
 
-=item B<password> - API password (required)
+=item B<ontap-password> - API password (required)
 
-=item B<ssl_verify> - Verify SSL certificates (default: yes)
+=item B<ontap-ssl-verify> - Verify SSL certificates (default: yes)
 
-=item B<thin> - Use thin provisioning (default: yes)
+=item B<ontap-thin> - Use thin provisioning (default: yes)
 
-=item B<igroup_mode> - 'per-node' or 'shared' igroup (default: per-node)
+=item B<ontap-igroup-mode> - 'per-node' or 'shared' igroup (default: per-node)
+
+=item B<ontap-cluster-name> - PVE cluster name used for igroup naming (default: pve)
+
+=item B<ontap-protocol> - 'iscsi' or 'fc' (default: iscsi)
+
+=item B<ontap-device-timeout> - Device discovery timeout in seconds (default: 60)
+
+=item B<ontap-portal-probe-timeout> - TCP pre-check timeout before iscsiadm,
+0 disables (default: 2)
+
+=item B<ontap-status-timeout> - Per-call ONTAP REST timeout for the pvestatd
+health path only (default: 5)
+
+=item B<ontap-activate-deadline> - Wall-clock budget for the iSCSI
+discover/login loop in activate_storage (default: 30)
 
 =back
+
+=head1 PROXMOX VE COMPATIBILITY
+
+Supports Proxmox VE 9.0, 9.1 and 9.2. The storage plugin API version reported by
+api() is negotiated at load time against the running C<PVE::Storage::APIVER>,
+because Proxmox VE bumped APIVER twice within the 9.1 point releases
+(libpve-storage-perl 9.0.16-9.1.2 = 13, 9.1.3-9.1.5 = 14, 9.1.6+ = 15) and PVE
+hard-rejects a plugin that reports a version higher than its own. See the
+APIVERSION_MAX comment for details.
 
 =head1 AUTHOR
 

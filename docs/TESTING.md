@@ -2372,6 +2372,252 @@ grep -c "serial_number" lib/PVE/Storage/Custom/NetAppONTAP/API.pm               
 
 ---
 
+## 31. Proxmox VE 9.0/9.1/9.2 Compatibility Audit Fixes (v0.2.23)
+
+Covers the storage-API audit performed against Proxmox VE 9.2 (proxmox-ve 9.2.0 /
+pve-manager 9.2.5 / libpve-storage-perl 9.1.2). All assertions in 31.1-31.4 run
+without ONTAP; 31.5 requires the simulator.
+
+### 31.1 Unit suite (no ONTAP required, CORE)
+
+```bash
+perl -Ilib tests/audit_fixes.t
+# Expected: 105/105 PASS. Covers:
+#  - api() negotiation against PVE::Storage::APIVER (13/14/15/16/9 + fallback)
+#  - _parse_ontap_time (Z, +HH:MM, +HHMM, fractional, garbage -> undef NOT 0)
+#  - volume_rollback_is_possible: newest allowed, older refused, blockers listed
+#  - volume_snapshot_delete: linked-clone lock detected; temp clone never blocks
+#  - volume_snapshot_info ordering; filesystem_path / rename_snapshot die clearly
+#  - get_identity; volume_resize $snapname rejection; parse_volname dies
+#  - multipath_flush refuses to run without a device
+#  - recovery-queue clone holds: purge our own deleted clone, NEVER a live
+#    one, NEVER a customer-named one, honour ontap-purge-recovery-queue 0
+```
+
+### 31.2 API version negotiation across every PVE 9 storage library (CORE)
+
+The loader hard-rejects a plugin whose `api()` exceeds the running `APIVER`, and
+warns on every load when it is lower. PVE bumped `APIVER` twice inside 9.1, so
+`api()` must match each one exactly.
+
+```bash
+mkdir -p /tmp/apiver && cd /tmp/apiver
+for v in 9.0.18 9.1.0 9.1.2 9.1.3 9.1.5 9.1.6; do
+    apt-get download libpve-storage-perl=$v >/dev/null 2>&1
+done
+for v in 9.0.18 9.1.0 9.1.2 9.1.3 9.1.5 9.1.6; do
+    rm -rf t; mkdir t; dpkg-deb -x libpve-storage-perl_${v}_all.deb t
+    AV=$(grep -oP 'APIVER => \K\d+' t/usr/share/perl5/PVE/Storage.pm)
+    OUT=$(perl -I/tmp/apiver/t/usr/share/perl5 -I/root/jt-pve-storage-netapp/lib \
+          -MPVE::Storage -e 'print PVE::Storage::Custom::NetAppONTAPPlugin->api();' 2>&1)
+    W=$(echo "$OUT" | grep -c 'NetAppONTAPPlugin.*older storage API')
+    echo "$v APIVER=$AV api=$(echo "$OUT" | tail -c 3) warnings=$W"
+done
+# Expected, for every row: api == APIVER, warnings == 0.
+#   9.0.18 / 9.1.0 / 9.1.2 -> APIVER 13, api 13
+#   9.1.3  / 9.1.5         -> APIVER 14, api 14
+#   9.1.6+                 -> APIVER 15, api 15
+# A row showing warnings=1 means the plugin would spam
+# "implementing an older storage API" on every pvedaemon/pvestatd/pveproxy/pvesm load.
+```
+
+### 31.3 PVE 9 storage-API contract checks (CORE)
+
+```bash
+cd /root/jt-pve-storage-netapp
+perl -Ilib -MPVE::Storage -e '
+my $p = "PVE::Storage::Custom::NetAppONTAPPlugin";
+my $cfg = PVE::Storage::config(); my $scfg = $cfg->{ids}{netapp1};
+print "loaded_from=$INC{\"PVE/Storage/Custom/NetAppONTAPPlugin.pm\"}\n";
+print "shared=", ($cfg->{ids}{netapp1}{shared}//"UNDEF"), "\n";
+print "snap_method=", $p->volume_qemu_snapshot_method("netapp1",$scfg,"vm-100-disk-0"), "\n";
+print "format=", ($p->parse_volname("vm-100-disk-0"))[6], "\n";
+print "default_format=", $p->get_formats($scfg,"netapp1")->{default}, "\n";
+print "identity=", $p->get_identity($scfg,"netapp1"), "\n";'
+# Expected:
+#   loaded_from   = the lib/ path under test (not /usr/share/perl5)
+#   shared        = 1            (SHARED_STORAGE registration still works on PVE 9)
+#   snap_method   = storage      (NOT qemu/mixed -- else PVE would demand
+#                                 volume_snapshot_info + backing-chain blockdevs)
+#   format        = raw
+#   default_format= raw
+#   identity      = netappontap://<portal>/<svm>
+```
+
+### 31.4 Static regression guards
+
+```bash
+P=lib/PVE/Storage/Custom/NetAppONTAPPlugin.pm
+M=lib/PVE/Storage/Custom/NetAppONTAP/Multipath.pm
+
+# api() must not be a hardcoded constant again.
+grep -Pzc 'sub api \{\s*\n\s*return APIVERSION;\s*\n\}' "$P"          # Expected: 0
+
+# N1: the SnapRestore guard must exist.
+grep -c '^sub volume_rollback_is_possible' "$P"                        # Expected: 1
+
+# N4: filesystem_path must not silently rely on the never-set $scfg->{storage}.
+grep -v '^\s*#' "$P" | grep -c 'path($scfg, $volname, $scfg->{storage}'  # Expected: 0
+
+# N5: multipath -F must not appear as an invocation anywhere.
+grep -v '^\s*#' "$M" | grep -c "MULTIPATH, '-F'"                       # Expected: 0
+
+# N6: deactivate_storage must gate teardown on path health.
+sed -n '/^sub deactivate_storage/,/^}/p' "$P" | grep -c multipath_path_health  # >= 1
+
+# N7: the API-client cache key must include the SVM, not just the portal.
+grep -v '^\s*#' "$P" | grep -c "\$scfg->{storage} // \$scfg->{'ontap-portal'}"  # Expected: 0
+
+# N8: activate_volume must accept the PVE 9.1 $hints argument.
+grep -A2 '^sub activate_volume' "$P" | grep -c '\$cache, \$hints'      # Expected: 1
+
+# N11: no unused PVE imports; the one actually used is imported.
+grep -c '^use PVE::ProcFSTools' "$P"                                   # Expected: 0
+grep -c '^use PVE::Cluster' "$P"                                       # Expected: 0
+grep -c '^use PVE::INotify;' "$P"                                      # Expected: 1
+```
+
+### 31.5 / 31.6 / 31.7 Snapshot safety against real ONTAP (simulator, ONTAP REQUIRED)
+
+Driven by `tests/sim_snapshot_safety.pl`, which uses the DEV lib (`perl -Ilib`) so it
+exercises the NEW code regardless of which version is installed under
+`/usr/share/perl5`. Host-side device residual assertions are applied after every
+`free_image` (the v0.2.14 rule). Throwaway VMIDs 999010-999012; cleans up on failure.
+
+```bash
+perl -Ilib tests/sim_snapshot_safety.pl
+# Expected: 34/34 PASS.
+```
+
+**31.5 -- ONTAP SnapRestore destructiveness + the rollback guard.** Part A first
+proves the PREMISE on real ONTAP rather than trusting the vendor docs (the CLAUDE.md
+"verify storage vendor claims" rule): it creates snapA/snapB/snapC, then bypasses the
+guard and performs the SnapRestore the guard exists to prevent. Assertions:
+
+- the guard PERMITS a rollback to the newest snapshot, with no blockers
+- the guard REFUSES a rollback to the oldest, with `not the most recent snapshot`,
+  `SnapRestore would DELETE`, and blockers exactly `snapB, snapC`
+- all three snapshots are still on ONTAP after the refusal (nothing destroyed)
+- after the deliberately un-guarded SnapRestore, **only snapA remains** -- i.e. ONTAP
+  really did delete snapB and snapC, while Proxmox VE's config would still list them.
+  If this assertion ever fails, the premise behind the whole fix has changed and the
+  guard should be re-evaluated.
+
+**31.6 -- a linked clone locks its parent snapshot.** Part B creates a linked clone
+from `snap1` (`clone_image` with a `$snap`, the path `qm clone --snapname` takes),
+then asserts `volume_snapshot_delete` is refused with a message that names the
+blocking clone AND its owning guest AND the `volume clone split start` remedy, and is
+**not** the bare ONTAP `has not expired or is locked`.
+
+**31.7 -- ONTAP volume recovery queue holds a deleted clone.** Still Part B: after the
+clone is freed, the snapshot delete must SUCCEED. This is the regression guard for
+finding N12 -- a deleted FlexClone remains a clone of its parent while ONTAP keeps it
+in the volume recovery queue, so without the purge the snapshot stays locked for the
+whole retention window (default 12h) and the parent volume becomes undeletable.
+Expect this line in the output:
+
+```
+Purging deleted FlexClone 'pve_..._1036' from the ONTAP volume recovery queue: ...
+Released 1 recovery-queue clone hold(s) on 'pve_netapp1_999011_disk0': ...
+```
+
+To inspect the queue directly (no ONTAP CLI/SSH needed -- REST passthrough):
+
+```bash
+# Set these for your environment; never hardcode the password in a file.
+export ONTAP_HOST=<ontap-mgmt-ip> ONTAP_SVM=<svm> ONTAP_USER=admin
+read -rsp 'ONTAP password: ' ONTAP_PASS; export ONTAP_PASS; echo
+
+perl -Ilib -e '
+use JSON; use PVE::Storage::Custom::NetAppONTAP::API;
+my $api = PVE::Storage::Custom::NetAppONTAP::API->new(
+    host => $ENV{ONTAP_HOST}, username => $ENV{ONTAP_USER},
+    password => $ENV{ONTAP_PASS}, svm => $ENV{ONTAP_SVM},
+    aggregate => "aggr1", ssl_verify => 0);
+print "queue: ", encode_json($api->recovery_queue_list()), "\n";
+print "clones of parent: ", encode_json($api->volume_get_clone_children_cli("pve_netapp1_999011_disk0")), "\n";'
+# A queued clone appears as "<original>_<id>" (e.g. pve_netapp1_999012_disk0_1036) and
+# is reported by the CLI clone view even though /storage/volumes no longer lists it.
+```
+
+### 31.8 End-to-end via qm (ONTAP REQUIRED + PLUGIN MUST BE INSTALLED)
+
+31.5-31.7 drive the plugin directly. This variant goes through `qm` -> pvedaemon ->
+the **installed** plugin, so it only tests the new code AFTER `make deb` + install on
+this node. Run it as the final pre-release gate.
+
+```bash
+STORAGE=netapp1; VMID=9920
+qm create $VMID --name snaprestore-test --memory 512
+qm set $VMID --scsi0 $STORAGE:1
+qm snapshot $VMID snapA; sleep 1
+qm snapshot $VMID snapB; sleep 1
+qm snapshot $VMID snapC
+
+qm rollback $VMID snapA
+# Expected: FAILS with "can't rollback, 'snapA' is not the most recent snapshot"
+#   and "ONTAP SnapRestore would DELETE these newer snapshot(s): snapB, snapC".
+# Expected: ONTAP still lists all three snapshots.
+qm rollback $VMID snapC          # Expected: succeeds
+
+# Host-side residual assertions (v0.2.14 rule)
+WWID=$(pvesm path $STORAGE:vm-$VMID-disk-0 | xargs basename)
+SLAVES=$(ls /sys/block/$(readlink -f /dev/mapper/$WWID | xargs basename)/slaves/ 2>/dev/null)
+qm destroy $VMID --purge
+test -e /dev/mapper/$WWID && echo "FAIL: /dev/mapper/$WWID still present" || echo "OK: mapper gone"
+for s in $SLAVES; do
+    test -e /sys/block/$s && echo "FAIL: sd $s still present" || echo "OK: $s removed"
+done
+
+# Linked-clone lock + recovery queue, end to end
+VMID=9921; CLONEID=9922
+qm create $VMID --name linkedclone-test --memory 512
+qm set $VMID --scsi0 $STORAGE:1
+qm snapshot $VMID snap1
+
+# NOTE: do NOT use `qm template` here -- Proxmox VE refuses to templatise a VM
+# that has snapshots ("unable to create template, because VM contains snapshots").
+# And for a NON-template source `full` defaults to 1, so without --full 0 you get a
+# full qemu-img copy and clone_image() is never called. --full 0 is what reaches the
+# linked-clone path (PVE::Storage::vdisk_clone with a $snapname). Confirm the log
+# line says "create linked clone of drive scsi0", not a "transferred ..." progress.
+qm clone $VMID $CLONEID --snapname snap1 --full 0
+
+qm delsnapshot $VMID snap1
+# Expected: FAILS on one line, naming the clone AND its guest:
+#   "... is locked by 1 dependent FlexClone(s): pve_netapp1_9922_disk0 (guest 9922)."
+# Expected: the snapshot still exists on ONTAP and in `qm listsnapshot $VMID`.
+
+qm destroy $CLONEID --purge
+
+# The clone volume is now deleted, but ONTAP still holds it in the volume recovery
+# queue where it STILL counts as a clone of the parent. Confirm the divergence:
+perl -Ilib -e 'use PVE::Storage::Custom::NetAppONTAP::API;
+my $a = PVE::Storage::Custom::NetAppONTAP::API->new(
+    host => $ENV{ONTAP_HOST}, username => $ENV{ONTAP_USER},
+    password => $ENV{ONTAP_PASS}, svm => $ENV{ONTAP_SVM},
+    aggregate => "aggr1", ssl_verify => 0);
+print "REST clone children: ", scalar(@{$a->volume_get_clone_children("pve_netapp1_9921_disk0")}), "\n";
+print "CLI clone view:      ", join(",", map { $_->{flexclone} }
+    @{$a->volume_get_clone_children_cli("pve_netapp1_9921_disk0")}), "\n";'
+# Expected: REST = 0, CLI = pve_netapp1_9922_disk0_<id>  <-- the recovery-queue hold
+
+# A refused delsnapshot leaves PVE's own 'lock: snapshot-delete' on the config
+# (standard PVE behaviour after ANY failed snapshot delete, not specific to this
+# plugin). Clear it before retrying.
+qm unlock $VMID
+qm delsnapshot $VMID snap1
+# Expected: SUCCEEDS, and the task log shows:
+#   "Purging deleted FlexClone 'pve_netapp1_9922_disk0_<id>' from the ONTAP volume
+#    recovery queue: ..."
+#   "Released 1 recovery-queue clone hold(s) on 'pve_netapp1_9921_disk0': ..."
+# Expected: 0 pve_snap_* snapshots left on the ONTAP volume.
+
+qm destroy $VMID --purge
+```
+
+---
+
 ## Cleanup
 
 ```bash
@@ -2380,6 +2626,12 @@ qm destroy 9900 --purge 2>/dev/null
 qm destroy 9901 --purge 2>/dev/null
 qm destroy 9902 --purge 2>/dev/null
 qm destroy 9903 --purge 2>/dev/null
+qm destroy 9904 --purge 2>/dev/null
+qm destroy 9905 --purge 2>/dev/null
+qm destroy 9906 --purge 2>/dev/null
+qm destroy 9920 --purge 2>/dev/null
+qm destroy 9921 --purge 2>/dev/null
+qm destroy 9922 --purge 2>/dev/null
 pct destroy 9910 --purge 2>/dev/null
 
 # Verify no orphaned volumes on ONTAP
@@ -2391,6 +2643,59 @@ pvesm list $STORAGE
 ## Release Test Results
 
 Each release must pass all tests above before publishing. Results are recorded below.
+
+### v0.2.23-1 Proxmox VE 9.0/9.1/9.2 Compatibility Audit + Snapshot Safety (2026-07-26)
+
+**Status: all runnable tests PASS. Not yet published** — `make deb`, install on the node, section 31.8 (`qm`-level end-to-end), the `github/` sync, README deb filenames and the tag are still outstanding.
+
+**Environment:** proxmox-ve 9.2.0 / pve-manager 9.2.5 / libpve-storage-perl 9.1.2 (APIVER 13) / qemu-server 9.1.16 / pve-container 6.1.12 / multipath-tools 0.11.1 / open-iscsi 2.1.11 / kernel 7.0.2-7-pve. ONTAP simulator svm1 @ 192.168.1.194, aggregate aggr1, 2 iSCSI LIFs.
+
+| Suite | Result |
+|-------|--------|
+| `make test` (Perl syntax, 6 modules) | 6/6 PASS |
+| `podchecker` on the main plugin | PASS |
+| `tests/audit_fixes.t` | 105/105 PASS |
+| `tests/status_timeout.t` | 20/20 PASS |
+| `tests/stale_sd_reaper.t` | 20/20 PASS |
+| `tests/activate_budget.t` | 8/8 PASS |
+| `tests/sim_snapshot_safety.pl` (real ONTAP, 31.5-31.7) | 34/34 PASS |
+| `tests/sim_functional.pl` (real ONTAP) | 13/13 PASS |
+| `tests/cleanup_load.pl` (real ONTAP) | 6/6 PASS |
+| Section 31.2 APIVER matrix (6 storage libraries) | 6/6 PASS, zero warnings |
+| Section 31.4 static regression guards | 11/11 PASS |
+| Section 31.8 `qm`-level end-to-end (plugin INSTALLED on pc-pve1) | PASS |
+| **Total** | **153 unit + 53 functional, 0 failures** |
+
+**Section 31.8 (`qm`-level, run with 0.2.23-1 installed on pc-pve1):**
+
+- `dpkg -i` clean (`ii`), the v0.2.22 "restart pvestatd (not reload)" warning rendered, `systemctl restart pvestatd` + `pvedaemon` both changed PID, `pvesm status` shows both netappontap storages `active`, no plugin warnings in the pvestatd journal.
+- `qm rollback 9920 snapA` (oldest of snapA/snapB/snapC) REFUSED, naming snapB and snapC; all three snapshots still present on ONTAP afterwards. `qm rollback 9920 snapC` (newest) succeeded.
+- `qm clone 9921 9922 --snapname snap1 --full 0` produced a real linked clone (`create linked clone of drive scsi0`), and ONTAP reported `pve_netapp1_9922_disk0` pinned to `pve_snap_snap1`.
+- `qm delsnapshot 9921 snap1` REFUSED, naming `pve_netapp1_9922_disk0 (guest 9922)`; snapshot survived. After `qm destroy 9922 --purge`, REST reported 0 clone children while the CLI view still showed the recovery-queue entry `pve_netapp1_9922_disk0_1052`; the retry then purged it automatically and the snapshot delete succeeded (0 snapshots left).
+- Host-side residual assertions passed for every destroy (mapper device absent, all `sd` slaves removed from `/sys/block`), 0 leftover ONTAP volumes, 0 NETAPP multipath maps.
+
+**Re-verified natively on APIVER 15 (2026-07-26, after upgrading all nodes):** the whole suite was re-run on pc-pve1 once it reached libpve-storage-perl **9.1.6 (APIVER 15)** and qemu-server **9.2.1** — i.e. against the newest storage API rather than only against extracted package trees. `make test` 6/6, units **153/153**, functional **53/53**, and section 31.8 re-run on that combination **12/12**. On that node `api()` returns 15 with zero warnings, while pc-pve1 previously returned 13 against APIVER 13 — the same plugin binary, negotiated per node.
+
+Cluster after the rollout: plugin 0.2.23-1 on all three nodes; pc-pve1/2/3 all on proxmox-ve 9.2.0 / pve-manager 9.2.5 / libpve-storage-perl 9.1.6, `api()` = 15 everywhere, zero "older storage API" warnings. Notably the other third-party plugins present on pc-pve1 (PureStorage, DellPowerFlex, DellPowerStore, DellPowerVault) *do* emit that warning at APIVER 15 — this plugin is the only one that does not, which is the practical payoff of negotiating `api()` instead of hardcoding it.
+
+**Two corrections that section 31.8 forced (both now fixed):**
+
+1. The original 31.8 draft used `qm template` + `qm clone --snapname`. Proxmox VE refuses to templatise a VM that has snapshots, and for a non-template source `full` defaults to 1 — so that sequence silently produced a **full** clone and never exercised `clone_image()`. The reachable linked-clone path is `--full 0` (there is no template restriction on it: `API2/Qemu.pm` only does `my $full = $param->{full} // !is_template($conf)`). The test plan now uses `--full 0` and asserts the "create linked clone" log line.
+2. Proxmox VE collapses newlines in task/CLI error output into spaces, so the multi-line `die` messages rendered as unreadable run-on paragraphs in `qm rollback` / `qm delsnapshot`. All four new error messages were reformatted to single lines, leading with the wording the core plugins use. Re-verified through `qm` after reinstalling.
+3. A refused `delsnapshot` leaves PVE's own `lock: snapshot-delete` on the guest config, so a retry needs `qm unlock <vmid>` first. This is standard PVE behaviour after ANY failed snapshot delete (not specific to this plugin) and is now documented in 31.8.
+
+**Key confirmations on real ONTAP:**
+
+- **SnapRestore destructiveness PREMISE CONFIRMED.** With snapA/snapB/snapC present, an un-guarded rollback to snapA left only snapA on ONTAP — snapB and snapC were destroyed, while Proxmox VE's config would still have listed them. This validates the highest-severity fix rather than relying on vendor documentation.
+- **The rollback guard works both ways:** rollback to the newest snapshot is permitted; rollback to an older one is refused with the newer snapshots reported as blockers, and nothing is destroyed by the refused attempt.
+- **New finding N12 (ONTAP volume recovery queue)** was discovered by section 31.6 and fixed in this release. A deleted FlexClone still counts as a clone of its parent while ONTAP retains it in the recovery queue, blocking the parent's snapshot delete for up to 12h. This also corrected the v0.2.13 root-cause analysis, which had attributed the sticky `volume_clone_dependent` owner to eventual consistency plus a simulator quirk.
+- **No regression** in `sim_functional` / `cleanup_load` from the `free_image` and `volume_snapshot_delete` changes.
+- ONTAP left clean afterwards: 0 live `pve_*` volumes. The 17 remaining volume-recovery-queue entries are ONTAP's normal safety net for volumes the tests deleted; the fix deliberately does not purge non-blocking entries, and they expire on their own.
+
+**Skipped, with reason:**
+
+- Section 31.8 was run, but **only on pc-pve1** (the plugin is installed there; pc-pve2 and pc-pve3 still run 0.2.18-1). Install on the remaining nodes with `systemctl restart pvestatd` on each before publishing.
+- Sections 1-30 were not re-run in full; the changes are confined to the storage-API surface, snapshot/rollback paths and the API client cache, and the three functional suites plus 153 unit assertions cover those paths. Section 10 (ONTAP-coordinated failure tests) needs the ONTAP admin agent.
 
 ### v0.2.22-1 postinst restart-pvestatd Warning Release (2026-06-16)
 

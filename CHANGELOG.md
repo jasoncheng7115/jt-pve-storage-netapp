@@ -2,6 +2,111 @@
 
 All notable changes to the NetApp ONTAP Storage Plugin for Proxmox VE are documented here.
 
+## [0.2.23] - 2026-07-26
+
+### Proxmox VE 9.0/9.1/9.2 Compatibility Audit + Snapshot Safety Fixes
+
+**Status: prepared, not yet published.** All tests pass against the restored ONTAP simulator: units **153/153** (`audit_fixes` 105, `status_timeout` 20, `stale_sd_reaper` 20, `activate_budget` 8), `make test` 6/6, and functional **53/53** (`sim_snapshot_safety` 34, `sim_functional` 13, `cleanup_load` 6). Remaining before publishing: `make deb`, install on this node, the `qm`-level end-to-end (`docs/TESTING.md` 31.8), then the `github/` sync, README deb filenames and tag.
+
+Requirements relaxed from Proxmox VE 9.1 to **Proxmox VE 9.0 or later**.
+
+#### Data safety: silent loss of snapshot restore points (highest severity)
+
+ONTAP SnapRestore (`PATCH /storage/volumes` with `restore_to.snapshot`) deletes **every snapshot created after the restore target**. Proxmox VE had no way to know that:
+
+- The plugin did not implement `volume_rollback_is_possible()`, so PVE's base implementation returned `1` for any snapshot.
+- `PVE::AbstractConfig::snapshot_rollback()` does **not** remove newer snapshots from the guest config.
+
+Result: rolling back to an older snapshot silently destroyed the newer ones on ONTAP while Proxmox VE kept listing them in the config and web UI. The operator believed they still held those restore points; the loss only surfaced when a later rollback or delete of them failed. Every core plugin whose rollback is likewise destructive (ZFSPool, LvmThin, LVM, BTRFS) implements this guard for exactly this reason.
+
+- **Fix:** implement `volume_rollback_is_possible()`. It compares ONTAP snapshot creation times, refuses any rollback that is not to the most recent snapshot, and reports the doomed snapshots through PVE's `$blockers` list so the web UI names them. A template's `__pve_base__` snapshot can also block, since SnapRestore past it would destroy the base that linked clones depend on. Unparseable or tied ONTAP timestamps are treated as **blocking** (fail safe), never as "older, therefore harmless".
+
+#### Snapshot delete now detects FlexClones that lock the snapshot
+
+`PVE::Storage::vdisk_clone($cfg, $volid, $vmid, $snapname)` is reachable (`qm clone ... --snapname X` without `--full`, and the LXC equivalent), and `clone_image()` then creates a normal `pve_*` FlexClone whose parent is that snapshot. `volume_snapshot_delete()` only ever looked for the deterministic `tmpclone_<vol>_<snap>`, so ONTAP rejected the delete with a raw `Snapshot ... has not expired or is locked` and nothing told the operator what was holding it — the same symptom class as the v0.2.13 vzdump incident, from a clone this function never looked for.
+
+- **Fix:** after the temp-clone teardown, query `volume_get_clone_children()` and refuse with an actionable message naming each blocking clone and its owning guest, plus how to make them independent. The plugin does **not** auto-split or auto-delete — those are live disks of other guests. The deterministic temp clone is explicitly exempt, because ONTAP metadata can still list a just-deleted FlexClone (the v0.2.13 lesson) and blocking on it would regress the vzdump CT snapshot-mode path.
+
+#### Storage API version negotiation (the actual PVE 9.0-9.2 compatibility issue)
+
+PVE's third-party plugin loader **hard-rejects** a plugin whose `api()` exceeds the running `PVE::Storage::APIVER` — the storage silently disappears from the node — and warns on every load when `api()` is lower. Proxmox VE bumped `APIVER` twice **inside** the 9.1 point releases (verified by unpacking each package):
+
+| libpve-storage-perl | APIVER | APIAGE | accepts |
+|---|---|---|---|
+| 9.0.16 - 9.1.2 | 13 | 4 | 9-13 |
+| 9.1.3 - 9.1.5 | 14 | 5 | 9-14 |
+| 9.1.6+ | 15 | 6 | 9-15 |
+
+The hardcoded `api() => 13` therefore made every `pvedaemon` / `pvestatd` / `pveproxy` / `pvesm` invocation on 9.1.3+ print `Plugin ... is implementing an older storage API, an upgrade is recommended`.
+
+- **Fix:** `api()` now returns the highest version the plugin implements that the running PVE understands (capped at 15, floor 9), falling back to 13 when `PVE::Storage` is not loaded. Verified against every available 9.0/9.1 storage library: exact APIVER match and **zero warnings** on 9.0.18, 9.1.0, 9.1.2, 9.1.3, 9.1.5 and 9.1.6.
+- `volume_resize()` now accepts the `$snapname` argument added in APIVER 14 and rejects it explicitly, instead of silently resizing the **current** volume when asked to resize a snapshot.
+- New `get_identity()` (APIVER 15, exposed via `GET /nodes/{node}/storage/{id}/identity`) returning `netappontap://<portal>/<svm>`. The aggregate is deliberately excluded: it only decides where new FlexVols land.
+
+#### ONTAP management-gateway load: API client cache thrash
+
+`_get_api()` keyed its client cache on `$scfg->{storage} // $scfg->{'ontap-portal'}`, but Proxmox VE **never** populates `$scfg->{storage}`, so the key degraded to portal-only while the validity check compared portal **and** SVM. Two `netappontap` storages sharing one ONTAP management LIF but using different SVMs therefore evicted each other's client on every single `_get_api()` call. Each rebuild discards the keep-alive connection, putting the plugin back into "new TCP + TLS handshake + basic auth per REST request" — the exact behaviour that caused the 2026-06-16 mgwd congestion collapse and that `keep_alive` (v0.2.19) exists to prevent.
+
+- **Fix:** key the cache on `(portal, svm, data|status)`. Sibling storages now keep independent, reused connections; two entries pointing at the same portal **and** SVM still share one client.
+
+#### `multipath -F` removed from the codebase
+
+`Multipath::multipath_flush()` had a no-device branch that executed `multipath -F`, which flushes **all** unused multipath maps system-wide including the customer's manually managed storage. It was unreachable dead code, but left the call site one accidental caller away from a cluster-wide incident, and violated the project's own hard rule. Following the v0.2.4 lesson (delete dead code with a known bug pattern rather than leaving it as a footgun), the branch is gone and the function now croaks without a device argument.
+
+#### `deactivate_storage()`: added the v0.2.17 path-health gate
+
+It tears down multipath devices and all SCSI paths for every LUN of the storage, guarded only by `is_device_in_use()` — which does **not** see a QEMU-held disk of a running VM (an open fd is not a sysfs holder). Reaching it would reproduce the v0.2.17 incident: `multipath -f` fails on the busy map, the `dmsetup remove --force` fallback rips it out from under QEMU, and the guest takes I/O errors.
+
+- **Fix:** gate teardown on `multipath_path_health()`, treating indeterminate (`-1`) exactly like alive (`1`), as the orphan reaper does.
+- Also corrected a misleading comment: **nothing in Proxmox VE 9.0-9.2 calls `PVE::Storage::deactivate_storage()`** (verified across the whole `/usr/share/perl5/PVE` tree), so it must not be relied on for cleanup on `pvesm set --disable` or storage removal.
+
+#### `filesystem_path()` no longer fails with a misleading internal error
+
+Its signature carries no `$storeid`, and this plugin needs the storage ID to derive the ONTAP FlexVol name, so it cannot be implemented. The old body passed the never-set `$scfg->{storage}` and died with `storage is required at .../Naming.pm line 213`. It is unreachable in PVE 9.0-9.2 (every base method that calls it is overridden, and `volume_snapshot_info` / `rename_snapshot` are only invoked when `volume_qemu_snapshot_method` returns `'mixed'`, while this plugin returns `'storage'`), but it was a booby trap for the next PVE release that widens the external-snapshot API.
+
+- **Fix:** die with a clear, plugin-level message pointing at `path()`. Also override `volume_snapshot_info()` — now answered from ONTAP as an ordered `name => {order, timestamp}` map — and `rename_snapshot()` (explicitly unsupported), so neither can fall through to the base implementation.
+
+#### ONTAP volume recovery queue holds a deleted clone (found by the new tests)
+
+Discovered while running the new 31.6 test against real ONTAP, and a **correction to the v0.2.13 diagnosis**.
+
+A FlexClone that has been **deleted** still counts as a clone of its parent for as long as ONTAP keeps it in the **volume recovery queue** (enabled by default; retention is per-SVM via `vserver modify -volume-delete-retention-hours`, default 12h). The queued volume is renamed `<original>_<id>` and is invisible to `/storage/volumes`, but ONTAP's own clone view still reports it. Consequences, both reproduced on real ONTAP:
+
+- deleting the parent's snapshot fails with `Snapshot ... has not expired or is locked`
+- deleting the parent volume fails with `it has one or more clones`
+
+...for up to the whole retention window, with an error that never mentions the queue. In practice: destroy a linked-clone VM, then try to delete the source snapshot (or the source disk) and it fails for 12 hours for no visible reason. `free_image()`'s old "stale clone metadata, retrying..." loop was hitting exactly this — it burned 5 attempts against a condition that sleeping can never clear, then failed with a message that pointed nowhere.
+
+This also **corrects the v0.2.13 root-cause analysis**, which attributed the sticky `volume_clone_dependent` owner to eventual consistency plus an ONTAP-simulator quirk. The real mechanism is the recovery queue, which is present on real ONTAP too; `volume_clone_split` worked around it because splitting de-clones the volume *before* deletion, so its queue entry is no longer a clone.
+
+- **Fix:** new `API::volume_get_clone_children_cli()` (ONTAP's authoritative clone view, including queued clones), `recovery_queue_list()` and `recovery_queue_purge()`, plus `_release_recovery_queue_clone_holds()`. `volume_snapshot_delete()` and `free_image()` now release such holds instead of failing. Splitting before deleting a linked clone was rejected as the fix: it would copy the clone's entire delta just to throw the volume away, turning `qm destroy` on a linked clone into a minutes-to-hours operation.
+- **Safety:** an entry is purged only when ONTAP reports it as a clone of the volume being operated on, it is **not** a live volume, it **is** in the recovery queue, and its name matches the plugin's own scheme (`pve_*_<id>` or `tmpclone_pve_*_<id>`). A live clone is reported for the operator to resolve, never purged. A customer's own clone is never touched. Purging is limited to entries actively blocking the delete the operator just requested, so the recovery queue's safety net is preserved everywhere else, and every purge is logged.
+- **Opt-out:** new `ontap-purge-recovery-queue` (boolean, default 1). Set to 0 to leave the queue untouched and receive an actionable error naming the queued volume and the `volume recovery-queue purge` command instead.
+
+#### Smaller correctness and hygiene fixes
+
+- `activate_volume()` now accepts the `$hints` argument Proxmox VE 9.1 passes (`Storage.pm:1411`); it was silently dropped by a too-short signature.
+- `volume_size_info()` now honours the `$timeout` PVE passes in (commonly 10s); it was accepted and ignored, so the call was bounded only by the client default of 15s x 2 retries. `API::get()` / `lun_get()` gained a `%opts` pass-through for this.
+- `parse_volname()` now dies on an unparseable volume name, as every core plugin does, instead of returning `undef` and letting the failure surface later as `Use of uninitialized value` with no indication of which volume was at fault.
+- `API::volume_get_clone_children()` now requests `clone.parent_snapshot.name` explicitly, so callers can tell which parent snapshot each child clone pins.
+- Removed the unused `PVE::ProcFSTools` and `PVE::Cluster` imports; import `PVE::INotify`, which is actually used.
+- POD: corrected the SYNOPSIS and CONFIGURATION OPTIONS, which still documented pre-0.2.x option names (`portal` / `svm` / `aggregate` / `ssl_verify` / `thin` / `igroup_mode`) instead of the real `ontap-` prefixed ones — copying the old POD example into `storage.cfg` could not work. Added a Proxmox VE compatibility section.
+
+#### Verified as NOT problems (recorded so they are not re-investigated)
+
+- **`-blockdev` conversion (PVE 9.0's largest change):** the plugin does not implement `qemu_blockdev_options()`, and does not need to. The base implementation `stat()`s the path returned by `path()`, sees `S_ISBLK`, and emits `{driver => 'host_device', filename => ...}`; `filename` is on PVE's allow-list for that driver.
+- **`multipathd` CLI compatibility with multipath-tools 0.11.1** (Debian 13 / PVE 9, up from 0.9.x on PVE 8): `show maps raw format '%n %w'`, `show paths raw format '%m %t %o'` and `disablequeueing map` all verified working, with output that `multipath_path_health()` parses correctly.
+- **`SHARED_STORAGE` registration** still works on PVE 9.2 (`shared` is auto-set to 1).
+- **`status()`'s double-forked cleanup grandchild calling `PVE::Storage::config()`** does not misuse the parent's pmxcfs IPC socket: the inherited `$ccache` / `$versions` satisfy the read with **zero** `ipcc_get_config` calls (measured).
+- **Running-VM snapshots being crash-consistent without a guest agent**, and `volume_snapshot_needs_fsfreeze()` returning 0 for LXC: both match core PVE behaviour (LVM/LVM-thin), and `PVE::LXC::sync_container_namespace()` does a `syncfs` inside the container's mount namespace.
+- **Empty `volume_export_formats()`**: same as LVM/RBD; `qm move-disk` uses `qemu-img convert` via `path()`, and shared storage does not move volumes on migration.
+
+#### Tests
+
+- New `tests/audit_fixes.t` (79 assertions, no ONTAP required): API version negotiation in a fresh process per APIVER, ONTAP timestamp parsing, the rollback guard, the linked-clone lock (including the temp-clone no-regression guard), snapshot info ordering, and static guards for every fix above.
+- `tests/status_timeout.t`: distinct test storages now differ by `ontap-svm` instead of a `storage` key. The old version relied on `_get_api()` reading `$scfg->{storage}`, which merely reproduced the caching bug it was meant to guard.
+- `docs/TESTING.md` + `docs/TESTING_zh-TW.md`: new **section 31** covering the unit suite, the cross-version APIVER matrix, PVE 9 API contract checks, static guards, and two ONTAP-required functional tests (31.5 SnapRestore destructiveness + rollback guard, with host-side device assertions per the v0.2.14 rule; 31.6 linked-clone lock).
+
 ## [0.2.22] - 2026-06-16
 
 ### postinst: prominent "restart pvestatd (not reload)" upgrade warning

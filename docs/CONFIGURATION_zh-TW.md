@@ -275,6 +275,33 @@ netappontap: <storage-id>
 - 進行中的 login 絕不中斷，且在尚未有任何路徑時絕不跳過(必須取得至少一條路徑，否則誠實失敗)——所以不會把「慢但連得到」的儲存誤判成 inactive。
 - 被跳過的 portal 會在下次 activation 補上；multipath 備援會自我修復。
 
+### ontap-purge-recovery-queue
+
+**類型：** boolean
+**預設：** 1（啟用）
+**說明：** 允許 plugin 在自己**已刪除**的 FlexClone 阻擋快照或 volume 刪除時，把它從 ONTAP 的 volume recovery queue 中 purge 掉。
+
+```bash
+--ontap-purge-recovery-queue 1   # 預設
+--ontap-purge-recovery-queue 0   # 完全不動 recovery queue，改為回報錯誤
+```
+
+**為什麼需要這個選項：** ONTAP 會把已刪除的 volume 保留在 volume recovery queue 中（預設啟用；保留時間由各 SVM 的 `vserver modify -volume-delete-retention-hours` 決定，預設 12 小時）。被該 queue 保留的已刪除 FlexClone **仍然算是其 parent 的 clone**，因此會造成：
+
+- 刪除 parent 的快照失敗，錯誤為 `Snapshot ... has not expired or is locked`
+- 刪除 parent volume 失敗，錯誤為 `it has one or more clones`
+
+而且會持續整個保留期，錯誤訊息完全沒有提到這個 queue。實際情境是：銷毀一個 linked clone VM，接著要刪除來源快照，就會失敗長達 12 小時，而且看不出原因。
+
+**注意事項：**
+- purge 的範圍**非常窄**。只有在 ONTAP 回報該項目是「目前操作對象」的 clone、它已不是線上 volume、它確實在 recovery queue 中，且名稱符合 plugin 自己的命名規則（`pve_*_<id>` 或 `tmpclone_pve_*_<id>`）時才會移除。**線上**的 clone 只會回報給您處理，絕不 purge；您自己建立的 clone 絕不觸碰。
+- 只會 purge 正在阻擋您剛剛要求的那次刪除的項目，因此 recovery queue 在其他所有情況下的保護仍然完整。每次 purge 都會寫入日誌。
+- 設為 `0` 時，您會得到可行動的錯誤訊息，指名被 queue 保留的 volume 以及自行清除的指令：
+  ```
+  volume recovery-queue purge -vserver <svm> -volume <name>
+  ```
+- 檢視該 queue：在 ONTAP CLI 執行 `volume recovery-queue show`。
+
 ## 標準 PVE 選項
 
 ### content

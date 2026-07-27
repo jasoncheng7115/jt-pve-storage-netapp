@@ -12,6 +12,7 @@ use Fcntl qw(:flock);
 use POSIX qw();
 use Time::Local qw();
 use PVE::INotify;
+use PVE::Storage::Common;
 
 use PVE::Storage::Custom::NetAppONTAP::API;
 use PVE::Storage::Custom::NetAppONTAP::Naming qw(
@@ -2648,6 +2649,172 @@ sub volume_resize {
 # Volume activation
 #
 
+#
+# Volume export / import  (raw+size stream)
+#
+# Enables `qm remote-migrate` / `pct remote-migrate` (cluster-to-cluster) and the
+# storage-content copy API. LOCAL migration never needs this -- both
+# QemuMigrate.pm and LXC/Migrate.pm return early for $scfg->{shared}, and this
+# plugin is registered in @SHARED_STORAGE.
+#
+# The wire format is deliberately trivial (see PVE::Storage::Plugin):
+#   8 bytes  little-endian uint64 = image size in bytes
+#   N bytes  the raw image
+#
+# Modelled on LVMPlugin, with two differences that matter for a SAN backend:
+#
+#   1. The device does not exist the moment alloc_image() returns. It has to be
+#      mapped to the node's igroup, rediscovered over iSCSI/FC and assembled by
+#      multipath. Both directions therefore call activate_volume() and fail
+#      loudly if the device never shows up, instead of dd'ing into nothing.
+#
+#   2. THE SIZE MUST BE VERIFIED BEFORE WRITING. The stream carries an exact byte
+#      count; alloc_image() takes KiB and ONTAP creates a LUN of exactly that many
+#      bytes. If the stream is not a whole number of KiB, dd would silently write
+#      past the end of the LUN and the imported disk would be TRUNCATED --
+#      corruption no error message would report. We round up before allocating,
+#      then re-read the REAL device size and refuse if it is smaller.
+
+sub volume_export_formats {
+    my ($class, $scfg, $storeid, $volname, $snapshot, $base_snapshot, $with_snapshots) = @_;
+
+    # No incremental streams, no snapshot bundles, and no exporting a snapshot
+    # directly (that would need a temp FlexClone; out of scope and untested).
+    return () if $with_snapshots || defined($base_snapshot) || defined($snapshot);
+
+    my ($vtype) = eval { $class->parse_volname($volname) };
+    return () if $@ || !$vtype || $vtype ne 'images';
+
+    return ('raw+size');
+}
+
+sub volume_import_formats {
+    my ($class, $scfg, $storeid, $volname, $snapshot, $base_snapshot, $with_snapshots) = @_;
+
+    return $class->volume_export_formats(
+        $scfg, $storeid, $volname, $snapshot, $base_snapshot, $with_snapshots);
+}
+
+sub volume_export {
+    my ($class, $scfg, $storeid, $fh, $volname, $format, $snapshot, $base_snapshot,
+        $with_snapshots) = @_;
+
+    die "volume export format '$format' not available for $class\n"
+        if $format ne 'raw+size';
+    die "cannot export volumes together with their snapshots in $class\n" if $with_snapshots;
+    die "cannot export an incremental stream in $class\n" if defined($base_snapshot);
+    die "cannot export a snapshot in $class\n" if defined($snapshot);
+
+    # The LUN must be mapped and assembled on THIS node before it can be read.
+    $class->activate_volume($storeid, $scfg, $volname, undef, {});
+
+    my ($file) = $class->path($scfg, $volname, $storeid);
+    die "internal error: no path for volume '$volname'\n" if !$file;
+    die "device '$file' for volume '$volname' is not a block device\n" if !-b $file;
+
+    # Ask the kernel, not ONTAP: this is the size dd will actually read, and it
+    # doubles as proof that the device is really present and readable.
+    my $size;
+    run_command(
+        ['/sbin/blockdev', '--getsize64', $file],
+        outfunc => sub {
+            my ($line) = @_;
+            die "unexpected output from blockdev: $line\n" if $line !~ /^(\d+)$/;
+            $size = int($1);
+        },
+    );
+    die "could not determine size of '$file'\n" if !$size;
+
+    PVE::Storage::Plugin::write_common_header($fh, $size);
+    run_command(['dd', "if=$file", 'bs=64k', 'status=none'], output => '>&' . fileno($fh));
+}
+
+sub volume_import {
+    my ($class, $scfg, $storeid, $fh, $volname, $format, $snapshot, $base_snapshot,
+        $with_snapshots, $allow_rename) = @_;
+
+    die "volume import format '$format' not available for $class\n"
+        if $format ne 'raw+size';
+    die "cannot import volumes together with their snapshots in $class\n" if $with_snapshots;
+    die "cannot import an incremental stream in $class\n" if defined($base_snapshot);
+    die "cannot import into a snapshot in $class\n" if defined($snapshot);
+
+    my ($vtype, $name, $vmid, undef, undef, undef, $file_format) =
+        $class->parse_volname($volname);
+    die "cannot import format '$format' into a volume of format '$file_format'\n"
+        if $file_format ne 'raw';
+
+    my $stream_size = PVE::Storage::Plugin::read_common_header($fh);
+    die "import: refusing a zero-length stream\n" if !$stream_size;
+
+    # alloc_image() takes KiB. Round the byte count UP so the LUN can never be
+    # smaller than the stream -- see the truncation note above.
+    my $size_kb = PVE::Storage::Common::align_size_up($stream_size, 1024) / 1024;
+
+    # Only the ALLOCATION is serialised. The transfer is a full disk copy and must
+    # NOT run while holding the cluster-wide storage lock (the v0.2.24 lesson).
+    my $allocname = $class->cluster_lock_storage(
+        $storeid,
+        $scfg->{shared},
+        undef,
+        sub {
+            my $api = _get_api($scfg);
+            my $existing = eval { $api->volume_get(pve_volname_to_ontap($storeid, $volname)); };
+            if ($existing) {
+                die "volume '$volname' already exists on storage '$storeid'\n" if !$allow_rename;
+                warn "volume '$volname' already exists - importing under a different name\n";
+                $name = undef;
+            }
+            return $class->alloc_image($storeid, $scfg, $vmid, 'raw', $name, $size_kb);
+        },
+    );
+
+    my $imported = eval {
+        my $oldname = $volname;
+        $volname = $allocname;
+        die "internal error: allocated name '$allocname' differs from requested '$oldname'\n"
+            if defined($name) && $allocname ne $oldname;
+
+        # Map + rediscover + assemble multipath, then wait for the device.
+        $class->activate_volume($storeid, $scfg, $volname, undef, {});
+
+        my ($file) = $class->path($scfg, $volname, $storeid);
+        die "internal error: no path for freshly allocated volume '$volname'\n" if !$file;
+        die "device '$file' for '$volname' did not appear as a block device\n" if !-b $file;
+
+        # ANTI-TRUNCATION GUARD. Re-read the real device size and refuse if it
+        # cannot hold the stream. Without this, dd writes past the end of the LUN
+        # and silently produces a truncated disk.
+        my $dev_size;
+        run_command(
+            ['/sbin/blockdev', '--getsize64', $file],
+            outfunc => sub {
+                my ($line) = @_;
+                $dev_size = int($1) if $line =~ /^(\d+)$/;
+            },
+        );
+        die "could not determine size of '$file' before importing\n" if !$dev_size;
+        die "refusing to import: device '$file' is $dev_size bytes but the stream is "
+          . "$stream_size bytes -- writing it would TRUNCATE the image\n"
+            if $dev_size < $stream_size;
+
+        run_command(['dd', "of=$file", 'bs=64k', 'conv=fsync', 'status=none'],
+            input => '<&' . fileno($fh));
+
+        return "$storeid:$volname";
+    };
+    if (my $err = $@) {
+        # free_image() does the full 7-step host-side teardown plus the ONTAP
+        # delete, so a failed import leaves neither a stale device nor an orphaned
+        # FlexVol.
+        eval { $class->free_image($storeid, $scfg, $volname, 0, 'raw'); };
+        warn "cleanup of partially imported volume '$volname' failed: $@" if $@;
+        die $err;
+    }
+
+    return $imported;
+}
+
 # $hints is passed through by PVE::Storage::activate_volumes (Storage.pm:1411) on
 # Proxmox VE 9.1+. Currently only 'guest-is-windows' and
 # 'plugin-may-deactivate-volume' exist, neither of which changes anything for a SAN
@@ -3004,7 +3171,7 @@ sub _get_snapshot_path {
     die "Failed to find device for temporary clone '$temp_clone_name' (WWID: $wwid)"
         unless $device && -b $device;
 
-    return ($device, $parsed->{vmid}, 'raw');
+    return wantarray ? ($device, $parsed->{vmid}, 'raw') : $device;
 }
 
 sub path {
@@ -3047,7 +3214,8 @@ sub path {
         my $synthetic_wwid = sprintf("3600a0980%012x%012x",
             $digest, length($ontap_volname));
         warn "LUN $lun_path not found on ONTAP, returning synthetic path for cleanup\n";
-        return ("/dev/mapper/$synthetic_wwid", $parsed->{vmid}, 'raw');
+        return wantarray ? ("/dev/mapper/$synthetic_wwid", $parsed->{vmid}, 'raw')
+                         : "/dev/mapper/$synthetic_wwid";
     }
 
     # Try multipath first
@@ -3087,7 +3255,11 @@ sub path {
         eval { _track_wwid($storeid, $wwid); };
     }
 
-    return ($device, $parsed->{vmid}, 'raw');
+    # Honour wantarray, exactly as PVE::Storage::Plugin::path() does. Returning a
+    # 3-element list unconditionally means `my $p = $plugin->path(...)` silently
+    # yields the LAST element -- the string 'raw' -- instead of the device path,
+    # and the failure surfaces far away as "'raw' is not a block device".
+    return wantarray ? ($device, $parsed->{vmid}, 'raw') : $device;
 }
 
 # filesystem_path() cannot be implemented by this plugin.

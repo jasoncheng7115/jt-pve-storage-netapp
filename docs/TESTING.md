@@ -2814,6 +2814,48 @@ journalctl --since '5 min ago' | grep -c 'tur checker reports path is down'  # E
 
 ---
 
+## 34. Volume Export / Import (v0.2.27)
+
+Enables `qm remote-migrate` / `pct remote-migrate`. The load-bearing assertion is
+**truncation safety**.
+
+### 34.1 Round-trip against real ONTAP (ONTAP REQUIRED, needs TWO storages)
+
+```bash
+perl -Ilib tests/sim_export_import.pl
+# Expected: 8/8 PASS.
+#   - export = 8-byte header + payload
+#   - 4 MiB round-trip between netapp1 and netapp2 is byte-identical (sha256)
+#   - an odd-sized stream (1 MiB + 1 byte) allocates a LUN rounded UP to 1025 KiB,
+#     and the first 1048577 bytes are byte-identical -> no truncation
+#   - importing onto an existing name is refused without allow_rename,
+#     and lands on a new name with it
+#   - ONTAP is clean afterwards
+```
+
+### 34.2 Static guards
+
+```bash
+P=lib/PVE/Storage/Custom/NetAppONTAPPlugin.pm
+grep -c '^sub volume_export\b' $P                                   # Expected: 1
+grep -c '^sub volume_import\b' $P                                   # Expected: 1
+sed -n '/^sub volume_import /,/^}/p' $P | grep -cF 'align_size_up'  # >= 1
+sed -n '/^sub volume_import /,/^}/p' $P | grep -c 'would TRUNCATE'  # Expected: 1
+sed -n '/^sub volume_import /,/^}/p' $P | grep -cF '$dev_size < $stream_size'  # Expected: 1
+# path() must honour wantarray (base-class contract)
+grep -cF "return wantarray ? (\$device, \$parsed->{vmid}, 'raw') : \$device;" $P   # Expected: 2
+```
+
+### 34.3 What is deliberately NOT supported
+
+`volume_export_formats` returns an empty list — so PVE reports a clear
+"no matching import/export format" rather than doing something unsafe — when a
+snapshot is requested, when an incremental (`base_snapshot`) stream is requested,
+or when `with_snapshots` is set. Exporting a snapshot would require a temporary
+FlexClone and is untested.
+
+---
+
 ## Cleanup
 
 ```bash

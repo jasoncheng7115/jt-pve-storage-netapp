@@ -2378,6 +2378,42 @@ journalctl --since '5 min ago' | grep -c 'tur checker reports path is down'  # �
 
 ---
 
+## 34. Volume 匯出／匯入（v0.2.27）
+
+用以支援 `qm remote-migrate`／`pct remote-migrate`。關鍵斷言是**防截斷**。
+
+### 34.1 對真實 ONTAP 的來回驗證（需要 ONTAP，且需要兩個 storage）
+
+```bash
+perl -Ilib tests/sim_export_import.pl
+# 預期：8/8 PASS。
+#   - 匯出 = 8 位元組標頭 + 內容
+#   - netapp1 與 netapp2 之間 4 MiB 來回後 sha256 完全一致
+#   - 奇數大小串流（1 MiB + 1 位元組）配置出向上對齊為 1025 KiB 的 LUN，
+#     且前 1048577 位元組完全一致 -> 沒有截斷
+#   - 匯入到既有名稱在未開啟 allow_rename 時被拒絕，開啟後改用新名稱
+#   - 測試後 ONTAP 保持乾淨
+```
+
+### 34.2 靜態守則
+
+```bash
+P=lib/PVE/Storage/Custom/NetAppONTAPPlugin.pm
+grep -c '^sub volume_export\b' $P                                   # 預期：1
+grep -c '^sub volume_import\b' $P                                   # 預期：1
+sed -n '/^sub volume_import /,/^}/p' $P | grep -cF 'align_size_up'  # >= 1
+sed -n '/^sub volume_import /,/^}/p' $P | grep -c 'would TRUNCATE'  # 預期：1
+sed -n '/^sub volume_import /,/^}/p' $P | grep -cF '$dev_size < $stream_size'  # 預期：1
+# path() 必須遵守 wantarray（base class 契約）
+grep -cF "return wantarray ? (\$device, \$parsed->{vmid}, 'raw') : \$device;" $P   # 預期：2
+```
+
+### 34.3 刻意不支援的情況
+
+在下列情況下 `volume_export_formats` 會回傳空清單 —— 於是 PVE 會明確回報「no matching import/export format」，而不是做出不安全的行為 ——：要求匯出快照時、要求增量（`base_snapshot`）串流時，或設定了 `with_snapshots` 時。匯出快照需要暫存 FlexClone，且未經測試。
+
+---
+
 ## 清除
 
 ```bash

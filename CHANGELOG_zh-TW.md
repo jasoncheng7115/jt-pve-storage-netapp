@@ -2,6 +2,40 @@
 
 NetApp ONTAP Storage Plugin for Proxmox VE 的所有重要變更都記錄在此。
 
+## [0.2.27] - 2026-07-27
+
+### 跨叢集遷移：實作 `volume_export`／`volume_import`
+
+`volume_export_formats`、`volume_export`、`volume_import_formats` 與 `volume_import` 先前皆未實作，因此 Proxmox VE 找不到共通的傳輸格式，`qm remote-migrate`／`pct remote-migrate` 會以下列訊息失敗：
+
+```
+no matching import/export format found for storage '<id>'
+```
+
+`LVMPlugin`、`RBDPlugin` 與 `ISCSIPlugin` 都有實作，因此這是真正的能力缺口，而非常態。**本地遷移從未受影響** —— `QemuMigrate.pm` 與 `LXC/Migrate.pm` 都對 `$scfg->{shared}` 提早返回，而本外掛已註冊於 `@SHARED_STORAGE`。
+
+線上格式是 Proxmox VE 極簡的 `raw+size`：8 位元組的 little-endian 大小標頭，後接原始映像內容。
+
+#### 防截斷是整段實作的關鍵
+
+串流帶的是**精確的位元組數**，而 `alloc_image()` 收的是 KiB，ONTAP 會建立恰好該位元組數的 LUN。因此若串流不是 KiB 的整數倍，就可能被寫到**超出 LUN 尾端**，靜默產生一顆被截斷的磁碟，而且不會有任何錯誤訊息。
+
+`volume_import()` 因此在配置前先將大小**向上**對齊（`align_size_up`，與 LVM 相同），**並且**接著以 `blockdev --getsize64` 重新讀取**真實**裝置大小，若小於串流則拒絕寫入。只做向上對齊並不足夠：先驗證，再寫入。
+
+#### 與 LVM 模型的兩項 SAN 特有差異
+
+- **`alloc_image()` 回傳的當下裝置並不存在。** 它必須先對映到該節點的 igroup、透過 iSCSI／FC 重新探索，再由 multipath 組裝。因此兩個方向都會呼叫 `activate_volume()`，並在裝置始終沒有出現時明確失敗，而不是把資料 `dd` 到空無一物。
+- **匯入失敗會執行 `free_image()`** —— 即完整的 7 步驟主機端拆除加上 ONTAP 刪除 —— 因此不會留下殘留裝置或孤立的 FlexVol。
+- 只有**配置**那一段在 `cluster_lock_storage` 內執行；傳輸本身是整顆磁碟的複製，不可持有叢集層級的儲存鎖（v0.2.24 的教訓）。
+
+### 錯誤修正：`path()` 忽略了 `wantarray`
+
+`PVE::Storage::Plugin::path()` 的結尾是 `return wantarray ? (...) : $path`。我們的版本無條件回傳 3 元素清單，因此 `my $p = $plugin->path(...)` 會靜默取得**最後**一個元素 —— 字串 `'raw'` —— 而非裝置路徑，錯誤最後以 `'raw' is not a block device` 的形式出現在很遠的地方。
+
+三個回傳點皆已修正（`path()`、其合成路徑分支，以及 `_get_snapshot_path()`）。此問題是在撰寫 `volume_export` 時立刻踩到而發現的。
+
+**測試**：`make test` 6/6、podchecker OK、單元 **228/228**、對真實 ONTAP 模擬器的功能測試 **61/61** —— 包含新增的 `tests/sim_export_import.pl`（8/8）：兩個 storage 之間 4 MiB 的 checksum 來回驗證、刻意設計的 1 MiB + 1 位元組奇數大小串流（LUN 向上對齊為 1025 KiB，前 1,048,577 位元組完全一致），以及對既有名稱在開啟／關閉 `allow_rename` 兩種情況下的匯入。測試後 ONTAP 保持乾淨。
+
 ## [0.2.26] - 2026-07-27
 
 ### FC：不再於每次輪詢發出 LIP，並為 rescan 迴圈加上時間上限

@@ -1,3 +1,52 @@
+jt-pve-storage-netapp (0.2.27-1) stable; urgency=medium
+
+  * Implement volume_export / volume_import (raw+size); fix path() wantarray
+  * Requirements: Proxmox VE 9.0 or later
+  * New capability: cluster-to-cluster migration
+    - volume_export_formats/volume_export/volume_import_formats/volume_import
+      were not implemented, so PVE could find no common transfer format and
+      'qm remote-migrate' / 'pct remote-migrate' failed with
+      "no matching import/export format found for storage '<id>'". LVMPlugin,
+      RBDPlugin and ISCSIPlugin all implement this, so it was a genuine gap.
+      LOCAL migration was never affected: QemuMigrate.pm and LXC/Migrate.pm both
+      return early for $scfg->{shared} and this plugin is in @SHARED_STORAGE.
+    - The wire format is PVE's trivial raw+size: an 8-byte little-endian size
+      header followed by the raw image.
+  * TRUNCATION SAFETY is the load-bearing part of the import path. The stream
+    carries an exact byte count, alloc_image() takes KiB, and ONTAP creates a LUN
+    of exactly that many bytes -- so a stream that is not a whole number of KiB
+    could be written past the end of the LUN, silently producing a short disk
+    that no error would report. volume_import() therefore rounds the size UP
+    before allocating (align_size_up, as LVM does) AND then re-reads the REAL
+    device size with blockdev --getsize64, refusing the write if it is smaller
+    than the stream. Rounding alone is not enough: verify, then write.
+  * Two SAN-specific differences from the LVM model, both handled:
+    - The device does not exist the moment alloc_image() returns; it must be
+      mapped to the node's igroup, rediscovered and assembled by multipath. Both
+      directions call activate_volume() and fail loudly if the device never
+      appears, rather than dd'ing into nothing.
+    - A failed import runs free_image(), i.e. the full 7-step host-side teardown
+      plus the ONTAP delete, so neither a stale device nor an orphaned FlexVol is
+      left behind.
+    - Only the ALLOCATION runs under cluster_lock_storage; the transfer is a full
+      disk copy and must not hold the cluster-wide storage lock (v0.2.24 lesson).
+  * Bug fix: path() ignored wantarray
+    - PVE::Storage::Plugin::path() ends with `return wantarray ? (...) : $path`.
+      Ours returned a 3-element list unconditionally, so
+      `my $p = $plugin->path(...)` silently yielded the LAST element -- the
+      string 'raw' -- instead of the device path, and the failure surfaced far
+      away as "'raw' is not a block device". Fixed in all three return paths
+      (path(), its synthetic-path branch, and _get_snapshot_path()). Found while
+      writing volume_export, which hit it immediately.
+  * Testing: make test 6/6, podchecker OK, units 228/228, functional against a
+    real ONTAP simulator 61/61 -- including the new tests/sim_export_import.pl
+    (8/8): a checksummed 4 MiB round-trip between two storages, a deliberately
+    odd-sized 1 MiB + 1 byte stream (LUN rounded up to 1025 KiB, first 1048577
+    bytes byte-identical), and existing-name imports with and without
+    allow_rename. ONTAP left clean afterwards.
+
+ -- Jason Cheng <jason@jason.tools>  Mon, 27 Jul 2026 23:30:00 +0800
+
 jt-pve-storage-netapp (0.2.26-1) stable; urgency=medium
 
   * FC: stop issuing a LIP on every poll, and bound the rescan loop

@@ -561,6 +561,80 @@ sub volume_get_clone_children {
     });
 }
 
+# List LUNs together with the igroups they are mapped to, in ONE paginated call.
+#
+# lun_list() deliberately does not carry lun_maps (it is on the 10s status path and
+# must stay minimal). Callers that need mappings for a whole namespace must NOT loop
+# lun_get() per LUN -- that is the N+1 REST storm that overwhelmed a customer's
+# ONTAP management gateway in v0.2.21. Ask for the field in the collection GET.
+sub lun_list_with_maps {
+    my ($self, $pattern) = @_;
+
+    my $svm_uuid = $self->get_svm_uuid();
+    return $self->_get_all_records('/storage/luns', {
+        name       => $pattern // '*',
+        'svm.uuid' => $svm_uuid,
+        fields     => 'name,lun_maps.igroup.name',
+    });
+}
+
+# Sample a LUN's cumulative I/O counters.
+#
+# Used to answer "is some OTHER node actively using this LUN?" before a
+# destructive operation. The host-side check (is_device_in_use) only sees the
+# node it runs on; on a shared SAN the guest may be running anywhere in the
+# cluster, and on the node handling a `pvesm free` the device may not be mapped
+# at all -- in which case there is nothing local to inspect.
+#
+# Returns undef if this ONTAP does not report LUN statistics (older releases),
+# so callers can tell "no activity" from "cannot tell".
+#
+# NOTE these are CUMULATIVE raw counters, not a rate. A single sample says only
+# "this LUN has ever done I/O", which is true of every used disk. Callers MUST
+# compare two samples taken a few seconds apart.
+sub lun_get_io_sample {
+    my ($self, $lun_path) = @_;
+
+    my $svm_uuid = $self->get_svm_uuid();
+    my $resp = eval {
+        $self->get('/storage/luns', {
+            name       => $lun_path,
+            'svm.uuid' => $svm_uuid,
+            fields     => 'name,statistics',
+        });
+    };
+    return undef if $@;
+
+    my $rec = ($resp->{records} && @{ $resp->{records} }) ? $resp->{records}[0] : undef;
+    my $stats = $rec ? $rec->{statistics} : undef;
+    return undef unless $stats && $stats->{iops_raw};
+
+    # 'status' is ONTAP's own quality flag for the sample ("ok",
+    # "partial_no_data", ...). Anything but ok means the numbers are not
+    # trustworthy, which must read as "cannot tell", not as "idle".
+    return undef if ($stats->{status} // '') ne 'ok';
+
+    my $iops = $stats->{iops_raw};
+    my $tput = $stats->{throughput_raw} // {};
+
+    # DELIBERATELY read+write ONLY -- 'other' is excluded.
+    #
+    # Every node that has the LUN mapped runs multipathd, whose path checker
+    # issues TEST UNIT READY on each path every few seconds. Those land in the
+    # 'other' bucket, so 'other' advances continuously on EVERY mapped LUN even
+    # when nothing is using it. Measured on a genuinely idle LUN: 1 'other'
+    # operation and 0 bytes in 8s. Including it would make an activity check
+    # refuse essentially every delete.
+    #
+    # Data transfer is the honest discriminator: a path checker moves no bytes,
+    # and any real guest I/O does.
+    return {
+        timestamp => $stats->{timestamp},
+        ops   => ($iops->{read} // 0) + ($iops->{write} // 0),
+        bytes => ($tput->{read} // 0) + ($tput->{write} // 0),
+    };
+}
+
 # Clone children of $parent_name AS ONTAP ITSELF SEES THEM, including clones
 # that have been deleted but are still held in the volume recovery queue.
 #

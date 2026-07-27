@@ -1,3 +1,130 @@
+jt-pve-storage-netapp (0.2.24-1) stable; urgency=medium
+
+  * Data-safety audit follow-up to 0.2.23 (delete / overwrite / deadlock review)
+  * Requirements: Proxmox VE 9.0 or later
+  * Testing: make test 6/6, podchecker OK, units 194/194, functional against a
+    real ONTAP simulator 53/53, plus real-ONTAP verification of the cross-node
+    I/O guard (idle mapped LUN not flagged 3/3, active dd flagged at
+    ~41 MB/10s, clearing within ~10s of the I/O stopping) and of the one-call
+    lun_list_with_maps() query returning igroup names.
+  * DATA LOSS: two storages could silently share one ONTAP volume namespace
+    - ONTAP volume names are pve_{storage}_{vmid}_disk{N} with the storage ID
+      run through sanitize_for_ontap(), which TRUNCATES to 32 characters. Two
+      different PVE storage IDs can therefore produce the same prefix -- e.g.
+      'netapp-production-cluster-alpha-one' and '...-two' both become
+      'netapp_production_cluster_alpha_'. If both storages also point at the
+      same SVM they address literally the same FlexVols: list_images() on one
+      reports the other's disks, and free_image() on one DESTROYS the other's
+      volume.
+    - The naming scheme cannot be changed without renaming every existing
+      customer volume, so the collision is prevented instead: a new
+      on_add_hook() refuses to create a storage whose (portal, SVM, 32-char
+      sanitized prefix) matches an existing netappontap storage, naming the
+      conflicting storage and the consequence. The same prefix under a
+      different SVM or portal is a separate namespace and is still allowed.
+      Configurations that predate the check are warned about at
+      activate_storage time rather than refused -- refusing to activate an
+      existing storage would take running guests offline.
+  * Orphan cleanup could tear down live devices for some storage IDs
+    - list_images(), _cleanup_orphaned_devices() and deactivate_storage() built
+      their ONTAP query prefixes with a naive s/-/_/g, which diverges from
+      sanitize_for_ontap() for any storage ID containing a dot (PVE allows
+      [a-z][a-z0-9\-\_\.]*[a-z0-9]) or longer than 32 characters.
+    - A prefix that matches nothing is dangerous in the orphan reaper: the
+      alive set comes back EMPTY, so every tracked WWID looks like a deleted
+      LUN. The v0.2.17 path-health gate still protects devices with active
+      paths, but a device whose paths are all momentarily down (controller
+      takeover, fabric blip) would then be torn down even though its LUN is
+      alive. list_images() would also report "this storage has no disks".
+    - All three now use sanitize_for_ontap($storeid, 32), the same function
+      that generates the real volume names.
+  * Cross-node in-use detection before delete (new ontap-inuse-io-check)
+    - is_device_in_use() is thorough but NODE-LOCAL: mounts, swap, sysfs
+      holders, and -- via fuser -- any process holding the block device open,
+      which does include a running QEMU (verified empirically; the v0.2.17 note
+      in CLAUDE.md claiming otherwise was wrong and has been corrected).
+    - What it cannot cover is the rest of the cluster. On the node servicing a
+      'pvesm free' the LUN may not be mapped at all, so there is nothing local
+      to inspect. That path is unguarded by PVE too: DELETE
+      /nodes/{node}/storage/{storage}/content/{volume} -- the storage content
+      view's Remove button -- does a permission check and then calls
+      vdisk_free, guarding only base volumes (volume_is_base_and_used).
+    - free_image() now asks ONTAP whether the LUN is transferring data, but
+      only when the local check could not run. The test is ONE-DIRECTIONAL:
+      observed I/O refuses the delete, absence of I/O never blocks one. That
+      distinction matters -- 'qm destroy' calls vdisk_free while the guest
+      config STILL references the disks (verified in QemuServer::destroy_vm),
+      so a "refuse if referenced" test would break destroy entirely.
+    - The verdict rests on BYTES transferred, not operation counts: multipathd
+      issues TEST UNIT READY on every mapped LUN continuously, which moves no
+      data. Counting operations made a genuinely idle LUN look busy (measured:
+      1 operation, 0 bytes in 8s), which would have refused nearly every
+      cross-node delete.
+  * free_image's delete retry loop is now wall-clock bounded
+    (ontap-delete-deadline, default 300s). free_image runs inside PVE's
+    cluster-wide storage lock, and one ONTAP volume delete can take ~240s
+    (60s HTTP x 2 retries + a 120s job wait), so five attempts could hold that
+    lock for ~20 minutes and block alloc/free for the storage on every node.
+    A per-call timeout does not bound a loop's total time (the v0.2.12 lesson).
+  * Recovery-queue purge now fails CLOSED on an API error
+    - _release_recovery_queue_clone_holds() decided "this volume is not live"
+      from `if (eval { $api->volume_get($name) })`, which treats a FAILED
+      volume_get (network blip, auth, ONTAP busy) identically to a confirmed
+      absence, advancing a live volume toward a destructive purge. This is the
+      v0.2.16 lesson applied to a destructive path, where it matters more.
+      A die is now reported as "could not verify" and refuses.
+  * volume_snapshot_rollback gets the same cross-node guard as free_image.
+    Rollback is MORE destructive than delete -- it silently overwrites the whole
+    volume with older content, so a mistake is not even visible as a missing
+    disk. PVE routes a rollback to the guest's owning node and stops the guest
+    first, so the exposure is narrower than free_image's, but the same
+    structural hole exists: if the LUN is not mapped on this node, $device is
+    undef and NO check runs. This mainly catches the same volid being attached
+    to a guest on another node, which PVE permits and does not guard.
+  * Snapshot names differing only in '-' vs '_' collide on ONTAP
+    - PVE snapshot names match [a-z][a-z0-9_-]+, so 'my-snap' and 'my_snap' are
+      distinct; sanitize_for_ontap() maps '-' to '_', so BOTH become the ONTAP
+      snapshot 'pve_snap_my_snap'. Creating the second is refused (the existing
+      snapshot_get check), which is the safe outcome -- two PVE snapshots must
+      never become one ONTAP snapshot -- but the error said "already exists" for
+      a name Proxmox VE lists as free, which is baffling.
+    - The encoding cannot be changed without orphaning every existing snapshot,
+      so the error now explains the mapping and names the variant that occupies
+      it. The same collision affects vmstate volume names, where alloc_image
+      likewise refuses.
+  * Detect a SECOND Proxmox VE cluster sharing the ONTAP volume namespace
+    - Volume names are pve_{storage}_{vmid}_disk{N} and contain NO cluster
+      identifier; 'ontap-cluster-name' only ever appears in igroup names. Two
+      clusters that each have a storage called e.g. 'netapp1' pointing at the
+      same SVM therefore share pve_netapp1_* completely. Allocation is safe
+      (existence checks pick the next free disk ID), but list_images() returns
+      the other cluster's volumes as if they were local: they appear in the
+      storage content view and in 'qm rescan' as unused disks, and deleting one
+      there destroys a live disk of the other cluster.
+    - status() now warns (24h cooldown, syslog) when LUNs in this storage's
+      namespace are mapped to igroups whose name does not start with this
+      cluster's own 'pve_{cluster}_' prefix -- proof that another PVE cluster
+      owns them. Warn only, never refuse; the storages are already in service.
+    - Implemented with a single paginated lun_list_with_maps() call. An earlier
+      draft looped lun_get() per LUN and only stamped its cooldown when a
+      problem was found, which on a healthy setup would have re-run every ~10s
+      status() poll -- reintroducing the v0.2.21 N+1 REST storm. It also parsed
+      the cluster name out of the igroup, which is ambiguous once the cluster
+      name itself contains '_' (or '-', which sanitizes to '_'); prefix matching
+      is used instead.
+  * Reviewed and found sound (recorded so it is not re-litigated): both flocks
+    use LOCK_NB with a bounded 10s retry and then proceed unlocked, so they can
+    never hang (worst case a lost tracking-file update, which is not a data
+    risk); all alarm() uses are leaf-level (glob / socket connect / open3) with
+    no nesting; every external command has an explicit timeout; all ONTAP waits
+    are bounded; alloc_image/clone_image use bounded TOCTOU retries with an
+    existence pre-check plus a create-error handler; vmstate and cloudinit
+    allocations die if the volume exists; rename_volume checks the target;
+    volume_resize refuses to shrink; the orphan reaper aborts entirely if
+    lun_list fails rather than treating a query failure as "all deleted".
+
+ -- Jason Cheng <jason@jason.tools>  Mon, 27 Jul 2026 14:30:00 +0800
+
 jt-pve-storage-netapp (0.2.23-1) stable; urgency=medium
 
   * Proxmox VE 9.0/9.1/9.2 compatibility audit + snapshot safety fixes

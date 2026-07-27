@@ -24,6 +24,7 @@ use PVE::Storage::Custom::NetAppONTAP::Naming qw(
     pve_volname_to_ontap
     ontap_to_pve_volname
     is_pve_managed_volume
+    sanitize_for_ontap
 );
 use PVE::Storage::Custom::NetAppONTAP::ISCSI qw(
     get_initiator_name
@@ -245,6 +246,38 @@ sub properties {
             maximum => 120,
             default => 30,
         },
+        'ontap-inuse-io-check' => {
+            description => "Before deleting a volume whose device is NOT mapped on"
+                . " this node, ask ONTAP whether the LUN is doing I/O and refuse the"
+                . " delete if it is. The host-side in-use check (mounts, swap, sysfs"
+                . " holders, open file descriptors) only covers the node it runs on;"
+                . " on shared SAN storage the guest may be running elsewhere in the"
+                . " cluster, and 'pvesm free' / the storage content view's Remove"
+                . " button perform no in-use check at all. This is one-directional:"
+                . " observed I/O refuses the delete, absence of I/O never blocks one"
+                . " (an idle guest produces no I/O), so it cannot break 'qm destroy'."
+                . " The verdict rests on BYTES transferred, not operation counts:"
+                . " multipathd's path checker issues TEST UNIT READY on every mapped"
+                . " LUN continuously, which moves no data but would otherwise look like"
+                . " activity. ONTAP's counters lag by up to one statistics interval, so"
+                . " a disk whose guest was just stopped can read as active for a few"
+                . " seconds; retrying clears it. Costs a few seconds, and only on that"
+                . " ambiguous path. Set to 0 to disable.",
+            type => 'boolean',
+            default => 1,
+        },
+        'ontap-delete-deadline' => {
+            description => "Wall-clock budget (seconds) for the volume-delete retry"
+                . " loop in free_image. free_image runs inside PVE's cluster-wide"
+                . " storage lock, so a long retry loop blocks alloc/free for this"
+                . " storage on every node; one ONTAP volume delete can take ~240s, so"
+                . " the 5 attempts could otherwise hold that lock for ~20 minutes."
+                . " Raise only if your ONTAP is legitimately slow to delete volumes.",
+            type => 'integer',
+            minimum => 60,
+            maximum => 1800,
+            default => 300,
+        },
         'ontap-purge-recovery-queue' => {
             description => "Allow the plugin to purge its OWN already-deleted"
                 . " FlexClones from ONTAP's volume recovery queue when they block"
@@ -282,6 +315,8 @@ sub options {
         'ontap-portal-probe-timeout' => { optional => 1 },
         'ontap-status-timeout' => { optional => 1 },
         'ontap-activate-deadline' => { optional => 1 },
+        'ontap-inuse-io-check' => { optional => 1 },
+        'ontap-delete-deadline' => { optional => 1 },
         'ontap-purge-recovery-queue' => { optional => 1 },
         nodes                => { optional => 1 },
         disable              => { optional => 1 },
@@ -448,6 +483,71 @@ sub _get_api {
     };
 
     return $api;
+}
+
+# Refuse to let two storages share one ONTAP volume namespace.
+#
+# Volume names are pve_{sanitized-storeid}_{vmid}_disk{N}, and
+# sanitize_for_ontap() TRUNCATES the storage ID to 32 characters (and strips
+# characters PVE allows but ONTAP does not, e.g. '.'). Two DIFFERENT PVE storage
+# IDs can therefore produce the SAME prefix -- for example
+# 'netapp-production-cluster-alpha-one' and 'netapp-production-cluster-alpha-two'
+# both become 'netapp_production_cluster_alpha_'.
+#
+# If those two storages also point at the same SVM, they address literally the
+# same FlexVols: list_images() on one reports the other's disks, and free_image()
+# on one DELETES the other's volume. That is silent cross-storage data loss.
+#
+# We cannot fix this by changing the naming scheme -- that would rename every
+# existing customer volume. Instead we refuse to create the collision, and warn
+# about any that predate this check. Note the SVM is part of the test: the same
+# prefix under a different SVM is a different namespace and is fine.
+sub _assert_unique_ontap_namespace {
+    my ($storeid, $scfg, $noerr) = @_;
+
+    my $prefix = sanitize_for_ontap($storeid, 32);
+    my $portal = $scfg->{'ontap-portal'} // '';
+    my $svm    = $scfg->{'ontap-svm'} // '';
+    return 1 if !length($prefix) || !length($svm);
+
+    my $cfg = eval { PVE::Storage::config(); };
+    return 1 if !$cfg || !$cfg->{ids};
+
+    for my $other_id (sort keys %{ $cfg->{ids} }) {
+        next if $other_id eq $storeid;
+        my $other = $cfg->{ids}{$other_id};
+        next unless $other && ($other->{type} // '') eq 'netappontap';
+        next unless ($other->{'ontap-svm'} // '') eq $svm;
+        next unless ($other->{'ontap-portal'} // '') eq $portal;
+        next unless sanitize_for_ontap($other_id, 32) eq $prefix;
+
+        my $msg =
+            "storage '$storeid' would share the ONTAP volume namespace 'pve_${prefix}_*' "
+          . "with existing storage '$other_id' (same portal '$portal', same SVM '$svm').\n"
+          . "  ONTAP volume names are pve_{storage}_{vmid}_disk{N} with the storage ID "
+          . "sanitized and truncated to 32 characters, so these two IDs are "
+          . "indistinguishable on ONTAP.\n"
+          . "  Both storages would address the SAME FlexVols: one would list the "
+          . "other's disks, and deleting a disk on one would DESTROY the other's "
+          . "volume.\n"
+          . "  Use a storage ID whose first 32 sanitized characters differ, or a "
+          . "different SVM.\n";
+
+        die $msg if !$noerr;
+        warn "WARNING: $msg";
+        return 0;
+    }
+
+    return 1;
+}
+
+# Called by PVE before a new storage is written to the config (locked context).
+sub on_add_hook {
+    my ($class, $storeid, $scfg, %param) = @_;
+
+    _assert_unique_ontap_namespace($storeid, $scfg);
+
+    return undef;
 }
 
 # Get igroup name for current node
@@ -774,6 +874,11 @@ sub activate_storage {
     # Ensure igroup exists (common for both protocols)
     _ensure_igroup($scfg, $api);
 
+    # Namespace-collision check for configs created before on_add_hook existed.
+    # Warn only -- refusing to activate an existing storage would take running
+    # guests offline, which is worse than the collision it reports.
+    eval { _assert_unique_ontap_namespace($storeid, $scfg, 1); };
+
     return 1;
 }
 
@@ -826,8 +931,13 @@ sub deactivate_storage {
     }
 
     # Step 3: Get all volumes for this storage and cleanup their devices
-    my $san_storeid = $storeid;
-    $san_storeid =~ s/-/_/g;
+    # MUST use sanitize_for_ontap(), the same function encode_volume_name() uses
+    # to build the real volume names. A naive s/-/_/g diverges from it for any
+    # storage ID containing a dot (PVE allows [a-z][a-z0-9\-\_\.]*[a-z0-9]) or
+    # longer than 32 chars, because sanitize_for_ontap also strips non-word
+    # characters and truncates. A divergent prefix makes this query match NOTHING,
+    # which is dangerous here: an empty result reads as "nothing exists".
+    my $san_storeid = sanitize_for_ontap($storeid, 32);
     my $prefix = "pve_${san_storeid}_*";
     my $volumes = eval { $api->volume_list($prefix); } // [];
 
@@ -1134,8 +1244,13 @@ sub _cleanup_orphaned_devices {
     my ($api, $storeid) = @_;
 
     # Phase 1: Query ONTAP for currently alive pve_* LUNs in this storage
-    my $san_storage = $storeid;
-    $san_storage =~ s/-/_/g;
+    # MUST use sanitize_for_ontap() -- see the note in deactivate_storage().
+    # This one is load-bearing for DATA AVAILABILITY: a prefix that does not match
+    # the real volume names yields an EMPTY alive set, so every tracked WWID looks
+    # like a deleted LUN. The path-health gate still protects devices with active
+    # paths, but a device whose paths are all momentarily down (controller
+    # failover, fabric blip) would then be torn down even though its LUN is alive.
+    my $san_storage = sanitize_for_ontap($storeid, 32);
     my $luns = eval { $api->lun_list("/vol/pve_${san_storage}_*/lun0"); };
     if ($@ || !defined $luns) {
         # API error - abort to avoid false positives
@@ -1607,6 +1722,88 @@ sub _check_aggregate_capacity {
 #  (a) total LIF count < 2 (single point of failure)
 #  (b) all LIFs have the same home_node (single controller failure)
 # Cooldown: 24 hours per storage (config-related, rarely changes).
+# Detect a SECOND Proxmox VE cluster using the same ONTAP volume namespace.
+#
+# Volume names are pve_{storage}_{vmid}_disk{N} -- there is NO cluster component.
+# 'ontap-cluster-name' only ever appears in IGROUP names. So two PVE clusters that
+# each have a storage called e.g. 'netapp1' pointing at the same SVM share the
+# namespace pve_netapp1_* completely.
+#
+# The dangerous consequence is not allocation (alloc_image checks existence and
+# picks the next free disk ID) but VISIBILITY: list_images() returns the other
+# cluster's volumes as if they belonged here, so they appear in the storage
+# content view and in `qm rescan` as unused disks -- and deleting one from there
+# destroys a live disk of the other cluster.
+#
+# Detection is cheap and specific: this plugin maps every LUN it owns to igroups
+# named pve_{our-cluster}_*. A pve_{storage}_* LUN mapped to an igroup with a
+# DIFFERENT pve_* cluster prefix is therefore owned by another PVE cluster.
+#
+# Warn only, never refuse: the storages are already in service, and refusing to
+# activate would take running guests offline over a reporting problem.
+sub _check_foreign_cluster_namespace {
+    my ($api, $storeid, $scfg) = @_;
+
+    my $dir = _health_state_dir();
+    my $flag = "$dir/$storeid-foreign-cluster-warn";
+    my $last = (stat($flag))[9] // 0;
+    return if (time() - $last) < 86400;    # 24h cooldown
+
+    # Stamp the cooldown BEFORE doing any work and regardless of the outcome.
+    # If it were only written when a problem is found, a healthy single-cluster
+    # setup would re-run this on every ~10s status() poll -- the v0.2.21 N+1 REST
+    # storm all over again.
+    if (open(my $fh, '>', $flag)) { close($fh); }
+
+    my $our_prefix = 'pve_' . sanitize_for_ontap($scfg->{'ontap-cluster-name'} // 'pve', 32) . '_';
+    my $prefix = sanitize_for_ontap($storeid, 32);
+
+    # ONE paginated call that already carries the igroup names.
+    my $luns = eval { $api->lun_list_with_maps("/vol/pve_${prefix}_*/lun0"); };
+    return if $@ || !$luns || !@$luns;
+
+    my %foreign;
+    for my $lun (@$luns) {
+        for my $map (@{ $lun->{lun_maps} // [] }) {
+            my $ig = $map->{igroup} && $map->{igroup}{name};
+            next unless defined $ig;
+            # Only igroups following this plugin's own scheme are meaningful; a
+            # customer's hand-made igroup says nothing about PVE cluster ownership.
+            next unless $ig =~ /^pve_/;
+            # Compare by PREFIX rather than parsing the cluster name out of the
+            # igroup: 'pve_{cluster}_{node}' is ambiguous once the cluster name
+            # itself contains '_' (or '-', which sanitizes to '_'), and a wrong
+            # parse here would be a false accusation of namespace sharing.
+            next if index($ig, $our_prefix) == 0;
+            $foreign{$ig}++;
+        }
+    }
+    return unless %foreign;
+
+    my $msg = sprintf(
+        "WARNING: Storage '%s' appears to share its ONTAP volume namespace "
+      . "'pve_%s_*' with ANOTHER Proxmox VE cluster. LUNs in this namespace are "
+      . "mapped to igroup(s) %s, which do not belong to this cluster (expected the "
+      . "prefix '%s'). Volume names carry NO cluster identifier -- 'ontap-cluster-name' "
+      . "only appears in igroup names -- so this storage's image list includes the "
+      . "other cluster's disks. They appear in the storage content view and in "
+      . "'qm rescan' as unused disks, and DELETING ONE THERE WOULD DESTROY A LIVE "
+      . "DISK OF THE OTHER CLUSTER. Give each cluster its own SVM, or storage IDs "
+      . "that differ within their first 32 sanitized characters.",
+        $storeid, $prefix,
+        join(', ', map { "'$_'" } sort keys %foreign),
+        $our_prefix);
+
+    warn "$msg\n";
+    eval {
+        require Sys::Syslog;
+        my $formatted = sprintf("%s", $msg);
+        Sys::Syslog::openlog('pve-storage-netapp', 'pid', 'daemon');
+        Sys::Syslog::syslog('warning', "%s", $formatted);
+        Sys::Syslog::closelog();
+    };
+}
+
 sub _check_lif_redundancy {
     my ($api, $storeid, $scfg) = @_;
     my $proto = $scfg->{'ontap-protocol'} // 'iscsi';
@@ -1723,6 +1920,9 @@ sub status {
 
     # LIF redundancy check (24h cooldown, warns if < 2 iSCSI LIFs)
     eval { _check_lif_redundancy($status_api, $storeid, $scfg); };
+
+    # Another PVE cluster sharing this storage's ONTAP volume namespace (24h cooldown)
+    eval { _check_foreign_cluster_namespace($status_api, $storeid, $scfg); };
 
     return ($cache->{total}, $cache->{avail}, $cache->{used}, 1);
 }
@@ -1955,6 +2155,54 @@ sub alloc_image {
     return $pve_volname;
 }
 
+# Is the LUN doing I/O right now, as seen by ONTAP itself?
+#
+# Returns a short human-readable description of the observed activity, or 0 for
+# "no activity observed", or dies if it cannot tell. ONTAP's per-LUN counters are
+# CUMULATIVE, so a single reading is meaningless -- two samples are compared, and
+# the second is only taken once ONTAP's own statistics timestamp has advanced
+# (otherwise we would compare a sample against itself and always conclude "idle").
+sub _lun_has_active_io {
+    my ($api, $lun_path, %opts) = @_;
+
+    my $window = $opts{window} // 4;    # seconds to watch for
+    my $first = $api->lun_get_io_sample($lun_path);
+    die "this ONTAP did not report usable LUN statistics\n" if !$first;
+
+    my $deadline = time() + $window;
+    my $second;
+    while (time() < $deadline) {
+        select(undef, undef, undef, 0.5);
+        $second = $api->lun_get_io_sample($lun_path);
+        last if $second
+            && defined $second->{timestamp}
+            && defined $first->{timestamp}
+            && $second->{timestamp} ne $first->{timestamp};
+        $second = undef;
+    }
+
+    # ONTAP never refreshed its statistics inside the window -- we cannot
+    # distinguish "idle" from "stale", so say so rather than guess "idle".
+    die "ONTAP statistics did not refresh within ${window}s\n" if !$second;
+
+    my $d_ops   = ($second->{ops}   // 0) - ($first->{ops}   // 0);
+    my $d_bytes = ($second->{bytes} // 0) - ($first->{bytes} // 0);
+
+    # The verdict rests on BYTES TRANSFERRED, not the operation count.
+    #
+    # lun_get_io_sample() already excludes 'other' ops, but read/write op counts
+    # alone are still the weaker signal -- bytes are what unambiguously separate a
+    # guest touching the disk from housekeeping. Verified on real ONTAP: a genuinely
+    # idle LUN moved 0 bytes while a running dd moved ~20 MB in 10s.
+    #
+    # Counters can also reset (controller takeover, LUN remap), and a negative
+    # delta is not evidence of use.
+    return 0 if $d_bytes <= 0;
+
+    return sprintf("%d byte(s) transferred in %d read/write operation(s) over the last %ds",
+        $d_bytes, $d_ops > 0 ? $d_ops : 0, $window);
+}
+
 sub free_image {
     my ($class, $storeid, $scfg, $volname, $isBase, $format) = @_;
 
@@ -1965,15 +2213,60 @@ sub free_image {
     # Get LUN WWID for cleanup and in-use check
     my $wwid = eval { $api->lun_get_wwid($lun_path); };
 
-    # Safety check: Verify device is not in use before deletion
+    # Safety check: Verify device is not in use before deletion.
+    #
+    # is_device_in_use() covers THIS node thoroughly: mounts, swap, sysfs holders
+    # (LVM/dm-crypt/kpartx) and -- via fuser -- any process holding the block
+    # device open, which includes a running QEMU. What it cannot cover is the rest
+    # of the cluster: on shared SAN storage the guest may be running on another
+    # node, and on the node servicing a `pvesm free` the LUN may not even be
+    # mapped, in which case $device is undef and there is nothing local to check.
+    #
+    # That gap is reachable: DELETE /nodes/{node}/storage/{storage}/content/{volume}
+    # (the storage content view's Remove button, and `pvesm free`) does a
+    # permission check and then calls vdisk_free straight away -- no in-use test,
+    # no config-reference test. PVE only guards base volumes there
+    # (volume_is_base_and_used).
+    my $local_device_checked = 0;
     if ($wwid) {
         my $device = get_device_by_wwid($wwid);
         if ($device && -b $device) {
+            $local_device_checked = 1;
             if (is_device_in_use($device)) {
                 my $details = get_device_usage_details($device);
                 die "Cannot delete volume '$volname': device $device is still in use.\n\n" .
                     "$details\n";
             }
+        }
+    }
+
+    # Cross-node safety net: ask ONTAP whether the LUN is doing I/O right now.
+    #
+    # Only when the local check could not run -- if the device is mapped here, the
+    # host-side test above is authoritative and cheaper. This costs one short
+    # sampling window and only on the ambiguous path.
+    #
+    # This is deliberately ONE-DIRECTIONAL. Observed I/O proves the volume is in
+    # use somewhere and we refuse. The absence of I/O proves nothing (a running
+    # guest can be idle), so it never blocks a legitimate delete: a guest being
+    # destroyed is stopped, and `qm destroy` frees volumes while the config still
+    # references them, so a config-reference test would break destroy entirely.
+    if ($wwid && !$local_device_checked && ($scfg->{'ontap-inuse-io-check'} // 1)) {
+        my $busy = eval { _lun_has_active_io($api, $lun_path); };
+        if ($@) {
+            warn "Could not sample ONTAP I/O activity for '$volname' before deleting "
+               . "(continuing; the host-side check could not run either): $@";
+        } elsif ($busy) {
+            die "Cannot delete volume '$volname': ONTAP reports ACTIVE I/O on LUN "
+              . "'$lun_path' ($busy), so it is in use -- most likely by a guest "
+              . "running on another cluster node. This node has no local mapping "
+              . "for it, so the host-side in-use check could not see that.\n"
+              . "  Stop or migrate the guest that owns this disk, then retry. Note "
+              . "ONTAP's counters lag by up to one statistics interval, so a disk "
+              . "whose guest has JUST been stopped can still read as active for a few "
+              . "seconds -- simply retry. If you are certain the I/O is not a guest, "
+              . "disable this cross-node check with "
+              . "'pvesm set $storeid --ontap-inuse-io-check 0'.\n";
         }
     }
 
@@ -2032,7 +2325,25 @@ sub free_image {
     my $retry_delay = 2;
     my $deleted = 0;
 
+    # Wall-clock budget for the whole retry loop.
+    #
+    # free_image() runs inside PVE's cluster_lock_storage(), so every second spent
+    # here blocks alloc/free for this storage on EVERY node. One volume_delete can
+    # take up to ~240s on its own (60s HTTP x 2 retries + a 120s job wait), so five
+    # attempts could hold the cluster-wide lock for ~20 minutes. Bound the loop: a
+    # per-call timeout does not bound a loop's total time (the v0.2.12 lesson).
+    # Exceeding the budget fails with a clear message instead of holding the lock.
+    my $delete_deadline = time() + ($scfg->{'ontap-delete-deadline'} // 300);
+
     for my $attempt (1 .. $max_retries) {
+        if ($attempt > 1 && time() >= $delete_deadline) {
+            die "Failed to delete volume '$ontap_volname': gave up after "
+              . ($scfg->{'ontap-delete-deadline'} // 300) . "s and $attempt attempt(s). "
+              . "ONTAP kept reporting a clone dependency. free_image() holds the "
+              . "cluster-wide storage lock, so it must not retry indefinitely. "
+              . "Check 'volume clone show' and 'volume recovery-queue show' for "
+              . "'$ontap_volname' on the SVM, then retry the delete.\n";
+        }
         eval { $api->volume_delete($ontap_volname); };
         if (!$@) {
             $deleted = 1;
@@ -2122,8 +2433,11 @@ sub list_images {
 
     # Build filter pattern
     my $filter = 'pve_*';
-    my $san_storage = $storeid;
-    $san_storage =~ s/-/_/g;
+    # MUST use sanitize_for_ontap() -- see the note in deactivate_storage().
+    # A divergent prefix makes list_images() return an empty list, i.e. "this
+    # storage has no disks", which hides real volumes from the UI and from
+    # callers such as find_free_diskname()/clone_image().
+    my $san_storage = sanitize_for_ontap($storeid, 32);
     if ($vmid) {
         $filter = "pve_${san_storage}_${vmid}_*";
     }
@@ -2875,8 +3189,24 @@ sub volume_snapshot {
     # Safety check: Verify snapshot doesn't already exist
     my $existing_snap = $api->snapshot_get($ontap_volname, $ontap_snapname);
     if ($existing_snap) {
-        die "Snapshot '$snap' already exists on volume '$volname'. " .
-            "Please use a different snapshot name or delete the existing snapshot first.";
+        # ONTAP snapshot names are sanitized, and '-' becomes '_'. PVE allows both
+        # ([a-z][a-z0-9_-]+), so 'my-snap' and 'my_snap' are distinct in PVE but
+        # BOTH become 'pve_snap_my_snap' on ONTAP. Without this hint the operator
+        # sees "already exists" for a name Proxmox VE shows as free, which is
+        # baffling. (Creation failing is the safe outcome -- it stops two PVE
+        # snapshots from silently becoming one ONTAP snapshot.)
+        my $hint = '';
+        if ($snap =~ /-/) {
+            (my $alt = $snap) =~ s/-/_/g;
+            $hint = " Note: on ONTAP '-' is converted to '_', so '$snap' and '$alt'"
+                  . " map to the same ONTAP snapshot name '$ontap_snapname'."
+                  . " If Proxmox VE does not list '$snap', an existing snapshot named"
+                  . " '$alt' (or another variant differing only in '-' vs '_') already"
+                  . " occupies it.";
+        }
+        die "Snapshot '$snap' already exists on volume '$volname' "
+          . "(ONTAP name '$ontap_snapname').$hint "
+          . "Please use a different snapshot name or delete the existing snapshot first.\n";
     }
 
     # Best-effort flush of host-side buffers before taking the storage-level
@@ -3111,7 +3441,21 @@ sub _release_recovery_queue_clone_holds {
         my $name = $child->{flexclone} // next;
 
         # (2) Live volumes are never purged -- the caller reports them instead.
-        if (eval { $api->volume_get($name); }) {
+        #
+        # Distinguish "confirmed absent" (volume_get returned undef) from "could
+        # not tell" (volume_get died: network blip, auth, ONTAP busy). A naive
+        # `if (eval { ... })` treats BOTH as absent, which would let a transient
+        # API error advance a live volume toward purging. This is the v0.2.16
+        # lesson ("distinguish confirmed-not-found from transient error when
+        # deciding to skip cleanup") applied to a destructive operation, so it
+        # matters more here, not less.
+        my $live_vol = eval { $api->volume_get($name); };
+        if ($@) {
+            push @refused, "$name (could not verify whether it is still a live "
+                         . "volume: $@)";
+            next;
+        }
+        if ($live_vol) {
             push @live, $name;
             next;
         }
@@ -3295,12 +3639,18 @@ sub volume_snapshot_rollback {
     my $ontap_snapname = encode_snapshot_name($snap);
     my $lun_path = encode_lun_path($ontap_volname);
 
-    # Quiesce device before rollback to prevent data corruption
+    # Quiesce device before rollback to prevent data corruption.
+    #
+    # Rollback is MORE destructive than delete: it silently overwrites the whole
+    # volume with older content, so a mistake here is not even visible as a
+    # missing disk. It gets the same treatment as free_image().
     my $wwid = eval { $api->lun_get_wwid($lun_path); };
     my $device;
+    my $local_device_checked = 0;
     if ($wwid) {
         $device = get_device_by_wwid($wwid);
         if ($device && -b $device) {
+            $local_device_checked = 1;
             if (is_device_in_use($device)) {
                 die "Cannot rollback snapshot: device $device is still in use. " .
                     "Please stop the VM first.";
@@ -3309,6 +3659,31 @@ sub volume_snapshot_rollback {
             warn "sync timed out: $@" if $@;
             eval { run_command(['/sbin/blockdev', '--flushbufs', $device], timeout => 10); };
             warn "blockdev --flushbufs timed out for $device: $@" if $@;
+        }
+    }
+
+    # Cross-node safety net, identical in shape to free_image()'s: only when the
+    # host-side check could not run, and one-directional (observed I/O refuses,
+    # idle never blocks). PVE routes a rollback to the guest's owning node and
+    # stops the guest first, so this mainly catches the case where the same volid
+    # was attached to a guest on another node -- which PVE permits and does not
+    # guard, and where the overwrite would be silent.
+    if ($wwid && !$local_device_checked && ($scfg->{'ontap-inuse-io-check'} // 1)) {
+        my $busy = eval { _lun_has_active_io($api, $lun_path); };
+        if ($@) {
+            warn "Could not sample ONTAP I/O activity for '$volname' before rolling "
+               . "back (continuing; the host-side check could not run either): $@";
+        } elsif ($busy) {
+            die "Cannot rollback snapshot '$snap' of '$volname': ONTAP reports ACTIVE "
+              . "I/O on LUN '$lun_path' ($busy), so it is in use -- most likely by a "
+              . "guest running on another cluster node. This node has no local mapping "
+              . "for it, so the host-side in-use check could not see that. A rollback "
+              . "would OVERWRITE whatever that guest is currently using.\n"
+              . "  Stop or migrate the guest that owns this disk, then retry. ONTAP's "
+              . "counters lag by up to one statistics interval, so a guest that was "
+              . "JUST stopped can still read as active for a few seconds -- simply "
+              . "retry. To disable this cross-node check: "
+              . "'pvesm set $storeid --ontap-inuse-io-check 0'.\n";
         }
     }
 

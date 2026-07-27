@@ -142,7 +142,7 @@
     <div class="hero__glow"></div>
     <div class="hero__glow-left"></div>
     <div class="hero__content">
-        <div class="hero__badge">v0.2.23 <span class="hero__badge-sep"></span> MIT License</div>
+        <div class="hero__badge">v0.2.24 <span class="hero__badge-sep"></span> MIT License</div>
         <h1 class="hero__title">jt-pve-storage-netapp</h1>
         <p class="hero__project-desc">
             <span class="lang-en">NetApp ONTAP SAN/iSCSI/FC Storage Plugin for Proxmox VE</span>
@@ -522,7 +522,7 @@
                 <span class="lang-en">Install the plugin package</span>
                 <span class="lang-zh">安裝 plugin 套件</span>
             </div>
-            <pre><span class="cmd">dpkg</span> <span class="flag">-i</span> jt-pve-storage-netapp_0.2.23-1_all.deb</pre>
+            <pre><span class="cmd">dpkg</span> <span class="flag">-i</span> jt-pve-storage-netapp_0.2.24-1_all.deb</pre>
             <p>
                 <span class="lang-en">The plugin automatically configures multipath and reloads Proxmox VE services (pvedaemon, pvestatd, pveproxy).</span>
                 <span class="lang-zh">Plugin 會自動設定 multipath 並重新載入 Proxmox VE 服務（pvedaemon、pvestatd、pveproxy）。</span>
@@ -596,7 +596,7 @@
                 <span class="lang-en">Install new package</span>
                 <span class="lang-zh">安裝新套件</span>
             </div>
-            <pre><span class="cmd">dpkg</span> <span class="flag">-i</span> jt-pve-storage-netapp_0.2.23-1_all.deb</pre>
+            <pre><span class="cmd">dpkg</span> <span class="flag">-i</span> jt-pve-storage-netapp_0.2.24-1_all.deb</pre>
         </div>
     </div>
     <div class="step">
@@ -1436,6 +1436,15 @@
         <span class="lang-en">Version history. For full details see <a href="https://github.com/jasoncheng7115/jt-pve-storage-netapp/blob/main/CHANGELOG.md">CHANGELOG.md</a>.</span>
         <span class="lang-zh">版本紀錄。完整內容請參閱 <a href="https://github.com/jasoncheng7115/jt-pve-storage-netapp/blob/main/CHANGELOG_zh-TW.md">CHANGELOG_zh-TW.md</a>。</span>
     </p>
+
+    <div class="changelog-entry">
+        <div class="changelog-version">v0.2.24 <span class="changelog-tag changelog-tag--fix">Fix</span></div>
+        <div class="changelog-date">2026-07-27</div>
+        <div class="changelog-summary">
+            <span class="lang-en">Data-safety audit of every destructive path (delete, overwrite, disconnect, deadlock). <strong>Two storages could silently share one ONTAP volume namespace:</strong> volume names are <code>pve_{storage}_{vmid}_disk{N}</code> and the storage ID is truncated to 32 characters, so two long IDs sharing a prefix address the same FlexVols on one SVM — <code>free_image()</code> on one would destroy the other's volume. A new <code>on_add_hook()</code> refuses to create such a collision. <strong>A second Proxmox VE cluster can share the namespace unnoticed:</strong> volume names carry no cluster identifier (<code>ontap-cluster-name</code> only appears in igroup names), so two clusters with a same-named storage on one SVM see each other's disks as deletable unused disks; this is now detected from igroup ownership and warned about. <strong>Cross-node in-use detection before delete and rollback:</strong> the host-side check is node-local, and on the node servicing a <code>pvesm free</code> the LUN may not be mapped at all, so nothing was checked — Proxmox VE guards only base volumes there. The plugin now asks ONTAP whether the LUN is transferring data, one-directionally (observed I/O refuses; idle never blocks, so <code>qm destroy</code> still works). Rollback gets the same guard because it silently overwrites rather than removes. <strong>Also:</strong> query prefixes now use the same sanitizer that generates the real names (a divergent prefix emptied the orphan reaper's alive set, risking teardown of live devices); the delete retry loop is wall-clock bounded so it cannot hold the cluster-wide storage lock for ~20 minutes; the recovery-queue check now fails closed on an API error; and snapshot names differing only in "-" vs "_" now produce an explanatory error. New options <code>ontap-inuse-io-check</code> and <code>ontap-delete-deadline</code>.</span>
+            <span class="lang-zh">針對每一條破壞性路徑的資料安全稽核（刪除、覆寫、斷線、死鎖）。<strong>兩個 storage 可能無聲共用同一個 ONTAP volume 命名空間：</strong>volume 名稱為 <code>pve_{storage}_{vmid}_disk{N}</code>，而 storage ID 會被截斷到 32 字元，因此兩個共用前綴的長 ID 在同一個 SVM 上會定址到同一批 FlexVol——其中一個的 <code>free_image()</code> 會摧毀另一個的 volume。新增的 <code>on_add_hook()</code> 會拒絕建立這種碰撞。<strong>第二個 Proxmox VE 叢集可能在無人察覺下共用命名空間：</strong>volume 名稱不含任何叢集識別碼（<code>ontap-cluster-name</code> 只出現在 igroup 名稱），因此兩個叢集若有同名 storage 指向同一個 SVM，會把對方的磁碟看成可刪除的未使用磁碟；現在會從 igroup 歸屬偵測並警告。<strong>刪除與倒回前的跨節點使用中偵測：</strong>主機端檢查僅限本節點，而在處理 <code>pvesm free</code> 的節點上該 LUN 可能根本沒有對應過去，於是完全沒有檢查——Proxmox VE 在該處也僅保護 base volume。外掛現在會詢問 ONTAP 該 LUN 是否正在傳輸資料，且為單向判定（偵測到 I/O 才拒絕；閒置永不阻擋，因此 <code>qm destroy</code> 仍可正常運作）。倒回套用同一守門，因為它是無聲覆寫而非移除。<strong>另外：</strong>查詢前綴改用與產生真實名稱相同的衛生化函式（前綴分岔會讓殘留清理的 alive set 變空，有拆掉線上裝置的風險）；刪除重試迴圈加上總時間上限，避免佔住叢集儲存鎖約 20 分鐘；recovery queue 檢查在 API 錯誤時改為 fail closed；只差 "-" 與 "_" 的快照名稱現在會給出解釋性錯誤訊息。新增選項 <code>ontap-inuse-io-check</code> 與 <code>ontap-delete-deadline</code>。</span>
+        </div>
+    </div>
 
     <div class="changelog-entry">
         <div class="changelog-version">v0.2.23 <span class="changelog-tag changelog-tag--fix">Fix</span></div>

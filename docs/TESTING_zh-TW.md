@@ -2191,6 +2191,136 @@ qm destroy $VMID --purge
 
 ---
 
+## 32. 資料安全稽核修正（v0.2.24）
+
+針對破壞性路徑的刪除／覆寫／斷線／死鎖檢視。
+
+### 32.1 單元與靜態涵蓋（不需 ONTAP，核心）
+
+```bash
+perl -Ilib tests/audit_fixes.t
+# 預期：135/135 PASS。v0.2.24 新增的部分涵蓋：
+#  - ONTAP 命名空間推導單一來源（含帶點與超過 32 字元的 storage ID）
+#  - 靜態守則確保簡化版 s/-/_/g 不會回來
+#  - on_add_hook 命名空間碰撞守門在 portal／SVM／前綴各種組合下的行為
+#  - 跨節點 I/O 檢查：使用中／閒置／計數器重置／無統計／統計未更新
+#  - free_image 的刪除總時間預算與選項註冊
+#  - recovery queue purge 在 API 錯誤時 fail closed
+```
+
+### 32.2 命名空間碰撞守門（核心）
+
+```bash
+# 兩個 storage ID 若前 32 個衛生化字元相同、且在同一個 SVM 上，
+# 會指向同一批 FlexVol。新增第二個必須被拒絕。
+pvesm add netappontap netapp-production-cluster-alpha-one \
+    --ontap-portal <ip> --ontap-svm svm1 --ontap-aggregate aggr1 \
+    --ontap-username admin --ontap-password <pw> --content images
+pvesm add netappontap netapp-production-cluster-alpha-two \
+    --ontap-portal <ip> --ontap-svm svm1 --ontap-aggregate aggr1 \
+    --ontap-username admin --ontap-password <pw> --content images
+# 預期：**第二個**指令失敗，訊息為
+#   "would share the ONTAP volume namespace 'pve_netapp_production_cluster_alpha__*'
+#    with existing storage 'netapp-production-cluster-alpha-one'"
+#   並說明在其中一個上刪除磁碟會 DESTROY 另一個的 volume。
+# 預期：相同前綴但**不同** SVM 或 portal 會被接受。
+pvesm remove netapp-production-cluster-alpha-one
+```
+
+### 32.3 對真實 ONTAP 驗證跨節點使用中守門（需要 ONTAP）
+
+驗證守門會對真實活動觸發，而且同樣重要的是：對「閒置但已對應」的 LUN**不會**觸發 —— 該情況下 `multipathd` 的 TEST UNIT READY 檢查器會持續運作。
+
+```bash
+perl -Ilib -e '
+use PVE::Storage::Custom::NetAppONTAPPlugin;
+use PVE::Storage::Custom::NetAppONTAP::Multipath qw(get_device_by_wwid);
+my $P="PVE::Storage::Custom::NetAppONTAPPlugin"; my $S="netapp1";
+my $scfg = PVE::Storage::config()->{ids}{$S};
+my $api  = PVE::Storage::Custom::NetAppONTAPPlugin::_get_api($scfg);
+my $has_io = \&PVE::Storage::Custom::NetAppONTAPPlugin::_lun_has_active_io;
+my $vol = $P->alloc_image($S,$scfg,999031,"raw",undef,1048576);
+my $ov  = PVE::Storage::Custom::NetAppONTAPPlugin::pve_volname_to_ontap($S,$vol);
+my $lp  = PVE::Storage::Custom::NetAppONTAPPlugin::encode_lun_path($ov);
+$P->activate_volume($S,$scfg,$vol,undef,{});
+my $dev = get_device_by_wwid($api->lun_get_wwid($lp));
+print "idle: ", ($has_io->($api,$lp,window=>8) || "not flagged"), "\n";
+system("dd if=/dev/zero of=$dev bs=1M count=600 oflag=direct status=none &");
+sleep 3;
+print "busy: ", ($has_io->($api,$lp,window=>10) || "NOT FLAGGED - guard inert!"), "\n";
+'
+# 預期：
+#   idle: not flagged            <- 儘管 multipathd 有 TUR，仍必須不被標記
+#   busy: N byte(s) transferred in M read/write operation(s) over the last 10s
+# 模擬器實測：閒置 = 0 bytes（3/3 次取樣），忙碌 = 10 秒約 41 MB。
+# I/O 停止後，守門會在大約一個統計週期內恢復（實測約 10 秒）；
+# 在該視窗內嘗試刪除會被拒絕，重試即可成功。此尾隨視窗屬預期行為並已記錄於文件。
+```
+
+### 32.4 靜態 regression 守則
+
+```bash
+P=lib/PVE/Storage/Custom/NetAppONTAPPlugin.pm
+# 簡化版 sanitizer 不可回來
+grep -v '^\s*#' $P | grep -c 's/-/_/g'                                  # 預期：0
+# 所有查詢前綴都使用權威函式
+grep -cF 'sanitize_for_ontap($storeid, 32)' $P                          # >= 3
+# 命名空間守門與刪除預算必須存在
+grep -c '^sub _assert_unique_ontap_namespace' $P                        # 預期：1
+grep -c '^sub on_add_hook' $P                                           # 預期：1
+grep -cF 'delete_deadline' $P                                           # >= 2
+# I/O 檢查只能在本機檢查無法執行時才跑
+grep -c '!$local_device_checked' $P                                     # 預期：1
+# I/O 取樣必須持續排除 other 類操作（multipathd TUR）
+grep -A3 'ops   =>' lib/PVE/Storage/Custom/NetAppONTAP/API.pm | grep -c 'other'  # 預期：0
+```
+
+### 32.5 倒回跨節點守門、快照名稱碰撞、外部叢集（核心）
+
+```bash
+# 倒回套用與 free_image 相同的單向 ONTAP I/O 守門，因為倒回是無聲地**覆寫** volume，
+# 而不是移除它。
+grep -c '_lun_has_active_io' lib/PVE/Storage/Custom/NetAppONTAPPlugin.pm   # >= 3
+sed -n '/^sub volume_snapshot_rollback/,/snapshot_rollback(/p' \
+    lib/PVE/Storage/Custom/NetAppONTAPPlugin.pm | grep -c '_lun_has_active_io'   # 預期：1
+
+# 只差 '-' 與 '_' 的快照名稱會對應到同一個 ONTAP 快照。
+perl -Ilib -e 'use PVE::Storage::Custom::NetAppONTAP::Naming qw(encode_snapshot_name);
+print encode_snapshot_name("my-snap") eq encode_snapshot_name("my_snap") ? "COLLIDE\n" : "distinct\n";'
+# 預期：COLLIDE —— 建立第二個會被拒絕（安全），且錯誤訊息現在必須說明
+# '-' -> '_' 的對應關係，而不是只說「已存在」。
+
+# 第二個 PVE 叢集共用命名空間，可從 igroup 歸屬偵測出來。
+grep -c '^sub _check_foreign_cluster_namespace' lib/PVE/Storage/Custom/NetAppONTAPPlugin.pm  # 1
+# 必須使用單一次分頁呼叫，絕不可對每顆 LUN 查詢（v0.2.21 的 N+1 教訓）：
+sed -n '/^sub _check_foreign_cluster_namespace/,/^}/p' \
+    lib/PVE/Storage/Custom/NetAppONTAPPlugin.pm | grep -c 'lun_list_with_maps'   # 預期：1
+sed -n '/^sub _check_foreign_cluster_namespace/,/^}/p' \
+    lib/PVE/Storage/Custom/NetAppONTAPPlugin.pm | grep -c -- '->lun_get('        # 預期：0
+```
+
+### 32.6 對真實 ONTAP 驗證單次 LUN／igroup 查詢（需要 ONTAP）
+
+外部叢集檢查仰賴 `lun_maps.igroup.name` 能在集合 GET 中取得。請實際驗證，不要假設：
+
+```bash
+perl -Ilib -MPVE::Storage -e '
+my $P="PVE::Storage::Custom::NetAppONTAPPlugin"; my $S="netapp1";
+my $scfg = PVE::Storage::config()->{ids}{$S};
+my $api  = PVE::Storage::Custom::NetAppONTAPPlugin::_get_api($scfg);
+my $vol  = $P->alloc_image($S,$scfg,999040,"raw",undef,1048576);
+my $r = $api->lun_list_with_maps("/vol/pve_${S}_*/lun0");
+for my $l (@$r) { print $l->{name}, " -> ",
+  join(", ", map { $_->{igroup}{name} } @{$l->{lun_maps}//[]}), "\n" }
+$P->free_image($S,$scfg,$vol,0,"raw");'
+# 預期：一行列出該 LUN 及其對應到的每一個 igroup，例如
+#   /vol/pve_netapp1_999040_disk0/lun0 -> pve_pve_pc_pve1, pve_pve_pc_pve2, pve_pve_pc_pve3
+# 所有 igroup 都必須以本叢集自身的 'pve_{cluster}_' 前綴開頭，
+# 因此在單一叢集的安裝環境中，外部叢集檢查會保持靜默。
+```
+
+---
+
 ## 清除
 
 ```bash

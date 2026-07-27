@@ -275,6 +275,41 @@ netappontap: <storage-id>
 - 進行中的 login 絕不中斷，且在尚未有任何路徑時絕不跳過(必須取得至少一條路徑，否則誠實失敗)——所以不會把「慢但連得到」的儲存誤判成 inactive。
 - 被跳過的 portal 會在下次 activation 補上；multipath 備援會自我修復。
 
+### ontap-inuse-io-check
+
+**類型：** boolean
+**預設：** 1（啟用）
+**說明：** 在刪除一個「裝置**未**對應到本節點」的 volume 之前，先詢問 ONTAP 該 LUN 是否正在傳輸資料，若是則拒絕刪除。
+
+```bash
+--ontap-inuse-io-check 1   # 預設
+--ontap-inuse-io-check 0   # 關閉跨節點檢查
+```
+
+**為什麼需要：** 主機端的使用中檢查（掛載、swap、sysfs holders，以及透過 `fuser` 偵測開啟中的檔案描述子）只涵蓋它執行的那一個節點。在共享 SAN 上，正在使用該 LUN 的 guest 可能跑在**別的**節點；而在處理 `pvesm free` 的那個節點上，該 LUN 可能根本沒有對應過去 —— 因此本機沒有任何東西可檢查。這條路徑原本毫無防護：`DELETE /nodes/{node}/storage/{storage}/content/{volume}`，也就是儲存內容檢視中的 **Remove** 按鈕與 `pvesm free`，只做權限檢查就直接刪除。Proxmox VE 本身在該處僅保護 base volume。
+
+**注意事項：**
+- 此檢查是**單向的**：偵測到 I/O 才拒絕刪除；沒有 I/O 永遠不會阻擋刪除。閒置的 guest 不會產生 I/O，因此它不可能變成誤擋 —— 更重要的是它不會弄壞 `qm destroy`，因為 `qm destroy` 是在 guest 設定「仍然參照著這些磁碟」的情況下釋放 volume 的。
+- 判定依據是**傳輸的位元組數**，而非操作次數。`multipathd` 會對每一個已對應的 LUN 持續發出 TEST UNIT READY，那不會搬移任何資料，但若以操作次數計算，閒置的 LUN 會看起來很忙碌。
+- ONTAP 的計數器最多會落後一個統計週期，因此**剛剛**才被停止的 guest 其磁碟仍可能被判定為使用中數秒。重試即可。
+- 它只花費數秒，而且只在上述有疑慮的路徑上執行 —— 若裝置有對應到本節點，則以主機端檢查為準。
+
+### ontap-delete-deadline
+
+**類型：** integer（60～1800）
+**預設：** 300
+**說明：** `free_image` 中 volume 刪除重試迴圈的總時間預算（秒）。
+
+```bash
+--ontap-delete-deadline 300   # 預設
+--ontap-delete-deadline 600   # ONTAP 刪除 volume 確實較慢時
+```
+
+**注意事項：**
+- `free_image` 執行在 Proxmox VE 的**叢集層級**儲存鎖之內，因此在這裡花掉的時間會阻擋**每一個**節點對該 storage 的配置／釋放操作。
+- 單一次 ONTAP volume 刪除本身最久可達約 240 秒（60 秒 HTTP × 2 次重試，加上 120 秒的 job 等待），所以五次重試可能讓該鎖被持有約 20 分鐘。
+- 超出預算時會以明確訊息失敗，並指向 `volume clone show` 與 `volume recovery-queue show`，而不是繼續佔住鎖。
+
 ### ontap-purge-recovery-queue
 
 **類型：** boolean

@@ -2,6 +2,68 @@
 
 NetApp ONTAP Storage Plugin for Proxmox VE 的所有重要變更都記錄在此。
 
+## [0.2.24] - 2026-07-27
+
+### 資料安全稽核：刪除、覆寫、斷線與死鎖檢視
+
+**狀態：已準備，尚未發佈。** 測試：`make test` 6/6、podchecker OK、單元 **194/194**、對真實 ONTAP 模擬器的功能測試 **53/53**，另加上新的跨節點 I/O 守門與新的單次 LUN／igroup 查詢在真實 ONTAP 上的驗證。
+
+接續 v0.2.23 的相容性稽核，針對每一條破壞性路徑所做的重點檢視。修正 8 項問題；確認無虞的部分記錄在最後，以免日後重複調查。
+
+#### 資料遺失：兩個 storage 可能無聲地共用同一個 ONTAP volume 命名空間
+
+ONTAP volume 名稱為 `pve_{storage}_{vmid}_disk{N}`，其中 storage ID 會經過 `sanitize_for_ontap()`，而該函式會**截斷到 32 個字元**。因此兩個不同的 Proxmox VE storage ID 可能產生相同前綴：`netapp-production-cluster-alpha-one` 與 `netapp-production-cluster-alpha-two` 都會變成 `netapp_production_cluster_alpha_`。
+
+若這兩個 storage 又指向同一個 SVM，它們定址的就是同一批 FlexVol：其中一個的 `list_images()` 會列出另一個的磁碟，而**其中一個的 `free_image()` 會摧毀另一個的 volume**。
+
+- **修正：**命名規則不能更動（否則既有客戶的每一個 volume 都要改名），因此改為**阻止碰撞成立**。新增的 `on_add_hook()` 會拒絕建立「(portal、SVM、32 字元衛生化前綴) 與既有 `netappontap` storage 相同」的 storage，並指名衝突對象與後果。相同前綴但位於不同 SVM 或 portal 屬於不同命名空間，仍然允許。早於此檢查的既有設定只會在 `activate_storage` 時警告而不拒絕——拒絕啟用一個已在服務中的 storage 會讓執行中的 guest 掉線。
+
+#### 某些 storage ID 會讓殘留清理拆掉活著的裝置
+
+`list_images()`、`_cleanup_orphaned_devices()` 與 `deactivate_storage()` 以簡化的 `s/-/_/g` 建立 ONTAP 查詢前綴，這與 `sanitize_for_ontap()` 在「storage ID 含句點」（Proxmox VE 允許 `[a-z][a-z0-9\-\_\.]*[a-z0-9]`）或「超過 32 字元」時會分岔。
+
+前綴對不上任何東西，在殘留清理中特別危險：alive set 會是**空的**，於是每一個被追蹤的 WWID 看起來都像已被刪除的 LUN。v0.2.17 的路徑健康閘門仍會保護「還有 active path」的裝置，但若某裝置的路徑此刻恰好全部中斷（控制器接管、網路瞬斷），即使其 LUN 還活著也會被拆掉。`list_images()` 也會回報「這個 storage 沒有任何磁碟」。
+
+- **修正：**三處均改用 `sanitize_for_ontap($storeid, 32)`，即產生真實 volume 名稱的同一個函式。
+
+#### 刪除與倒回前的跨節點使用中偵測
+
+`is_device_in_use()` 很完整，但只涵蓋**本節點**：掛載、swap、sysfs holders，以及透過 `fuser` 偵測任何持有該區塊裝置的程序——其中包含執行中的 QEMU。（CLAUDE.md 中 v0.2.17 那段聲稱它看不到 QEMU 的註解是**錯的**，已更正；它讓這次稽核走了一段冤枉路。）
+
+它無法涵蓋的是叢集的其餘部分。在處理 `pvesm free` 的那個節點上，該 LUN 可能根本沒有對應過去，因此 `$device` 是 undef，**完全沒有檢查會執行**。這條路徑在 Proxmox VE 這一側同樣沒有防護：`DELETE /nodes/{node}/storage/{storage}/content/{volume}`——也就是儲存內容檢視中的 **Remove** 按鈕——只做權限檢查便呼叫 `vdisk_free`，且僅保護 base volume。
+
+- **修正：**`free_image()` 與 `volume_snapshot_rollback()` 現在會詢問 ONTAP 該 LUN 是否正在傳輸資料，但**只在本機檢查無法執行時**才問。新增選項 `ontap-inuse-io-check`（預設 1）。
+- 此檢查是**單向的**：偵測到 I/O 才拒絕操作；沒有 I/O 永遠不會阻擋。這個區別至關重要——`qm destroy` 是在 guest 設定**仍然參照**這些磁碟的情況下呼叫 `vdisk_free`，因此「被參照就拒絕」的檢查會把 destroy 整個弄壞。
+- 判定依據是**傳輸的位元組數，而非操作次數**：`multipathd` 會對每個已對應的 LUN 持續發出 TEST UNIT READY，那不搬移任何資料。初版以操作次數計算，結果把真正閒置的 LUN 判為使用中（實測：8 秒 1 次操作、0 位元組），那會拒絕幾乎所有跨節點刪除。修正後實測：閒置 = 0 位元組（3/3 次取樣）、執行中的 `dd` = 10 秒約 41 MB，I/O 停止後約 10 秒恢復。
+- 倒回也套用同一守門，因為它比刪除**更**具破壞性：它會無聲地以較舊的內容覆寫整個 volume，出錯時甚至不會表現為「磁碟不見了」。
+
+#### 第二個 Proxmox VE 叢集可能在無人察覺下共用命名空間
+
+Volume 名稱**不含任何叢集識別碼**——`ontap-cluster-name` 只出現在 igroup 名稱中。兩個叢集若各自有一個名為例如 `netapp1` 的 storage 指向同一個 SVM，就會完全共用 `pve_netapp1_*`。配置本身是安全的（存在性檢查會挑下一個空的 disk ID），但 `list_images()` 會把另一個叢集的 volume 當成本地的回報：它們會出現在儲存內容檢視與 `qm rescan` 的未使用磁碟中，而**在那裡刪除其中一個就會摧毀另一個叢集的線上磁碟**。
+
+- **修正：**`status()` 現在會警告（24 小時冷卻，同時寫入 syslog）：當此 storage 命名空間中的 LUN 被對應到「名稱不以本叢集自身 `pve_{cluster}_` 前綴開頭」的 igroup 時——那正是另一個 Proxmox VE 叢集擁有它們的證據。僅警告，絕不拒絕。
+- 實作為單一次分頁的 `lun_list_with_maps()` 呼叫。初版對每顆 LUN 迴圈呼叫 `lun_get()`，且只在發現問題時才蓋冷卻戳記，在健康的環境下會導致每次約 10 秒的 `status()` 輪詢都重跑一遍——等於重現 v0.2.21 的 N+1 REST 風暴。初版也從 igroup 名稱中解析叢集名稱，而一旦叢集名稱本身含有 `_`（或 `-`，其衛生化後成為 `_`）就會產生歧義；因此改用前綴比對。
+
+#### `free_image` 的刪除重試迴圈現在有總時間上限
+
+`free_image()` 執行在 Proxmox VE 的**叢集層級**儲存鎖之內，而單次 ONTAP volume 刪除最久可達約 240 秒（60 秒 HTTP × 2 次重試，加上 120 秒的 job 等待），因此五次重試可能讓該鎖被持有約 20 分鐘，並阻擋每個節點對此 storage 的配置／釋放。新增選項 `ontap-delete-deadline`（預設 300 秒）。單次呼叫的逾時無法界定整個迴圈的總時間——這是 v0.2.12 的教訓。
+
+#### Recovery queue purge 現在會在 API 錯誤時 fail closed
+
+`_release_recovery_queue_clone_holds()` 以 `if (eval { $api->volume_get($name) })` 判斷「此 volume 並非線上」，這會把**失敗的**查詢（網路瞬斷、認證、ONTAP 忙碌）與「確認不存在」視為相同，使一個線上的 volume 往破壞性的 purge 前進。這是 v0.2.16 的教訓套用在破壞性路徑上，而在此處更為要緊。失敗現在會回報為「無法確認」並拒絕。
+
+#### 只差 `-` 與 `_` 的快照名稱在 ONTAP 上會碰撞
+
+Proxmox VE 的快照名稱符合 `[a-z][a-z0-9_-]+`，因此 `my-snap` 與 `my_snap` 是不同的；而 `sanitize_for_ontap()` 會把 `-` 轉成 `_`，於是兩者都變成 ONTAP 快照 `pve_snap_my_snap`。建立第二個會被既有檢查拒絕——這是安全的結果，因為兩個 Proxmox VE 快照絕不能變成同一個 ONTAP 快照——但錯誤訊息對一個 Proxmox VE 顯示為可用的名稱說「已存在」。
+
+- **修正：**編碼方式不能更動（否則既有快照全部失聯），因此錯誤訊息現在會說明此對應關係，並指出是哪個變體占用了它。相同的碰撞也影響 vmstate volume 名稱，`alloc_image` 同樣會拒絕。
+
+#### 已檢視並確認無虞（記錄下來以免重複調查）
+
+- **死鎖：**兩處 `flock` 都使用 `LOCK_EX|LOCK_NB` 搭配有界的 10 秒重試，逾時後便不加鎖繼續——最壞情況是追蹤檔的一次更新遺失，這不是資料風險，而且永遠不會 hang。所有 `alarm()` 都用在葉節點（glob、socket 連線、`open3`）且無巢狀，因此不會有內層 `alarm(0)` 取消外層逾時的情況。每個外部指令都有明確逾時；每個 ONTAP 等待都有界。
+- **覆寫：**`alloc_image()` 與 `clone_image()` 使用有界的 TOCTOU 重試，搭配存在性預檢與建立錯誤處理器；vmstate 與 cloud-init 的配置在 volume 已存在時會 die；`rename_volume()` 會檢查目標；`volume_resize()` 拒絕縮小。
+- **斷線：**殘留清理在 `lun_list` 失敗時會**整個中止**，而不是把查詢失敗當成「全部都被刪了」；`activate_storage()` 在沒有任何 portal 可達時會 die。
+
 ## [0.2.23] - 2026-07-26
 
 ### Proxmox VE 9.0／9.1／9.2 相容性稽核 + 快照安全修正

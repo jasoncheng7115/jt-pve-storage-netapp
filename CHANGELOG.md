@@ -2,6 +2,68 @@
 
 All notable changes to the NetApp ONTAP Storage Plugin for Proxmox VE are documented here.
 
+## [0.2.24] - 2026-07-27
+
+### Data-Safety Audit: Delete, Overwrite, Disconnect and Deadlock Review
+
+**Status: prepared, not yet published.** Tests: `make test` 6/6, podchecker OK, units **194/194**, functional against a real ONTAP simulator **53/53**, plus real-ONTAP verification of the new cross-node I/O guard and the new one-call LUN/igroup query.
+
+A focused review of every destructive path, following the v0.2.23 compatibility audit. Eight issues fixed; the areas found sound are recorded at the end so they are not re-investigated.
+
+#### Data loss: two storages could silently share one ONTAP volume namespace
+
+ONTAP volume names are `pve_{storage}_{vmid}_disk{N}`, with the storage ID passed through `sanitize_for_ontap()` — which **truncates to 32 characters**. Two different Proxmox VE storage IDs can therefore produce the same prefix: `netapp-production-cluster-alpha-one` and `netapp-production-cluster-alpha-two` both become `netapp_production_cluster_alpha_`.
+
+If both storages also point at the same SVM they address literally the same FlexVols: `list_images()` on one reports the other's disks, and **`free_image()` on one destroys the other's volume**.
+
+- **Fix:** the naming scheme cannot change without renaming every existing customer volume, so the collision is prevented instead. A new `on_add_hook()` refuses to create a storage whose (portal, SVM, 32-character sanitized prefix) matches an existing `netappontap` storage, naming the conflicting storage and the consequence. The same prefix under a different SVM or portal is a separate namespace and is still allowed. Configurations predating the check are warned about at `activate_storage` time rather than refused — refusing to activate an in-service storage would take running guests offline.
+
+#### Orphan cleanup could tear down live devices for some storage IDs
+
+`list_images()`, `_cleanup_orphaned_devices()` and `deactivate_storage()` built their ONTAP query prefixes with a naive `s/-/_/g`, which diverges from `sanitize_for_ontap()` for any storage ID containing a dot (Proxmox VE allows `[a-z][a-z0-9\-\_\.]*[a-z0-9]`) or longer than 32 characters.
+
+A prefix that matches nothing is dangerous in the orphan reaper: the alive set comes back **empty**, so every tracked WWID looks like a deleted LUN. The v0.2.17 path-health gate still protects devices with active paths, but a device whose paths are all momentarily down (controller takeover, fabric blip) would then be torn down even though its LUN is alive. `list_images()` would also report "this storage has no disks".
+
+- **Fix:** all three now use `sanitize_for_ontap($storeid, 32)`, the same function that generates the real volume names.
+
+#### Cross-node in-use detection before delete and rollback
+
+`is_device_in_use()` is thorough but **node-local**: mounts, swap, sysfs holders, and — via `fuser` — any process holding the block device open, which does include a running QEMU. (The v0.2.17 note in CLAUDE.md claiming it cannot see QEMU was **wrong** and has been corrected; it sent this audit down a false trail.)
+
+What it cannot cover is the rest of the cluster. On the node servicing a `pvesm free` the LUN may not be mapped at all, so `$device` is undef and **no check runs**. That path is unguarded by Proxmox VE too: `DELETE /nodes/{node}/storage/{storage}/content/{volume}` — the storage content view's **Remove** button — does a permission check and then calls `vdisk_free`, guarding only base volumes.
+
+- **Fix:** `free_image()` and `volume_snapshot_rollback()` now ask ONTAP whether the LUN is transferring data, but only when the local check could not run. New option `ontap-inuse-io-check` (default 1).
+- The test is **one-directional**: observed I/O refuses the operation; absence of I/O never blocks one. That distinction is essential — `qm destroy` calls `vdisk_free` while the guest config **still references** the disks, so a "refuse if referenced" test would break destroy entirely.
+- The verdict rests on **bytes transferred, not operation counts**: `multipathd` issues TEST UNIT READY on every mapped LUN continuously, which moves no data. An earlier draft counted operations and flagged a genuinely idle LUN (measured: 1 operation, 0 bytes in 8 s), which would have refused nearly every cross-node delete. Measured after the fix: idle = 0 bytes (3/3 samples), active `dd` = ~41 MB in 10 s, clearing about 10 s after the I/O stops.
+- Rollback gets the same guard because it is **more** destructive than delete: it silently overwrites the volume with older content, so a mistake is not even visible as a missing disk.
+
+#### A second Proxmox VE cluster can share the volume namespace unnoticed
+
+Volume names carry **no cluster identifier** — `ontap-cluster-name` only ever appears in igroup names. Two clusters that each have a storage called e.g. `netapp1` pointing at the same SVM share `pve_netapp1_*` completely. Allocation is safe (existence checks pick the next free disk ID), but `list_images()` returns the other cluster's volumes as if they were local: they appear in the storage content view and in `qm rescan` as unused disks, and **deleting one there destroys a live disk of the other cluster**.
+
+- **Fix:** `status()` now warns (24 h cooldown, also to syslog) when LUNs in this storage's namespace are mapped to igroups whose name does not begin with this cluster's own `pve_{cluster}_` prefix — proof that another Proxmox VE cluster owns them. Warn only, never refuse.
+- Implemented as a single paginated `lun_list_with_maps()` call. An earlier draft looped `lun_get()` per LUN and only stamped its cooldown when a problem was found, which on a healthy setup would have re-run on every ~10 s `status()` poll — reintroducing the v0.2.21 N+1 REST storm. It also parsed the cluster name out of the igroup, which is ambiguous once the cluster name itself contains `_` (or `-`, which sanitizes to `_`); prefix matching is used instead.
+
+#### `free_image`'s delete retry loop is now wall-clock bounded
+
+`free_image()` runs inside Proxmox VE's **cluster-wide** storage lock, and one ONTAP volume delete can take ~240 s (60 s HTTP × 2 retries plus a 120 s job wait), so five attempts could hold that lock for around 20 minutes and block allocate/free for the storage on every node. New option `ontap-delete-deadline` (default 300 s). A per-call timeout does not bound a loop's total time — the v0.2.12 lesson.
+
+#### Recovery-queue purge now fails closed on an API error
+
+`_release_recovery_queue_clone_holds()` decided "this volume is not live" from `if (eval { $api->volume_get($name) })`, which treats a **failed** lookup (network blip, auth, ONTAP busy) identically to a confirmed absence, advancing a live volume toward a destructive purge. This is the v0.2.16 lesson applied to a destructive path, where it matters more. A failure is now reported as "could not verify" and refuses.
+
+#### Snapshot names differing only in `-` vs `_` collide on ONTAP
+
+Proxmox VE snapshot names match `[a-z][a-z0-9_-]+`, so `my-snap` and `my_snap` are distinct; `sanitize_for_ontap()` maps `-` to `_`, so both become the ONTAP snapshot `pve_snap_my_snap`. Creating the second is refused by the existing check — the safe outcome, since two Proxmox VE snapshots must never become one ONTAP snapshot — but the error read "already exists" for a name Proxmox VE lists as free.
+
+- **Fix:** the encoding cannot change without orphaning every existing snapshot, so the error now explains the mapping and names the variant occupying it. The same collision affects vmstate volume names, where `alloc_image` likewise refuses.
+
+#### Reviewed and found sound (recorded so it is not re-litigated)
+
+- **Deadlocks:** both `flock` sites use `LOCK_EX|LOCK_NB` with a bounded 10 s retry and then proceed unlocked — worst case a lost tracking-file update, which is not a data risk, and never a hang. All `alarm()` uses are leaf-level (glob, socket connect, `open3`) with no nesting, so no inner `alarm(0)` can cancel an outer timeout. Every external command has an explicit timeout; every ONTAP wait is bounded.
+- **Overwrite:** `alloc_image()` and `clone_image()` use bounded TOCTOU retries with an existence pre-check plus a create-error handler; vmstate and cloud-init allocations die if the volume exists; `rename_volume()` checks the target; `volume_resize()` refuses to shrink.
+- **Disconnection:** the orphan reaper aborts entirely if `lun_list` fails, rather than treating a query failure as "everything was deleted"; `activate_storage()` dies when no portal is reachable.
+
 ## [0.2.23] - 2026-07-26
 
 ### Proxmox VE 9.0/9.1/9.2 Compatibility Audit + Snapshot Safety Fixes

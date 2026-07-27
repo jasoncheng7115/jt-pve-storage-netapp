@@ -2618,6 +2618,136 @@ qm destroy $VMID --purge
 
 ---
 
+## 32. Data-Safety Audit Fixes (v0.2.24)
+
+Delete / overwrite / disconnect / deadlock review of the destructive paths.
+
+### 32.1 Unit + static coverage (no ONTAP required, CORE)
+
+```bash
+perl -Ilib tests/audit_fixes.t
+# Expected: 135/135 PASS. The v0.2.24 additions cover:
+#  - ONTAP namespace derivation is single-sourced (dotted and >32-char storage IDs)
+#  - a static guard that the naive s/-/_/g sanitizer cannot come back
+#  - the on_add_hook namespace-collision guard across portal/SVM/prefix combinations
+#  - the cross-node I/O check: active/idle/counter-reset/no-stats/stale-stats
+#  - free_image's wall-clock delete deadline and option registration
+#  - recovery-queue purge failing CLOSED on an API error
+```
+
+### 32.2 Namespace collision guard (CORE)
+
+```bash
+# Two storage IDs whose first 32 sanitized characters match, on the SAME SVM,
+# would address the same FlexVols. Adding the second must be refused.
+pvesm add netappontap netapp-production-cluster-alpha-one     --ontap-portal <ip> --ontap-svm svm1 --ontap-aggregate aggr1     --ontap-username admin --ontap-password <pw> --content images
+pvesm add netappontap netapp-production-cluster-alpha-two     --ontap-portal <ip> --ontap-svm svm1 --ontap-aggregate aggr1     --ontap-username admin --ontap-password <pw> --content images
+# Expected: the SECOND command FAILS with
+#   "would share the ONTAP volume namespace 'pve_netapp_production_cluster_alpha__*'
+#    with existing storage 'netapp-production-cluster-alpha-one'"
+#   ... and states that deleting a disk on one would DESTROY the other's volume.
+# Expected: the same prefix under a DIFFERENT SVM or portal is accepted.
+pvesm remove netapp-production-cluster-alpha-one
+```
+
+### 32.3 Cross-node in-use guard against real ONTAP (ONTAP REQUIRED)
+
+Verifies the guard fires on real activity and — just as important — that it does
+**not** fire on an idle-but-mapped LUN, where `multipathd`'s TEST UNIT READY
+checker runs continuously.
+
+```bash
+perl -Ilib -e '
+use PVE::Storage::Custom::NetAppONTAPPlugin;
+use PVE::Storage::Custom::NetAppONTAP::Multipath qw(get_device_by_wwid);
+my $P="PVE::Storage::Custom::NetAppONTAPPlugin"; my $S="netapp1";
+my $scfg = PVE::Storage::config()->{ids}{$S};
+my $api  = PVE::Storage::Custom::NetAppONTAPPlugin::_get_api($scfg);
+my $has_io = \&PVE::Storage::Custom::NetAppONTAPPlugin::_lun_has_active_io;
+my $vol = $P->alloc_image($S,$scfg,999031,"raw",undef,1048576);
+my $ov  = PVE::Storage::Custom::NetAppONTAPPlugin::pve_volname_to_ontap($S,$vol);
+my $lp  = PVE::Storage::Custom::NetAppONTAPPlugin::encode_lun_path($ov);
+$P->activate_volume($S,$scfg,$vol,undef,{});
+my $dev = get_device_by_wwid($api->lun_get_wwid($lp));
+print "idle: ", ($has_io->($api,$lp,window=>8) || "not flagged"), "\n";
+system("dd if=/dev/zero of=$dev bs=1M count=600 oflag=direct status=none &");
+sleep 3;
+print "busy: ", ($has_io->($api,$lp,window=>10) || "NOT FLAGGED - guard inert!"), "\n";
+'
+# Expected:
+#   idle: not flagged            <- must NOT be flagged despite multipathd TUR
+#   busy: N byte(s) transferred in M read/write operation(s) over the last 10s
+# Measured on the simulator: idle = 0 bytes (3/3 samples), busy = ~41 MB in 10s.
+# After the I/O stops the guard clears within roughly one statistics interval
+# (~10s measured); a delete attempted inside that window is refused and succeeds
+# on retry. That trailing window is expected and documented.
+```
+
+### 32.4 Static regression guards
+
+```bash
+P=lib/PVE/Storage/Custom/NetAppONTAPPlugin.pm
+# the naive sanitizer must not return
+grep -v '^\s*#' $P | grep -c 's/-/_/g'                                  # Expected: 0
+# all query prefixes use the authoritative function
+grep -cF 'sanitize_for_ontap($storeid, 32)' $P                          # >= 3
+# the namespace guard and the delete deadline exist
+grep -c '^sub _assert_unique_ontap_namespace' $P                        # Expected: 1
+grep -c '^sub on_add_hook' $P                                           # Expected: 1
+grep -cF 'delete_deadline' $P                                           # >= 2
+# the I/O check must run ONLY when the local check could not
+grep -cF '!$local_device_checked' $P                                    # Expected: 1
+# 'other' ops must stay excluded from the I/O sample (multipathd TUR)
+grep -A3 'ops   =>' lib/PVE/Storage/Custom/NetAppONTAP/API.pm | grep -c 'other'  # Expected: 0
+```
+
+### 32.5 Rollback cross-node guard, snapshot-name collision, foreign cluster (CORE)
+
+```bash
+# Rollback gets the same one-directional ONTAP I/O guard as free_image, because a
+# rollback silently OVERWRITES the volume rather than removing it.
+grep -c '_lun_has_active_io' lib/PVE/Storage/Custom/NetAppONTAPPlugin.pm   # >= 3
+sed -n '/^sub volume_snapshot_rollback/,/snapshot_rollback(/p' \
+    lib/PVE/Storage/Custom/NetAppONTAPPlugin.pm | grep -c '_lun_has_active_io'   # Expected: 1
+
+# Snapshot names differing only in '-' vs '_' map to ONE ONTAP snapshot.
+perl -Ilib -e 'use PVE::Storage::Custom::NetAppONTAP::Naming qw(encode_snapshot_name);
+print encode_snapshot_name("my-snap") eq encode_snapshot_name("my_snap") ? "COLLIDE\n" : "distinct\n";'
+# Expected: COLLIDE -- creating the second is refused (safe), and the error must
+# now explain the '-' -> '_' mapping instead of just saying "already exists".
+
+# A second PVE cluster sharing the namespace is detected from igroup ownership.
+grep -c '^sub _check_foreign_cluster_namespace' lib/PVE/Storage/Custom/NetAppONTAPPlugin.pm  # 1
+# It must use ONE paginated call, never a per-LUN lookup (v0.2.21 N+1 lesson):
+sed -n '/^sub _check_foreign_cluster_namespace/,/^}/p' \
+    lib/PVE/Storage/Custom/NetAppONTAPPlugin.pm | grep -c 'lun_list_with_maps'   # Expected: 1
+sed -n '/^sub _check_foreign_cluster_namespace/,/^}/p' \
+    lib/PVE/Storage/Custom/NetAppONTAPPlugin.pm | grep -c -- '->lun_get('        # Expected: 0
+```
+
+### 32.6 One-call LUN/igroup query against real ONTAP (ONTAP REQUIRED)
+
+The foreign-cluster check depends on `lun_maps.igroup.name` being available in a
+collection GET. Verify it really is, rather than assuming:
+
+```bash
+perl -Ilib -MPVE::Storage -e '
+my $P="PVE::Storage::Custom::NetAppONTAPPlugin"; my $S="netapp1";
+my $scfg = PVE::Storage::config()->{ids}{$S};
+my $api  = PVE::Storage::Custom::NetAppONTAPPlugin::_get_api($scfg);
+my $vol  = $P->alloc_image($S,$scfg,999040,"raw",undef,1048576);
+my $r = $api->lun_list_with_maps("/vol/pve_${S}_*/lun0");
+for my $l (@$r) { print $l->{name}, " -> ",
+  join(", ", map { $_->{igroup}{name} } @{$l->{lun_maps}//[]}), "\n" }
+$P->free_image($S,$scfg,$vol,0,"raw");'
+# Expected: one line listing the LUN and every igroup it is mapped to, e.g.
+#   /vol/pve_netapp1_999040_disk0/lun0 -> pve_pve_pc_pve1, pve_pve_pc_pve2, pve_pve_pc_pve3
+# All igroups must start with this cluster's own 'pve_{cluster}_' prefix, so the
+# foreign-cluster check stays silent on a single-cluster installation.
+```
+
+---
+
 ## Cleanup
 
 ```bash

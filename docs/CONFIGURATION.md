@@ -275,6 +275,41 @@ netappontap: <storage-id>
 - An in-progress login is never interrupted, and the loop never skips while zero paths are up (it must obtain at least one path or fail honestly) — so it cannot mark a slow-but-reachable storage inactive.
 - Skipped portals are picked up on a later activation; multipath redundancy self-heals.
 
+### ontap-inuse-io-check
+
+**Type:** boolean
+**Default:** 1 (enabled)
+**Description:** Before deleting a volume whose device is **not** mapped on this node, ask ONTAP whether the LUN is transferring data, and refuse the delete if it is.
+
+```bash
+--ontap-inuse-io-check 1   # Default
+--ontap-inuse-io-check 0   # Disable the cross-node check
+```
+
+**Why this exists:** the host-side in-use check (mounts, swap, sysfs holders, and open file descriptors via `fuser`) only covers the node it runs on. On shared SAN storage the guest using a LUN may be running on a **different** node, and on the node servicing a `pvesm free` the LUN may not be mapped at all -- so there is nothing local to inspect. That path is otherwise unguarded: `DELETE /nodes/{node}/storage/{storage}/content/{volume}`, i.e. the **Remove** button in the storage content view and `pvesm free`, performs a permission check and then deletes. Proxmox VE itself only protects base volumes there.
+
+**Notes:**
+- The check is **one-directional**: observed I/O refuses the delete; the absence of I/O never blocks one. An idle guest produces no I/O, so this can never turn into a false block — and importantly it cannot break `qm destroy`, which frees volumes while the guest config still references them.
+- The verdict rests on **bytes transferred**, not operation counts. `multipathd` issues TEST UNIT READY on every mapped LUN continuously; that moves no data, but counting operations would make an idle LUN look busy.
+- ONTAP's counters lag by up to one statistics interval, so a disk whose guest was **just** stopped can still read as active for a few seconds. Simply retry.
+- It costs a few seconds, and only on the ambiguous path — if the device is mapped on this node, the host-side check is authoritative and is used instead.
+
+### ontap-delete-deadline
+
+**Type:** integer (60-1800)
+**Default:** 300
+**Description:** Wall-clock budget for the volume-delete retry loop in `free_image`.
+
+```bash
+--ontap-delete-deadline 300   # Default
+--ontap-delete-deadline 600   # ONTAP that is legitimately slow to delete volumes
+```
+
+**Notes:**
+- `free_image` runs inside Proxmox VE's **cluster-wide** storage lock, so time spent here blocks allocate/free for this storage on **every** node.
+- One ONTAP volume delete can take ~240 s on its own (60 s HTTP × 2 retries plus a 120 s job wait), so the five retry attempts could otherwise hold that lock for around 20 minutes.
+- Exceeding the budget fails with a message pointing at `volume clone show` and `volume recovery-queue show`, instead of continuing to hold the lock.
+
 ### ontap-purge-recovery-queue
 
 **Type:** boolean

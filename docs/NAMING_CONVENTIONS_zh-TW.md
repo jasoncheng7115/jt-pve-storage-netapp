@@ -22,53 +22,53 @@
 
 ### FlexVol 命名
 
-**模式：** `pve_{storage}_{vmid}_disk{diskid}`
+**模式**：`pve_{storage}_{vmid}_disk{diskid}`
 
-**範例：**
+**範例**：
 - VM 100、磁碟 0、storage "netapp1" → `pve_netapp1_100_disk0`
 - VM 205、磁碟 3、storage "ontap-ssd" → `pve_ontap_ssd_205_disk3`
 
-**淨化 (sanitization) 規則：**
+**淨化 (sanitization) 規則**：
 - Storage 名稱：將 `-` 替換為 `_`，截斷至 32 字元
 - VMID：整數，不修改
 - DiskID：整數，不修改
 
-**解析用的正規表示式：** `^pve_([a-zA-Z0-9_]+)_(\d+)_disk(\d+)$`
+**解析用的正規表示式**：`^pve_([a-zA-Z0-9_]+)_(\d+)_disk(\d+)$`
 
 ### LUN 命名
 
-**模式：** `/vol/{flexvol_name}/lun0`
+**模式**：`/vol/{flexvol_name}/lun0`
 
 由於每個 FlexVol 僅包含 1 個 LUN，因此 LUN 固定命名為 `lun0`。
 
-**範例：**
+**範例**：
 - FlexVol `pve_netapp1_100_disk0` → LUN 路徑 `/vol/pve_netapp1_100_disk0/lun0`
 
 ### 快照命名
 
-**模式：** `pve_snap_{sanitized_snapname}`
+**模式**：`pve_snap_{sanitized_snapname}`
 
-**淨化規則：**
+**淨化規則**：
 - 將空白字元替換為 `_`
 - 將 `-` 替換為 `_`
 - 移除所有不屬於 `[a-zA-Z0-9_]` 的字元
 - 截斷至 200 字元 (保留前綴空間)
 - 前綴加上 `pve_snap_`
 
-**範例：**
+**範例**：
 - PVE 快照 "before-upgrade" → `pve_snap_before_upgrade`
 - PVE 快照 "clean state 2024" → `pve_snap_clean_state_2024`
 - PVE 快照 "test@v1.0" → `pve_snap_testv10`
 
-**解析用的正規表示式：** `^pve_snap_(.+)$`
+**解析用的正規表示式**：`^pve_snap_(.+)$`
 
 ### igroup 命名
 
-**模式：** `pve_{clustername}_{nodename}`
+**模式**：`pve_{clustername}_{nodename}`
 
 對於單節點環境或共享 igroup：`pve_{clustername}_shared`
 
-**範例：**
+**範例**：
 - 叢集 "prod"、節點 "pve1" → `pve_prod_pve1`
 - 叢集 "prod"、共享 → `pve_prod_shared`
 
@@ -123,9 +123,9 @@ sub decode_snapshot_name {
 
 Proxmox VE 使用下列 volume ID 格式：
 
-**模式：** `{storage}:{content}/{volname}`
+**模式**：`{storage}:{content}/{volname}`
 
-**範例：**
+**範例**：
 - `netapp1:images/vm-100-disk-0`
 - `netapp1:images/vm-205-disk-3`
 
@@ -143,13 +143,13 @@ Proxmox VE 使用下列 volume ID 格式：
 
 Cloud-init volume 使用格式：`vm-{vmid}-cloudinit`
 
-**ONTAP FlexVol：** `pve_{storage}_{vmid}_cloudinit`
+**ONTAP FlexVol**：`pve_{storage}_{vmid}_cloudinit`
 
 ### VM 狀態 (休眠)
 
 VM 狀態 volume 使用格式：`vm-{vmid}-state-{snapname}`
 
-**ONTAP FlexVol：** `pve_{storage}_{vmid}_state_{snapname}`
+**ONTAP FlexVol**：`pve_{storage}_{vmid}_state_{snapname}`
 
 ### ISO/範本映像檔
 

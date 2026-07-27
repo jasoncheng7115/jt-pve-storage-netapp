@@ -33,7 +33,7 @@
 
 ## 免責聲明
 
-> **警告：本外掛程式為新開發軟體，使用風險自負。**
+> **警告：本外掛程式為新開發軟體，使用風險自負**。
 >
 > - 本外掛程式以「現狀」提供，不附帶任何形式的保證
 > - **iSCSI 協定已經過測試，但尚未在正式環境中進行大量測試**
@@ -42,19 +42,19 @@
 > - 作者不對任何資料遺失或系統問題負責
 > - 請定期備份資料並備妥復原計畫
 >
-> **建議使用方式：**
+> **建議使用方式**：
 > - 從非關鍵性虛擬機開始進行評估
 > - 密切監控儲存操作
 
 ## 重要：Multipath 安全規則
 
-> **安裝前務必閱讀。** 這些規則可避免 PVE 節點掛起以及誤斷其他儲存的連線。
+> **安裝前務必閱讀**。這些規則可避免 PVE 節點掛起以及誤斷其他儲存的連線。
 
 ### 規則 1：絕對不要使用 `multipath -F`（大寫 F）
 
-`multipath -F` 會清除全系統**所有未使用**的 multipath maps。如果你有其他儲存（手動 iSCSI LVM、其他廠牌等），剛好當下沒有 I/O 在跑，**就會被斷線**。需要手動 `systemctl reload multipathd` 或 `iscsiadm -m session --rescan` 才能恢復。
+`multipath -F` 會清除全系統**所有未使用**的 multipath maps。如果你有其他儲存（手動 iSCSI LVM、其他廠牌等），剛好當下沒有 I/O 在跑**，就會被斷線**。需要手動 `systemctl reload multipathd` 或 `iscsiadm -m session --rescan` 才能恢復。
 
-**請改用針對性清除：**
+**請改用針對性清除**：
 ```bash
 # 1. 找出 stale 的 WWID（所有 path 都顯示 "failed faulty"）
 multipath -ll
@@ -87,7 +87,7 @@ Plugin 安裝時會偵測這些設定並顯示醒目警告。詳見 [docs/CONFIG
 
 ### 規則 4：v0.2.2 之後會自動清理
 
-升級到 v0.2.2 之後，**不需要**再手動清理 stale 裝置。Plugin 會在背景的儲存狀態輪詢時自動偵測並清除它自己建立的殘留裝置。它只會處理自己建立過的 WWID，**永遠不會影響其他儲存**。
+升級到 v0.2.2 之後，**不需要**再手動清理 stale 裝置。Plugin 會在背景的儲存狀態輪詢時自動偵測並清除它自己建立的殘留裝置。它只會處理自己建立過的 WWID**，永遠不會影響其他儲存**。
 
 ## 功能特色
 
@@ -107,9 +107,9 @@ Plugin 安裝時會偵測這些設定並顯示醒目警告。詳見 [docs/CONFIG
 
 ## Web UI 支援
 
-> **注意：** 這是一個自訂/第三方儲存外掛程式。由於 Proxmox VE 的架構限制，自訂外掛程式不會顯示在 Web UI 的「新增儲存」下拉選單中。必須透過 CLI (`pvesm add`) 新增儲存。
+> **注意**：這是一個自訂/第三方儲存外掛程式。由於 Proxmox VE 的架構限制，自訂外掛程式不會顯示在 Web UI 的「新增儲存」下拉選單中。必須透過 CLI (`pvesm add`) 新增儲存。
 
-**透過 CLI 新增後，儲存將：**
+**透過 CLI 新增後，儲存將**：
 - 出現在 Web UI 儲存清單中（資料中心 -> 儲存）
 - 可在 Web UI 中建立 VM 磁碟
 - 在 Web UI 中顯示容量和狀態
@@ -162,7 +162,7 @@ ONTAP 使用者需要以下權限：
 
 ### 首次安裝（建議順序）
 
-> **重要：** 請在安裝外掛程式套件之前先安裝相依套件，以避免相依性解析問題。
+> **重要**：請在安裝外掛程式套件之前先安裝相依套件，以避免相依性解析問題。
 
 ```bash
 # 步驟 1：更新 apt 快取（必要！）
@@ -181,7 +181,7 @@ systemctl enable --now multipathd
 dpkg -i jt-pve-storage-netapp_0.2.24-1_all.deb
 ```
 
-> **注意：** 外掛程式會自動：
+> **注意**：外掛程式會自動：
 > - 將 NetApp 裝置配置加入 `/etc/multipath.conf`
 > - 重新啟動 `pvedaemon` 和 `pveproxy` 以載入外掛程式
 
@@ -206,7 +206,7 @@ dpkg -l | grep jt-pve-storage-netapp
 
 ### 叢集安裝（所有節點）
 
-> **重要：** 在 Proxmox VE 叢集中，此外掛程式**必須安裝在所有節點上**。
+> **重要**：在 Proxmox VE 叢集中，此外掛程式**必須安裝在所有節點上**。
 
 儲存配置透過 `/etc/pve/storage.cfg` 在叢集中共享。未安裝外掛程式的節點將顯示：
 ```
@@ -214,7 +214,7 @@ Parameter verification failed. (400)
 storage: No such storage
 ```
 
-**在每個節點上安裝：**
+**在每個節點上安裝**：
 ```bash
 # 在叢集中的每個節點上：
 apt update
@@ -226,7 +226,7 @@ systemctl enable --now iscsid multipathd
 dpkg -i jt-pve-storage-netapp_0.2.24-1_all.deb
 ```
 
-**叢集安裝順序：**
+**叢集安裝順序**：
 1. 先在所有節點上安裝外掛程式
 2. 然後新增儲存配置（只需在任一節點執行一次）
 
@@ -234,9 +234,9 @@ dpkg -i jt-pve-storage-netapp_0.2.24-1_all.deb
 
 ### 升級會影響執行中的 VM 嗎？
 
-**簡短答案：不會。** 執行中的 VM 在正常情況下不會受外掛升級影響。VM 的 I/O 路徑是 QEMU -> kernel block layer -> multipath -> iSCSI，外掛只負責控制層 (control plane)。
+**簡短答案：不會**。執行中的 VM 在正常情況下不會受外掛升級影響。VM 的 I/O 路徑是 QEMU -> kernel block layer -> multipath -> iSCSI，外掛只負責控制層 (control plane)。
 
-**詳細說明：**
+**詳細說明**：
 
 | 元件 | 升級會影響嗎？ | 原因 |
 |------|--------------|------|
@@ -248,7 +248,7 @@ dpkg -i jt-pve-storage-netapp_0.2.24-1_all.deb
 
 **外掛 postinst 會偵測進行中的操作**（`qm move-disk`、`qm clone`、`qm migrate`、`qmrestore`、`vzdump`、`pvesm alloc/free`），並給 5 秒讓你按 Ctrl+C 取消。從 v0.2.5 起，服務改用 SIGHUP（re-exec）而非完整 restart，所以沒有 stop-phase 期間 pvedaemon 不回應的問題。
 
-**建議：** 在低活動時段升級。只有想完全避免任何控制層操作中斷風險時，才需要先停或遷移 VM。
+**建議**：在低活動時段升級。只有想完全避免任何控制層操作中斷風險時，才需要先停或遷移 VM。
 
 ### 步驟 1：升級前備份
 
@@ -351,7 +351,7 @@ systemctl restart multipathd
 
 ### 1. 新增儲存
 
-**iSCSI 範例：**
+**iSCSI 範例**：
 ```bash
 pvesm add netappontap netapp1 \
     --ontap-portal 192.168.1.100 \
@@ -363,9 +363,9 @@ pvesm add netappontap netapp1 \
     --shared 1
 ```
 
-> **注意：** 使用 `--content images` 僅支援 VM 磁碟，或使用 `--content images,rootdir` 同時支援 LXC 容器。
+> **注意**：使用 `--content images` 僅支援 VM 磁碟，或使用 `--content images,rootdir` 同時支援 LXC 容器。
 
-**FC (Fibre Channel) 範例：**
+**FC (Fibre Channel) 範例**：
 ```bash
 pvesm add netappontap netapp-fc \
     --ontap-portal 192.168.1.100 \
@@ -413,7 +413,7 @@ pvesm status
 | `ontap-cluster-name` | `pve` | 用於 igroup 命名的叢集名稱（見下方說明）|
 | `ontap-device-timeout` | `60` | 裝置探索逾時秒數 |
 
-> **同一 SVM 多 storage 設定：** 若在同一個 SVM 上設定多個 storage，請為每個 storage 使用不同的 `ontap-cluster-name`，以避免 igroup 衝突。例如 `--ontap-cluster-name pve-prod` 和 `--ontap-cluster-name pve-dev`。
+> **同一 SVM 多 storage 設定**：若在同一個 SVM 上設定多個 storage，請為每個 storage 使用不同的 `ontap-cluster-name`，以避免 igroup 衝突。例如 `--ontap-cluster-name pve-prod` 和 `--ontap-cluster-name pve-dev`。
 
 ### storage.cfg 範例（iSCSI）
 
@@ -447,7 +447,7 @@ netappontap: netapp-fc
     shared 1
 ```
 
-> **注意：** 對於 FC，`ontap-portal` 仍然是 ONTAP REST API 存取所必需的。FC 資料路徑使用 FC fabric，而非管理 IP。
+> **注意**：對於 FC，`ontap-portal` 仍然是 ONTAP REST API 存取所必需的。FC 資料路徑使用 FC fabric，而非管理 IP。
 
 ## 使用方式
 
@@ -511,7 +511,7 @@ pvesm set netapp1 --disable 0
 pvesm status
 ```
 
-> **注意：** 停用儲存不會自動中斷 iSCSI 工作階段或 API 連線。外掛程式保持 iSCSI 工作階段活躍以便快速重新啟用。
+> **注意**：停用儲存不會自動中斷 iSCSI 工作階段或 API 連線。外掛程式保持 iSCSI 工作階段活躍以便快速重新啟用。
 
 ### iSCSI 工作階段管理
 
@@ -600,7 +600,7 @@ Proxmox VE Cluster                    NetApp ONTAP
 
 ### 資料流程
 
-**Volume 建立：**
+**Volume 建立**：
 1. PVE 呼叫 `alloc_image()`，傳入 vmid 和大小
 2. 外掛程式透過 Naming 模組產生 ONTAP volume 名稱
 3. 建立 FlexVol，大小為指定大小 + 64MB 開銷
@@ -609,7 +609,7 @@ Proxmox VE Cluster                    NetApp ONTAP
 5. 將 LUN 對應到節點的 igroup
 6. 回傳 PVE volume 名稱（`vm-{vmid}-disk-{diskid}`）
 
-**Volume 啟用：**
+**Volume 啟用**：
 1. PVE 呼叫 `activate_volume()`，傳入 volname
 2. 確保 LUN 已對應到目前節點的 igroup
 3. 重新掃描 iSCSI 工作階段和 SCSI 主機
@@ -617,7 +617,7 @@ Proxmox VE Cluster                    NetApp ONTAP
 5. 等待裝置出現（最多 60 秒）
 6. 回傳裝置路徑
 
-**快照回復：**
+**快照回復**：
 1. PVE 呼叫 `volume_snapshot_rollback()`，傳入 volname 和 snapname
 2. 外掛程式將名稱轉換為 ONTAP 格式
 3. 呼叫 ONTAP REST API 將 volume 還原至快照
@@ -670,7 +670,7 @@ PVE::Storage::Plugin (Proxmox VE 基礎類別)
 
 ### API.pm 函式
 
-**Volume 操作：**
+**Volume 操作**：
 - `volume_create()` - 建立 FlexVol（支援精簡/完整佈建）
 - `volume_get()` / `volume_list()` - 查詢 volumes
 - `volume_delete()` / `volume_resize()` - 管理 volumes
@@ -681,23 +681,23 @@ PVE::Storage::Plugin (Proxmox VE 基礎類別)
 - `volume_get_clone_children()` - 列出相依的 clones
 - `license_has_flexclone()` - 檢查 FlexClone 授權可用性
 
-**LUN 操作：**
+**LUN 操作**：
 - `lun_create()` - 在 volume 中建立 LUN
 - `lun_get()` / `lun_delete()` / `lun_resize()` - 管理 LUNs
 - `lun_get_serial()` / `lun_get_wwid()` - 取得識別碼
 - `lun_map()` / `lun_unmap()` / `lun_is_mapped()` - igroup 對應
 
-**快照操作：**
+**快照操作**：
 - `snapshot_create()` / `snapshot_delete()` - 管理快照
 - `snapshot_list()` / `snapshot_get()` - 查詢快照
 - `snapshot_rollback()` - 還原至快照
 
-**igroup 操作：**
+**igroup 操作**：
 - `igroup_create()` / `igroup_get()` / `igroup_get_or_create()`
 - `igroup_add_initiator()` / `igroup_remove_initiator()`
 - `igroup_list()` - 列出 SVM 中的所有 igroups
 
-**其他：**
+**其他**：
 - `iscsi_get_portals()` - 取得 iSCSI LIF 位址
 - `get_managed_capacity()` - 取得儲存容量
 - `wait_for_job()` - 處理非同步操作
@@ -972,9 +972,9 @@ Parameter verification failed. (400)
 storage: No such storage
 ```
 
-**原因：** NetApp 儲存已配置在 `/etc/pve/storage.cfg`（叢集共享），但此特定節點未安裝外掛程式。
+**原因**：NetApp 儲存已配置在 `/etc/pve/storage.cfg`（叢集共享），但此特定節點未安裝外掛程式。
 
-**解決方案：**
+**解決方案**：
 ```bash
 # 在受影響的節點上安裝
 dpkg -i jt-pve-storage-netapp_0.2.24-1_all.deb
@@ -989,9 +989,9 @@ systemctl restart pvedaemon pveproxy
 INFO: task vgs:12345 blocked for more than 120 seconds
 ```
 
-**原因：** multipath 裝置有失敗路徑，等待 I/O 的程序卡在核心 D 狀態。
+**原因**：multipath 裝置有失敗路徑，等待 I/O 的程序卡在核心 D 狀態。
 
-**解決方案：**
+**解決方案**：
 ```bash
 # 檢查 multipath 狀態
 multipath -ll
@@ -1009,20 +1009,20 @@ multipath -f <WWID>
 multipathd reconfigure
 ```
 
-**預防：** 在建立/啟用 volumes 前確保 iSCSI 目標可存取。
+**預防**：在建立/啟用 volumes 前確保 iSCSI 目標可存取。
 
 ### 連結複製裝置無法存取
 
 當使用從未啟動過的連結複製 VM 時，本機裝置可能不存在。
 
-**行為（v0.1.3+）：** 外掛程式回傳合成路徑（`/dev/mapper/$wwid`），刪除等操作透過 ONTAP API 正常執行。
+**行為（v0.1.3+）**：外掛程式回傳合成路徑（`/dev/mapper/$wwid`），刪除等操作透過 ONTAP API 正常執行。
 
-**舊版本可能看到：**
+**舊版本可能看到**：
 ```
 Device for LUN /vol/pve_netapp1_xxx_disk0/lun0 not found
 ```
 
-**舊版本解決方案：**
+**舊版本解決方案**：
 ```bash
 # 升級至 v0.1.3+ 會自動處理此情況
 # 或透過 REST API 或 System Manager 手動從 ONTAP 刪除
@@ -1039,9 +1039,9 @@ Device for LUN /vol/pve_netapp1_xxx_disk0/lun0 not found
 multipathd show maps raw format "%w"
 ```
 
-**原因：** LUN 替換或重建後的過時 multipath 快取。
+**原因**：LUN 替換或重建後的過時 multipath 快取。
 
-**解決方案：**
+**解決方案**：
 ```bash
 # 移除過時的 multipath 裝置
 multipathd del map <old_wwid>

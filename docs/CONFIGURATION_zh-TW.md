@@ -2,7 +2,7 @@
 
 ## 免責聲明
 
-> **警告：本專案為新開發的外掛，使用風險請自行承擔。**
+> **警告：本專案為新開發的外掛，使用風險請自行承擔**。
 >
 > - **iSCSI 協定已經過測試，但尚未在正式環境中廣泛驗證**
 > - **FC (Fibre Channel) 協定尚未完成完整驗證**
@@ -35,77 +35,77 @@ netappontap: <storage-id>
 
 ### ontap-portal
 
-**類型：** string
-**必填：** 是
-**說明：** ONTAP 叢集 (cluster) 或 SVM 管理 IP 位址或主機名稱
+**類型**：string
+**必填**：是
+**說明**：ONTAP 叢集 (cluster) 或 SVM 管理 IP 位址或主機名稱
 
 ```bash
 --ontap-portal 192.168.1.100
 --ontap-portal ontap.example.com
 ```
 
-**備註：**
+**備註**：
 - 請使用管理 LIF 的 IP 位址
 - 對於 SVM 層級的使用者，請使用 SVM 管理 LIF
 - 固定使用 HTTPS (port 443)
 
 ### ontap-svm
 
-**類型：** string
-**必填：** 是
-**說明：** 儲存虛擬機器 (Storage Virtual Machine, Vserver) 名稱
+**類型**：string
+**必填**：是
+**說明**：儲存虛擬機器 (Storage Virtual Machine, Vserver) 名稱
 
 ```bash
 --ontap-svm svm0
 --ontap-svm vs_prod
 ```
 
-**備註：**
+**備註**：
 - 必須是已啟用 iSCSI 服務的現有 SVM
 - API 使用者必須能存取此 SVM
 
 ### ontap-aggregate
 
-**類型：** string
-**必填：** 是
-**說明：** 建立 volume 時所使用的 aggregate 名稱
+**類型**：string
+**必填**：是
+**說明**：建立 volume 時所使用的 aggregate 名稱
 
 ```bash
 --ontap-aggregate aggr1
 --ontap-aggregate aggr_ssd_01
 ```
 
-**備註：**
+**備註**：
 - 必須是既有且有可用空間的 aggregate
 - 本儲存建立的所有 volume 皆會使用此 aggregate
 - 請依效能需求選擇適當的 aggregate
 
 ### ontap-username
 
-**類型：** string
-**必填：** 是
-**說明：** ONTAP API 使用者名稱
+**類型**：string
+**必填**：是
+**說明**：ONTAP API 使用者名稱
 
 ```bash
 --ontap-username pveadmin
 --ontap-username admin
 ```
 
-**備註：**
+**備註**：
 - 建議建立專用使用者並授予最小必要權限
 - 請參閱下方 [ONTAP 使用者設定](#ontap-使用者設定) 章節
 
 ### ontap-password
 
-**類型：** string
-**必填：** 是
-**說明：** ONTAP API 密碼
+**類型**：string
+**必填**：是
+**說明**：ONTAP API 密碼
 
 ```bash
 --ontap-password 'YourSecurePassword'
 ```
 
-**備註：**
+**備註**：
 - 請使用單引號以避免特殊字元被 shell 展開
 - 密碼會以明文儲存在 `/etc/pve/storage.cfg` (叢集範圍、僅 root 可存取)
 
@@ -113,85 +113,85 @@ netappontap: <storage-id>
 
 ### ontap-protocol
 
-**類型：** enum (iscsi, fc)
-**預設值：** iscsi
-**說明：** SAN 傳輸協定
+**類型**：enum (iscsi, fc)
+**預設值**：iscsi
+**說明**：SAN 傳輸協定
 
 ```bash
 --ontap-protocol iscsi   # iSCSI over Ethernet (預設)
 --ontap-protocol fc      # Fibre Channel
 ```
 
-**iSCSI 模式：**
+**iSCSI 模式**：
 - 需要 iSCSI initiator (open-iscsi)
 - 自動進行 target 探索與登入
 - 使用 IQN 識別 initiator
 
-**FC 模式：**
+**FC 模式**：
 - 需要 FC HBA (Fibre Channel Host Bus Adapter)
 - 自動從 FC HBA 取得 WWPN
 - 使用 WWPN 識別 initiator
 - 無需 target 登入 (由 FC fabric 處理連線)
 
-**備註：**
+**備註**：
 - 兩種協定皆使用相同的多重路徑 (multipath) 設定
 - 兩種協定皆以 WWID 識別裝置
 - FC 模式仍需設定 `ontap-portal` 以進行 API 存取
 
 ### ontap-ssl-verify
 
-**類型：** boolean (0 或 1)
-**預設值：** 1
-**說明：** 是否驗證 ONTAP SSL 憑證
+**類型**：boolean (0 或 1)
+**預設值**：1
+**說明**：是否驗證 ONTAP SSL 憑證
 
 ```bash
 --ontap-ssl-verify 0   # 關閉驗證
 --ontap-ssl-verify 1   # 啟用驗證 (預設)
 ```
 
-**備註：**
+**備註**：
 - 若使用自簽憑證，請設為 0
 - 正式環境請使用有效憑證並啟用驗證
 
 ### ontap-thin
 
-**類型：** boolean (0 或 1)
-**預設值：** 1
-**說明：** 是否對 volume 與 LUN 使用精簡佈建 (thin provisioning)
+**類型**：boolean (0 或 1)
+**預設值**：1
+**說明**：是否對 volume 與 LUN 使用精簡佈建 (thin provisioning)
 
 ```bash
 --ontap-thin 1   # 精簡佈建 (預設)
 --ontap-thin 0   # 完整佈建 (thick provisioning)
 ```
 
-**精簡佈建優點：**
+**精簡佈建優點**：
 - 節省空間 - 僅使用實際資料所佔空間
 - 建立 volume 速度較快
 - 可支援超額配置 (overcommitment)
 
-**完整佈建優點：**
+**完整佈建優點**：
 - 保證空間配置
 - 效能較可預期
 - 無空間耗盡風險
 
 ### ontap-igroup-mode
 
-**類型：** enum (per-node, shared)
-**預設值：** per-node
-**說明：** igroup 管理模式
+**類型**：enum (per-node, shared)
+**預設值**：per-node
+**說明**：igroup 管理模式
 
 ```bash
 --ontap-igroup-mode per-node   # 每個 PVE 節點一個 igroup (預設)
 --ontap-igroup-mode shared     # 所有節點共用單一 igroup
 ```
 
-**per-node 模式：**
+**per-node 模式**：
 - 建立 igroup：`pve_{cluster}_{nodename}`
 - 每個 PVE 節點擁有獨立的 initiator group
 - 存取控制更為精細
 - 建議正式環境使用
 
-**shared 模式：**
+**shared 模式**：
 - 建立 igroup：`pve_{cluster}_shared`
 - 所有 PVE 節點共用單一 initiator group
 - 管理較為簡單
@@ -199,32 +199,32 @@ netappontap: <storage-id>
 
 ### ontap-cluster-name
 
-**類型：** string
-**預設值：** pve
-**說明：** igroup 命名時使用的叢集名稱
+**類型**：string
+**預設值**：pve
+**說明**：igroup 命名時使用的叢集名稱
 
 ```bash
 --ontap-cluster-name production
 --ontap-cluster-name lab
 ```
 
-**備註：**
+**備註**：
 - 用於產生獨特的 igroup 名稱：`pve_{cluster}_{node}`
 - 當多個 PVE 叢集共用同一 ONTAP 時特別有用
 - 僅允許英數字與底線
 
 ### ontap-device-timeout
 
-**類型：** integer
-**預設值：** 60
-**說明：** LUN 映射後等待裝置出現的逾時秒數
+**類型**：integer
+**預設值**：60
+**說明**：LUN 映射後等待裝置出現的逾時秒數
 
 ```bash
 --ontap-device-timeout 60    # 預設：60 秒
 --ontap-device-timeout 120   # 儲存網路較慢時可加大
 ```
 
-**備註：**
+**備註**：
 - 外掛在映射 LUN 後會等待裝置出現
 - 若逾時則作業失敗並回報 "Device did not appear" 錯誤
 - 高延遲網路環境建議加大此值
@@ -232,63 +232,63 @@ netappontap: <storage-id>
 
 ### ontap-portal-probe-timeout
 
-**型別：** integer（0-30）
-**預設：** 2
-**說明：** 在 `iscsiadm` discovery/login 之前，先做 TCP 預檢以跳過連不到的 iSCSI portal 的逾時(秒)。設為 `0` 可停用預檢(舊行為)。
+**型別**：integer（0-30）
+**預設**：2
+**說明**：在 `iscsiadm` discovery/login 之前，先做 TCP 預檢以跳過連不到的 iSCSI portal 的逾時(秒)。設為 `0` 可停用預檢(舊行為)。
 
 ```bash
 --ontap-portal-probe-timeout 2   # 預設
 --ontap-portal-probe-timeout 0   # 停用（僅在極高延遲網路）
 ```
 
-**備註：**
+**備註**：
 - 若無此預檢，一個連不到的 LIF 每個會吃掉最多 30s discovery + 60s login，拖住 `activate_storage`／`status`。
 - 高延遲或壅塞的儲存網路可加大。
 
 ### ontap-status-timeout
 
-**型別：** integer（1-30）
-**預設：** 5
-**說明：** 僅供 pvestatd 健康路徑(`activate_storage`／`status`)使用的每次 ONTAP REST 逾時，且不重試。讓退化的 ONTAP(例如 ONTAP／韌體升級時某控制器離線)不會拖住 pvestatd、也不會把同節點其他 netappontap 儲存拖成 `inactive`。
+**型別**：integer（1-30）
+**預設**：5
+**說明**：僅供 pvestatd 健康路徑(`activate_storage`／`status`)使用的每次 ONTAP REST 逾時，且不重試。讓退化的 ONTAP(例如 ONTAP／韌體升級時某控制器離線)不會拖住 pvestatd、也不會把同節點其他 netappontap 儲存拖成 `inactive`。
 
 ```bash
 --ontap-status-timeout 5    # 預設
 --ontap-status-timeout 10   # 給「慢但健康」的 ONTAP 多一點容忍
 ```
 
-**備註：**
+**備註**：
 - 資料路徑(alloc／free／clone)不受影響，維持原本較長的逾時 + 重試。下一輪約 10s 的 pvestatd 輪詢就是重試，所以這裡不重試不會損失什麼。
 - 在重載但健康的 ONTAP 上，若 metadata 查詢偶爾超過此值，儲存可能短暫顯示 `inactive`、下一輪恢復。**執行中的 VM 不受影響**(裝置仍 map 著)。若看到這種閃爍，把此值調大即可。
 
 ### ontap-activate-deadline
 
-**型別：** integer（5-120）
-**預設：** 30
-**說明：** `activate_storage` 中 iSCSI discover/login 迴圈的 wall-clock 預算(秒)。一旦超過且已有至少一個 portal 登入成功，剩餘 portal 就延到下次 activation。界定 iSCSI 登入的累積時間，讓單一「連得到卻在登入時 hang」的 portal 不會拖住 pvestatd。
+**型別**：integer（5-120）
+**預設**：30
+**說明**：`activate_storage` 中 iSCSI discover/login 迴圈的 wall-clock 預算(秒)。一旦超過且已有至少一個 portal 登入成功，剩餘 portal 就延到下次 activation。界定 iSCSI 登入的累積時間，讓單一「連得到卻在登入時 hang」的 portal 不會拖住 pvestatd。
 
 ```bash
 --ontap-activate-deadline 30   # 預設
 --ontap-activate-deadline 60   # 高延遲、多 LIF 的網路
 ```
 
-**備註：**
+**備註**：
 - 進行中的 login 絕不中斷，且在尚未有任何路徑時絕不跳過(必須取得至少一條路徑，否則誠實失敗)——所以不會把「慢但連得到」的儲存誤判成 inactive。
 - 被跳過的 portal 會在下次 activation 補上；multipath 備援會自我修復。
 
 ### ontap-inuse-io-check
 
-**類型：** boolean
-**預設：** 1（啟用）
-**說明：** 在刪除一個「裝置**未**對應到本節點」的 volume 之前，先詢問 ONTAP 該 LUN 是否正在傳輸資料，若是則拒絕刪除。
+**類型**：boolean
+**預設**：1（啟用）
+**說明**：在刪除一個「裝置**未**對應到本節點」的 volume 之前，先詢問 ONTAP 該 LUN 是否正在傳輸資料，若是則拒絕刪除。
 
 ```bash
 --ontap-inuse-io-check 1   # 預設
 --ontap-inuse-io-check 0   # 關閉跨節點檢查
 ```
 
-**為什麼需要：** 主機端的使用中檢查（掛載、swap、sysfs holders，以及透過 `fuser` 偵測開啟中的檔案描述子）只涵蓋它執行的那一個節點。在共享 SAN 上，正在使用該 LUN 的 guest 可能跑在**別的**節點；而在處理 `pvesm free` 的那個節點上，該 LUN 可能根本沒有對應過去 —— 因此本機沒有任何東西可檢查。這條路徑原本毫無防護：`DELETE /nodes/{node}/storage/{storage}/content/{volume}`，也就是儲存內容檢視中的 **Remove** 按鈕與 `pvesm free`，只做權限檢查就直接刪除。Proxmox VE 本身在該處僅保護 base volume。
+**為什麼需要**：主機端的使用中檢查（掛載、swap、sysfs holders，以及透過 `fuser` 偵測開啟中的檔案描述子）只涵蓋它執行的那一個節點。在共享 SAN 上，正在使用該 LUN 的 guest 可能跑在**別的**節點；而在處理 `pvesm free` 的那個節點上，該 LUN 可能根本沒有對應過去 —— 因此本機沒有任何東西可檢查。這條路徑原本毫無防護：`DELETE /nodes/{node}/storage/{storage}/content/{volume}`，也就是儲存內容檢視中的 **Remove** 按鈕與 `pvesm free`，只做權限檢查就直接刪除。Proxmox VE 本身在該處僅保護 base volume。
 
-**注意事項：**
+**注意事項**：
 - 此檢查是**單向的**：偵測到 I/O 才拒絕刪除；沒有 I/O 永遠不會阻擋刪除。閒置的 guest 不會產生 I/O，因此它不可能變成誤擋 —— 更重要的是它不會弄壞 `qm destroy`，因為 `qm destroy` 是在 guest 設定「仍然參照著這些磁碟」的情況下釋放 volume 的。
 - 判定依據是**傳輸的位元組數**，而非操作次數。`multipathd` 會對每一個已對應的 LUN 持續發出 TEST UNIT READY，那不會搬移任何資料，但若以操作次數計算，閒置的 LUN 會看起來很忙碌。
 - ONTAP 的計數器最多會落後一個統計週期，因此**剛剛**才被停止的 guest 其磁碟仍可能被判定為使用中數秒。重試即可。
@@ -296,39 +296,39 @@ netappontap: <storage-id>
 
 ### ontap-delete-deadline
 
-**類型：** integer（60～1800）
-**預設：** 300
-**說明：** `free_image` 中 volume 刪除重試迴圈的總時間預算（秒）。
+**類型**：integer（60～1800）
+**預設**：300
+**說明**：`free_image` 中 volume 刪除重試迴圈的總時間預算（秒）。
 
 ```bash
 --ontap-delete-deadline 300   # 預設
 --ontap-delete-deadline 600   # ONTAP 刪除 volume 確實較慢時
 ```
 
-**注意事項：**
+**注意事項**：
 - `free_image` 執行在 Proxmox VE 的**叢集層級**儲存鎖之內，因此在這裡花掉的時間會阻擋**每一個**節點對該 storage 的配置／釋放操作。
 - 單一次 ONTAP volume 刪除本身最久可達約 240 秒（60 秒 HTTP × 2 次重試，加上 120 秒的 job 等待），所以五次重試可能讓該鎖被持有約 20 分鐘。
 - 超出預算時會以明確訊息失敗，並指向 `volume clone show` 與 `volume recovery-queue show`，而不是繼續佔住鎖。
 
 ### ontap-purge-recovery-queue
 
-**類型：** boolean
-**預設：** 1（啟用）
-**說明：** 允許 plugin 在自己**已刪除**的 FlexClone 阻擋快照或 volume 刪除時，把它從 ONTAP 的 volume recovery queue 中 purge 掉。
+**類型**：boolean
+**預設**：1（啟用）
+**說明**：允許 plugin 在自己**已刪除**的 FlexClone 阻擋快照或 volume 刪除時，把它從 ONTAP 的 volume recovery queue 中 purge 掉。
 
 ```bash
 --ontap-purge-recovery-queue 1   # 預設
 --ontap-purge-recovery-queue 0   # 完全不動 recovery queue，改為回報錯誤
 ```
 
-**為什麼需要這個選項：** ONTAP 會把已刪除的 volume 保留在 volume recovery queue 中（預設啟用；保留時間由各 SVM 的 `vserver modify -volume-delete-retention-hours` 決定，預設 12 小時）。被該 queue 保留的已刪除 FlexClone **仍然算是其 parent 的 clone**，因此會造成：
+**為什麼需要這個選項**：ONTAP 會把已刪除的 volume 保留在 volume recovery queue 中（預設啟用；保留時間由各 SVM 的 `vserver modify -volume-delete-retention-hours` 決定，預設 12 小時）。被該 queue 保留的已刪除 FlexClone **仍然算是其 parent 的 clone**，因此會造成：
 
 - 刪除 parent 的快照失敗，錯誤為 `Snapshot ... has not expired or is locked`
 - 刪除 parent volume 失敗，錯誤為 `it has one or more clones`
 
 而且會持續整個保留期，錯誤訊息完全沒有提到這個 queue。實際情境是：銷毀一個 linked clone VM，接著要刪除來源快照，就會失敗長達 12 小時，而且看不出原因。
 
-**注意事項：**
+**注意事項**：
 - purge 的範圍**非常窄**。只有在 ONTAP 回報該項目是「目前操作對象」的 clone、它已不是線上 volume、它確實在 recovery queue 中，且名稱符合 plugin 自己的命名規則（`pve_*_<id>` 或 `tmpclone_pve_*_<id>`）時才會移除。**線上**的 clone 只會回報給您處理，絕不 purge；您自己建立的 clone 絕不觸碰。
 - 只會 purge 正在阻擋您剛剛要求的那次刪除的項目，因此 recovery queue 在其他所有情況下的保護仍然完整。每次 purge 都會寫入日誌。
 - 設為 `0` 時，您會得到可行動的錯誤訊息，指名被 queue 保留的 volume 以及自行清除的指令：
@@ -341,44 +341,44 @@ netappontap: <storage-id>
 
 ### content
 
-**類型：** content type 清單
-**預設值：** images
-**說明：** 允許的內容類型
+**類型**：content type 清單
+**預設值**：images
+**說明**：允許的內容類型
 
 ```bash
 --content images           # 僅 VM 磁碟映像
 --content images,rootdir   # VM 磁碟與容器 rootfs
 ```
 
-**支援的內容類型：**
+**支援的內容類型**：
 - `images` - VM 磁碟映像 (QEMU)
 - `rootdir` - 容器根目錄 (LXC)
 
-**不支援：**
+**不支援**：
 - `iso` - ISO 映像 (區塊儲存無法存放檔案)
 - `vztmpl` - 容器範本
 - `backup` - 備份檔
 
 ### shared
 
-**類型：** boolean (0 或 1)
-**預設值：** 0
-**說明：** 將儲存標記為叢集共用
+**類型**：boolean (0 或 1)
+**預設值**：0
+**說明**：將儲存標記為叢集共用
 
 ```bash
 --shared 1   # 共用儲存 (建議)
 --shared 0   # 本地儲存
 ```
 
-**備註：**
+**備註**：
 - iSCSI SAN 儲存應一律設為 1
 - 跨節點線上遷移 (live migration) 必須啟用
 
 ### nodes
 
-**類型：** node 清單
-**預設值：** 所有節點
-**說明：** 限制儲存僅於特定節點使用
+**類型**：node 清單
+**預設值**：所有節點
+**說明**：限制儲存僅於特定節點使用
 
 ```bash
 --nodes pve1,pve2      # 僅可於 pve1 與 pve2 使用
@@ -387,9 +387,9 @@ netappontap: <storage-id>
 
 ### disable
 
-**類型：** boolean (0 或 1)
-**預設值：** 0
-**說明：** 停用此儲存
+**類型**：boolean (0 或 1)
+**預設值**：0
+**說明**：停用此儲存
 
 ```bash
 --disable 1   # 停用儲存
@@ -461,12 +461,12 @@ security login create -user-or-group-name pveadmin \
     -role admin
 ```
 
-**優點：**
+**優點**：
 - 設定簡單
 - 可透過叢集管理 LIF 運作
 - 無需 SVM 管理 LIF
 
-**缺點：**
+**缺點**：
 - 權限範圍較廣 (admin 角色)
 
 ### 方案 B：SVM 層級帳號 (權限較受限)
@@ -498,11 +498,11 @@ security login create -vserver svm0 \
     -role pve_storage
 ```
 
-**優點：**
+**優點**：
 - 最小必要權限
 - 僅限定於特定 SVM
 
-**缺點：**
+**缺點**：
 - 需要 SVM 管理 LIF (與資料 LIF 分開)
 - 設定較為複雜
 
@@ -513,7 +513,7 @@ security login create -vserver svm0 \
 | 叢集 (Cluster) | 叢集管理 LIF | 通常已存在 (例如 192.168.1.194) |
 | SVM | SVM 管理 LIF | 經常未設定；資料 LIF 無法使用 |
 
-**常見問題：** 若建立了 SVM 層級帳號但 SVM 僅有資料 LIF，認證會失敗並顯示 "User is not authorized"。此時請改用叢集層級帳號。
+**常見問題**：若建立了 SVM 層級帳號但 SVM 僅有資料 LIF，認證會失敗並顯示 "User is not authorized"。此時請改用叢集層級帳號。
 
 ### 驗證權限
 
@@ -656,7 +656,7 @@ sed -i 's/vm-107-disk-0/base-107-disk-0/g' /etc/pve/qemu-server/107.conf
 
 密碼以明文儲存在 `/etc/pve/storage.cfg`。這是 **PVE 標準設計**，所有需要認證的儲存外掛皆採此方式 (Ceph、iSCSI CHAP、ZFS over iSCSI 等)。
 
-**檔案權限：**
+**檔案權限**：
 ```
 -rw-r----- root www-data /etc/pve/storage.cfg (mode 0640)
 ```
@@ -668,14 +668,14 @@ sed -i 's/vm-107-disk-0/base-107-disk-0/g' /etc/pve/qemu-server/107.conf
 | 其他使用者 | 無存取 | 由檔案權限保護 |
 | 叢集節點 | 讀取 | 由 pmxcfs (叢集檔案系統) 複寫 |
 
-**風險評估：**
+**風險評估**：
 - 一般使用者無法讀取此檔案
 - 具存取權者 (root、叢集管理員) 本身已擁有完整系統權限
 - ONTAP API 帳號應限制權限，以降低外洩時的影響
 
-**額外強化 (選用)：**
+**額外強化 (選用)**：
 
-1. **ONTAP 端 IP 限制：**
+1. **ONTAP 端 IP 限制**：
    ```bash
    # 在 ONTAP CLI 上限制 API 使用者只能從特定 IP 存取
    security login create -vserver svm0 \
@@ -690,11 +690,11 @@ sed -i 's/vm-107-disk-0/base-107-disk-0/g' /etc/pve/qemu-server/107.conf
        -vserver svm0 -access-log-policy <policy>
    ```
 
-2. **網路隔離：**
+2. **網路隔離**：
    - 將 ONTAP 管理 LIF 放置於獨立的管理 VLAN
    - 透過防火牆規則僅允許 PVE 節點存取 port 443
 
-3. **定期輪替密碼：**
+3. **定期輪替密碼**：
    ```bash
    # 在 ONTAP 上更新密碼
    security login password -username pveadmin -vserver svm0
@@ -703,7 +703,7 @@ sed -i 's/vm-107-disk-0/base-107-disk-0/g' /etc/pve/qemu-server/107.conf
    pvesm set netapp1 --ontap-password 'NewPassword'
    ```
 
-4. **監控：**
+4. **監控**：
    - 啟用 ONTAP API 存取稽核日誌
    - 監控異常 API 活動
 
@@ -721,7 +721,7 @@ pvesm set netapp1 --ontap-ssl-verify 1
 pvesm set netapp1 --ontap-ssl-verify 0
 ```
 
-**警告：** 當 `ontap-ssl-verify` 停用時，外掛會記錄警告訊息。
+**警告**：當 `ontap-ssl-verify` 停用時，外掛會記錄警告訊息。
 
 ### 3. API 使用者權限
 
@@ -752,12 +752,12 @@ security login create -vserver svm0 \
     -role pve_storage
 ```
 
-**帳號層級說明：**
+**帳號層級說明**：
 - **SVM 層級帳號**：需要 SVM 管理 LIF (與資料 LIF 分開)
 - **叢集層級帳號**：可使用叢集管理 LIF，但存取範圍較廣
 - 若 SVM 沒有管理 LIF，請改用叢集層級帳號並搭配適當角色
 
-**內建角色參考：**
+**內建角色參考**：
 
 | 角色 | 層級 | 權限 |
 |------|------|------|
@@ -777,7 +777,7 @@ security login create -vserver svm0 \
 iptables -A OUTPUT -d <ontap-mgmt-ip> -p tcp --dport 443 -j ACCEPT
 ```
 
-**網路架構範例：**
+**網路架構範例**：
 ```
 ┌─────────────┐     管理網路 (VLAN 10)              ┌─────────────┐
 │   PVE Node  │──────────── 192.168.1.0/24 ──────────│ ONTAP Mgmt  │
@@ -817,7 +817,7 @@ iptables -A OUTPUT -d <ontap-mgmt-ip> -p tcp --dport 443 -j ACCEPT
 | `30` | I/O 排隊約 150 秒後失敗 | **建議值** - 預留足夠時間讓 ONTAP failover 完成，同時避免永久卡住。 |
 | `fail` | I/O 立即失敗 | 過於激進 - 正常 failover 亦會引發不必要的錯誤。 |
 
-**建議值：** `no_path_retry 30`
+**建議值**：`no_path_retry 30`
 
 若現行設定為 `no_path_retry queue` 或有 `features "... queue_if_no_path ..."`，請修正為：
 
@@ -840,13 +840,13 @@ features "2 pg_init_retries 50"
 | `infinity` | 裝置**永不**移除 | **危險** - 已刪除 LUN 的殘留 SCSI 裝置永遠不會清除，會持續產生 I/O 錯誤。 |
 | `60` | 裝置於 60 秒後移除 | **建議值** - 預留時間處理暫時性故障，同時清除失效裝置。 |
 
-**建議值：** `dev_loss_tmo 60`
+**建議值**：`dev_loss_tmo 60`
 
 #### fast_io_fail_tmo
 
 控制當傳輸層回報錯誤時，路徑被標記為失效的速度。
 
-**建議值：** `fast_io_fail_tmo 5`
+**建議值**：`fast_io_fail_tmo 5`
 
 ### NetApp 建議的 multipath.conf
 
@@ -903,7 +903,7 @@ multipathd show config local
 multipath -ll
 ```
 
-> **為何不用 `reload`？** `systemctl reload multipathd` 只會命令 daemon 重新解析 `/etc/multipath.conf`。新設定僅套用於 *未來* 建立的裝置，**不會**清除既有的多重路徑 map。若系統已有已刪除 LUN 的殘留 map (例如 dm-X 裝置所有路徑顯示為 "failed faulty")，`reload` 並不會移除它們。請使用 `restart`。
+> **為何不用 `reload`**？`systemctl reload multipathd` 只會命令 daemon 重新解析 `/etc/multipath.conf`。新設定僅套用於 *未來* 建立的裝置，**不會**清除既有的多重路徑 map。若系統已有已刪除 LUN 的殘留 map (例如 dm-X 裝置所有路徑顯示為 "failed faulty")，`reload` 並不會移除它們。請使用 `restart`。
 
 ### 與既有儲存共存
 
@@ -922,22 +922,22 @@ pvesm add netappontap storage-dev  --ontap-cluster-name pve-dev ...
 
 ### 混合環境：手動 iSCSI LVM 與本外掛並存
 
-常見情境：PVE 節點已使用手動設定的 iSCSI (例如 PVE 內建的 "iSCSI" 或 "LVM on iSCSI" 儲存類型)，同時也安裝本外掛以使用額外的 NetApp 儲存。**本外掛完全支援此設定，但必須遵守以下關鍵規則：**
+常見情境：PVE 節點已使用手動設定的 iSCSI (例如 PVE 內建的 "iSCSI" 或 "LVM on iSCSI" 儲存類型)，同時也安裝本外掛以使用額外的 NetApp 儲存。**本外掛完全支援此設定，但必須遵守以下關鍵規則**：
 
-**應該做：**
+**應該做**：
 - 升級至 **v0.2.2 或更新版本** - 自動 orphan 清除會安全地處理本外掛的殘留裝置，不會影響手動設定的儲存。
 - 讓外掛完全管理其自有 LUN。
 - 若需手動清除，僅針對特定 WWID 進行 flush：`multipath -f <wwid>`。
 
-**不要做：**
-- **絕對不要使用 `multipath -F` (大寫 F)。** 此指令會清除系統上所有未使用的多重路徑 map，包含手動設定的 iSCSI LVM (若當下無 I/O 活動)。恢復時需執行 `systemctl reload multipathd` 或 `iscsiadm -m session --rescan`。
+**不要做**：
+- **絕對不要使用 `multipath -F` (大寫 F)**。此指令會清除系統上所有未使用的多重路徑 map，包含手動設定的 iSCSI LVM (若當下無 I/O 活動)。恢復時需執行 `systemctl reload multipathd` 或 `iscsiadm -m session --rescan`。
 - 不要 flush 不熟悉的 WWID - 這些可能屬於手動設定的儲存。
 
-**為何 v0.2.2 在混合環境中安全：**
+**為何 v0.2.2 在混合環境中安全**：
 
 外掛會在 `/var/lib/pve-storage-netapp/<storeid>-wwids.json` 維護每個儲存的 WWID 追蹤檔。只會紀錄本外掛 `path()` 呼叫所涉及的 WWID (亦即透過 `pvesm alloc` 或 `qm` 操作本外掛儲存所建立的 LUN)。當 orphan 清除執行時 (於 `status()` 輪詢期間)，只會比對追蹤檔中的 WWID 與 ONTAP LUN 清單。手動 iSCSI 設定的 WWID 絕對不會出現在追蹤檔中，因此**絕不會**被自動清除處理到。
 
-**將 `multipath -F` 與手動 LVM iSCSI 混用時的症狀：**
+**將 `multipath -F` 與手動 LVM iSCSI 混用時的症狀**：
 
 | 症狀 | 原因 | 解法 |
 |------|------|------|
@@ -945,7 +945,7 @@ pvesm add netappontap storage-dev  --ontap-cluster-name pve-dev ...
 | 將 VM 遷移至該節點失敗或 LVM 仍不存在 | PVE LVM 外掛不會自動重新掃描 multipath | 同上 |
 | 本外掛儲存正常，手動儲存故障 | `multipath -F` 只影響未使用的 map，本外掛的使用中 map 未受影響 | 同上 |
 
-結論：**升級至 v0.2.2 之後，不要再執行 `multipath -F`。** 外掛會自動且安全地處理自身清除工作。
+結論：**升級至 v0.2.2 之後，不要再執行 `multipath -F`**。外掛會自動且安全地處理自身清除工作。
 
 ## ONTAP HA 配置最佳實踐
 

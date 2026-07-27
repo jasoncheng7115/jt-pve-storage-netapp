@@ -1460,7 +1460,7 @@
         <div class="changelog-date">2026-06-16</div>
         <div class="changelog-summary">
             <span class="lang-en">postinst: prominent "restart pvestatd (not reload)" upgrade warning. postinst reloads PVE services with <code>systemctl reload</code> (SIGHUP) to avoid restart stop-phase hangs on D-state children, but on many PVE versions SIGHUP re-exec does NOT reload the plugin's Perl modules — pvestatd keeps running the old code in memory (the PID stays the same) even though the new files are on disk. In the v0.2.21 rollout this made an installed fix appear to have no effect for over an hour. postinst now prints a prominent warning that the operator MUST run <code>systemctl restart pvestatd</code> on every node (and verify the PID changed). No Perl code change — lib/ is byte-identical to 0.2.21.</span>
-            <span class="lang-zh">postinst：醒目的「restart pvestatd（而非 reload）」升級警告。postinst 用 <code>systemctl reload</code>（SIGHUP）重載 PVE 服務，以避免 restart 卡在 D-state 子程序，但在許多 PVE 版本上 SIGHUP re-exec **不會**重載外掛的 Perl 模組——即使新檔案已在磁碟上，pvestatd 仍在記憶體裡跑舊 code（PID 不變）。在 v0.2.21 部署中，這讓一個已安裝的修正一個多小時都看似沒生效。postinst 現在會印出醒目警告，告知操作者**必須**在每個節點執行 <code>systemctl restart pvestatd</code>（並確認 PID 已改變）。沒有 Perl code 變更——lib/ 與 0.2.21 逐位元組相同。</span>
+            <span class="lang-zh">postinst：醒目的「restart pvestatd（而非 reload）」升級警告。postinst 用 <code>systemctl reload</code>（SIGHUP）重載 PVE 服務，以避免 restart 卡在 D-state 子程序，但在許多 PVE 版本上 SIGHUP re-exec <strong>不會</strong>重載外掛的 Perl 模組——即使新檔案已在磁碟上，pvestatd 仍在記憶體裡跑舊 code（PID 不變）。在 v0.2.21 部署中，這讓一個已安裝的修正一個多小時都看似沒生效。postinst 現在會印出醒目警告，告知操作者<strong>必須</strong>在每個節點執行 <code>systemctl restart pvestatd</code>（並確認 PID 已改變）。沒有 Perl code 變更——lib/ 與 0.2.21 逐位元組相同。</span>
         </div>
     </div>
 

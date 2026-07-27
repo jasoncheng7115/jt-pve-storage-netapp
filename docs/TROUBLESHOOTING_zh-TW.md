@@ -25,11 +25,11 @@ curl -k -u username:password https://ONTAP_IP/api/cluster
 
 ### 外掛未載入
 
-**症狀：**
+**症狀**：
 - `pvesm add --help` 未顯示 `netappontap`
 - 錯誤：`unknown storage type 'netappontap'`
 
-**診斷：**
+**診斷**：
 
 ```bash
 # 確認外掛檔案存在
@@ -42,30 +42,30 @@ perl -I /usr/share/perl5 -c /usr/share/perl5/PVE/Storage/Custom/NetAppONTAPPlugi
 journalctl -xeu pvedaemon | grep -i "netapp\|plugin\|error"
 ```
 
-**解決方式：**
+**解決方式**：
 
-1. **重新安裝外掛：**
+1. **重新安裝外掛**：
    ```bash
    dpkg -i jt-pve-storage-netapp_*.deb
    systemctl restart pvedaemon pveproxy
    ```
 
-2. **檢查相依套件：**
+2. **檢查相依套件**：
    ```bash
    apt install -f
    ```
 
-3. **驗證 Perl 模組：**
+3. **驗證 Perl 模組**：
    ```bash
    perl -MPVE::Storage -e 'print "OK\n"'
    ```
 
 ### API 版本警告
 
-**症狀：**
+**症狀**：
 - 警告：`Plugin ... is implementing an older storage API`
 
-**解決方式：**
+**解決方式**：
 此為告知性警告，外掛仍可運作。若要消除警告，請升級至最新版外掛。
 
 ---
@@ -74,11 +74,11 @@ journalctl -xeu pvedaemon | grep -i "netapp\|plugin\|error"
 
 ### 儲存未啟用
 
-**症狀：**
+**症狀**：
 - `pvesm status` 顯示儲存為 inactive
 - 無法在儲存上建立 VM
 
-**診斷：**
+**診斷**：
 
 ```bash
 # 檢查儲存設定
@@ -91,9 +91,9 @@ curl -k -u <username>:<password> https://<portal>/api/cluster
 journalctl -xeu pvedaemon | grep -i "netapp\|ontap" | tail -20
 ```
 
-**常見原因與解決方式：**
+**常見原因與解決方式**：
 
-1. **認證錯誤：**
+1. **認證錯誤**：
    ```bash
    # 測試認證
    curl -k -u pveadmin:password https://192.168.1.100/api/cluster
@@ -102,7 +102,7 @@ journalctl -xeu pvedaemon | grep -i "netapp\|ontap" | tail -20
    pvesm set <storage-id> --ontap-password 'NewPassword'
    ```
 
-2. **網路連線問題：**
+2. **網路連線問題**：
    ```bash
    # 測試連線
    ping <ontap-portal>
@@ -112,13 +112,13 @@ journalctl -xeu pvedaemon | grep -i "netapp\|ontap" | tail -20
    iptables -L -n | grep 443
    ```
 
-3. **SSL 憑證問題：**
+3. **SSL 憑證問題**：
    ```bash
    # 暫時關閉 SSL 驗證
    pvesm set <storage-id> --ontap-ssl-verify 0
    ```
 
-4. **SVM 無法存取：**
+4. **SVM 無法存取**：
    ```bash
    # 於 ONTAP 檢查 SVM 狀態
    vserver show -vserver <svm-name>
@@ -129,16 +129,16 @@ journalctl -xeu pvedaemon | grep -i "netapp\|ontap" | tail -20
 
 ### ONTAP 升級或重載時，儲存短暫顯示「inactive」
 
-**症狀：**
+**症狀**：
 - 某 netappontap 儲存在 Web UI 短暫變成 `inactive`、幾秒後又恢復，尤其在 ONTAP／韌體升級(控制器 takeover/giveback)期間，或 ONTAP 重載時。
 - `journalctl -u pvestatd` 出現短暫的 `unreachable ... Reason: ... read timeout`，會自己消失。
 
-**這是 v0.2.19+ 的預期設計行為，而且不影響執行中的 VM。**
+**這是 v0.2.19+ 的預期設計行為，而且不影響執行中的 VM**。
 
 - pvestatd 健康路徑(`activate_storage`／`status`)採用短逾時且不重試(`ontap-status-timeout`，預設 5s)。ONTAP 一時變慢時，外掛快速失敗、下一輪約 10s 的輪詢就恢復，而不會拖住 pvestatd、也不會把同節點**其他**儲存一起拖成 `inactive`。
 - 全程**執行中的 VM I/O 不中斷**——`inactive` 只影響狀態顯示與新操作，不影響已啟用的裝置。可用 `multipath -ll` 確認(該 LUN 的路徑維持 `active ready running`)。
 
-**該怎麼做：**
+**該怎麼做**：
 - 若一兩輪內就恢復，不必處理——這就是預期的 fast-fail 行為。
 - 若是**重載但健康**的 ONTAP 經常閃爍，把健康路徑逾時調大：
   ```bash
@@ -162,10 +162,10 @@ journalctl -u pvestatd -f                        # 觀察 status update time 維
 
 ### 設定錯誤
 
-**症狀：**
+**症狀**：
 - 出現缺少或無效選項的錯誤訊息
 
-**解決方式：**
+**解決方式**：
 
 確認所有必要選項皆已設定：
 ```bash
@@ -185,11 +185,11 @@ pvesm config <storage-id>
 
 ### 沒有 iSCSI Session
 
-**症狀：**
+**症狀**：
 - `iscsiadm -m session` 未顯示任何 session
 - 無法存取 LUN
 
-**診斷：**
+**診斷**：
 
 ```bash
 # 檢查 iSCSI daemon
@@ -202,14 +202,14 @@ iscsiadm -m discovery -t sendtargets -p <ontap-ip>
 cat /etc/iscsi/initiatorname.iscsi
 ```
 
-**解決方式：**
+**解決方式**：
 
-1. **啟動 iSCSI daemon：**
+1. **啟動 iSCSI daemon**：
    ```bash
    systemctl enable --now iscsid
    ```
 
-2. **探索並登入：**
+2. **探索並登入**：
    ```bash
    # 探索 target
    iscsiadm -m discovery -t sendtargets -p <ontap-data-ip>
@@ -218,7 +218,7 @@ cat /etc/iscsi/initiatorname.iscsi
    iscsiadm -m node --login
    ```
 
-3. **檢查 ONTAP 上的 igroup：**
+3. **檢查 ONTAP 上的 igroup**：
    ```bash
    # 於 ONTAP CLI
    igroup show -vserver <svm>
@@ -229,11 +229,11 @@ cat /etc/iscsi/initiatorname.iscsi
 
 ### 建立後找不到 LUN
 
-**症狀：**
+**症狀**：
 - 磁碟建立成功
 - `/dev/` 下未出現對應裝置
 
-**診斷：**
+**診斷**：
 
 ```bash
 # 檢查新裝置
@@ -246,27 +246,27 @@ multipath -ll
 # lun show -vserver <svm> -mapped
 ```
 
-**解決方式：**
+**解決方式**：
 
-1. **重新掃描 iSCSI session：**
+1. **重新掃描 iSCSI session**：
    ```bash
    iscsiadm -m session --rescan
    ```
 
-2. **重新掃描 SCSI hosts：**
+2. **重新掃描 SCSI hosts**：
    ```bash
    for host in /sys/class/scsi_host/host*/scan; do
        echo "- - -" > $host
    done
    ```
 
-3. **重載多重路徑：**
+3. **重載多重路徑**：
    ```bash
    multipathd reconfigure
    multipath -v2
    ```
 
-4. **完整重新掃描程序：**
+4. **完整重新掃描程序**：
    ```bash
    iscsiadm -m session --rescan
    sleep 2
@@ -277,20 +277,20 @@ multipath -ll
 
 ### Session 逾時
 
-**症狀：**
+**症狀**：
 - iSCSI session 斷線
 - 操作過程出現 I/O 錯誤
 
-**解決方式：**
+**解決方式**：
 
-1. **調整 `/etc/iscsi/iscsid.conf` 中的逾時值：**
+1. **調整 `/etc/iscsi/iscsid.conf` 中的逾時值**：
    ```ini
    node.session.timeo.replacement_timeout = 120
    node.conn[0].timeo.noop_out_interval = 5
    node.conn[0].timeo.noop_out_timeout = 5
    ```
 
-2. **重啟 iSCSI：**
+2. **重啟 iSCSI**：
    ```bash
    systemctl restart iscsid
    iscsiadm -m node --logout
@@ -303,11 +303,11 @@ multipath -ll
 
 ### 多重路徑裝置未建立
 
-**症狀：**
+**症狀**：
 - `lsscsi` 可見多條路徑
 - 沒有 `/dev/mapper/` 裝置
 
-**診斷：**
+**診斷**：
 
 ```bash
 # 檢查 multipathd 狀態
@@ -323,14 +323,14 @@ multipathd show paths
 multipathd show maps
 ```
 
-**解決方式：**
+**解決方式**：
 
-1. **啟動 multipathd：**
+1. **啟動 multipathd**：
    ```bash
    systemctl enable --now multipathd
    ```
 
-2. **加入 NetApp 設定 (安全設定)：**
+2. **加入 NetApp 設定 (安全設定)**：
    ```bash
    cat >> /etc/multipath.conf << 'EOF'
    devices {
@@ -356,9 +356,9 @@ multipathd show maps
    systemctl restart multipathd
    ```
 
-   > **警告：** 請勿使用 `features "3 queue_if_no_path pg_init_retries 50"` 或 `dev_loss_tmo infinity`。這些設定會導致當 LUN 無法使用時，整個 PVE 節點卡住。詳情請參閱 [CONFIGURATION_zh-TW.md](CONFIGURATION_zh-TW.md#多重路徑-multipath-設定)。
+   > **警告**：請勿使用 `features "3 queue_if_no_path pg_init_retries 50"` 或 `dev_loss_tmo infinity`。這些設定會導致當 LUN 無法使用時，整個 PVE 節點卡住。詳情請參閱 [CONFIGURATION_zh-TW.md](CONFIGURATION_zh-TW.md#多重路徑-multipath-設定)。
 
-3. **重新設定多重路徑：**
+3. **重新設定多重路徑**：
    ```bash
    multipathd reconfigure
    multipath -v2
@@ -366,18 +366,18 @@ multipathd show maps
 
 ### 殘留的多重路徑裝置
 
-**症狀：**
+**症狀**：
 - LUN 刪除或 VM 移除後，舊的多重路徑裝置仍然存在
 - 裝置顯示所有路徑為 `failed faulty running`
 - 可能出現在未執行刪除操作的叢集節點上
 - `lsblk` 與 `multipath -ll` 仍顯示已刪除的 LUN
 
-**根本原因：**
+**根本原因**：
 - 在某節點刪除 LUN 時，**其他**節點仍保留本地 SCSI 裝置
 - 核心不會自動移除已解除映射 LUN 的 SCSI 裝置
 - 多重路徑 map 會持續存在直到明確清除
 
-**v0.2.2+ 自動解法：**
+**v0.2.2+ 自動解法**：
 
 此問題現已自動處理。外掛會追蹤曾出現過的 WWID，並於每次 `status()` 輪詢時執行 orphan 清除 (背景 fork、非阻塞)。若從舊版升級，只要等待下一次 status 輪詢，殘留裝置就會被清除。
 
@@ -387,7 +387,7 @@ journalctl -u pvedaemon --since "5 minutes ago" | grep "Orphan cleanup"
 # 預期：「Orphan cleanup: processed N stale WWID(s)」
 ```
 
-**手動清除 (僅在 v0.2.2 前遺留情況下需要)：**
+**手動清除 (僅在 v0.2.2 前遺留情況下需要)**：
 
 ```bash
 # 1. 識別殘留 WWID - 找出所有路徑顯示為 "failed faulty running" 的項目
@@ -406,7 +406,7 @@ for sd in $(lsscsi | grep NETAPP | awk '{print $NF}'); do
 done
 ```
 
-**警告 - 不要使用 `multipath -F`：**
+**警告 - 不要使用 `multipath -F`**：
 
 > `multipath -F` (大寫 F) 會清除系統上所有未使用的多重路徑 map。在混合環境中 (例如本外掛加上手動設定的 iSCSI LVM)，會中斷當下沒有 I/O 的任何儲存，包括：
 > - 當下沒有執行 VM 的節點上手動設定的 iSCSI/FC LVM 儲存
@@ -414,9 +414,9 @@ done
 >
 > 恢復時需在各受影響節點執行 `systemctl reload multipathd` 或 `iscsiadm -m session --rescan`，必要時還需重新掃描 LVM。
 >
-> **請一律使用 `multipath -f <wwid>` (小寫) 以清除特定裝置。**
+> **請一律使用 `multipath -f <wwid>` (小寫) 以清除特定裝置**。
 
-**混合環境情境 (手動 iSCSI LVM 與本外掛並存)：**
+**混合環境情境 (手動 iSCSI LVM 與本外掛並存)**：
 
 | 症狀 | 原因 | 解法 |
 |------|------|------|
@@ -430,11 +430,11 @@ done
 
 ### 快照建立失敗
 
-**症狀：**
+**症狀**：
 - 建立 VM 快照時出錯
 - ONTAP 上未出現快照
 
-**診斷：**
+**診斷**：
 
 ```bash
 # 檢查 ONTAP 快照
@@ -444,21 +444,21 @@ done
 journalctl -xeu pvedaemon | grep -i snapshot
 ```
 
-**解決方式：**
+**解決方式**：
 
-1. **確認 volume 存在：**
+1. **確認 volume 存在**：
    ```bash
    # 於 ONTAP
    vol show -vserver <svm> -volume pve_<storage>_<vmid>_*
    ```
 
-2. **檢查快照空間：**
+2. **檢查快照空間**：
    ```bash
    # 於 ONTAP
    vol show -vserver <svm> -fields percent-snapshot-space
    ```
 
-3. **驗證 API 權限：**
+3. **驗證 API 權限**：
    ```bash
    # 於 ONTAP
    security login role show -vserver <svm> -role <role> -cmddirname snapshot
@@ -466,23 +466,23 @@ journalctl -xeu pvedaemon | grep -i snapshot
 
 ### 快照還原失敗
 
-**症狀：**
+**症狀**：
 - 還原操作失敗
 - 錯誤：`volume is busy`
 
-**解決方式：**
+**解決方式**：
 
-1. **確認 VM 已停機：**
+1. **確認 VM 已停機**：
    ```bash
    qm stop <vmid>
    ```
 
-2. **檢查是否有活動中的 session：**
+2. **檢查是否有活動中的 session**：
    ```bash
    iscsiadm -m session | grep <volume-name>
    ```
 
-3. **中斷 volume 連線：**
+3. **中斷 volume 連線**：
    ```bash
    # 可能需要手動中斷連線
    iscsiadm -m node -T <target> -p <portal> --logout
@@ -494,11 +494,11 @@ journalctl -xeu pvedaemon | grep -i snapshot
 
 ### ONTAP API 權限遭拒
 
-**症狀：**
+**症狀**：
 - HTTP 403 錯誤
 - 日誌出現 `access denied`
 
-**診斷：**
+**診斷**：
 
 ```bash
 # 測試 API 存取
@@ -508,7 +508,7 @@ curl -k -u <user>:<pass> https://<portal>/api/storage/volumes
 security login role show -vserver <svm> -role <role>
 ```
 
-**解決方式：**
+**解決方式**：
 
 加入缺少的權限：
 ```bash
@@ -525,7 +525,7 @@ security login role create -vserver <svm> -role <role> -cmddirname "snapshot" -a
 
 ### I/O 效能緩慢
 
-**診斷：**
+**診斷**：
 
 ```bash
 # 檢查多重路徑狀態
@@ -538,9 +538,9 @@ multipathd show paths format "%d %T %t %s"
 iscsiadm -m session -P 3
 ```
 
-**解決方式：**
+**解決方式**：
 
-1. **啟用 queue_if_no_path：**
+1. **啟用 queue_if_no_path**：
    ```bash
    # 於 /etc/multipath.conf
    defaults {
@@ -548,11 +548,11 @@ iscsiadm -m session -P 3
    }
    ```
 
-2. **使用多路徑：**
+2. **使用多路徑**：
    - 設定多個 iSCSI 資料 LIF
    - 確認多重路徑設定正確
 
-3. **檢查網路：**
+3. **檢查網路**：
    ```bash
    # 測試吞吐量
    iperf3 -c <ontap-ip>
@@ -564,7 +564,7 @@ iscsiadm -m session -P 3
 
 ### 節點故障後復原
 
-1. **在新節點 / 已復原的節點上：**
+1. **在新節點 / 已復原的節點上**：
    ```bash
    # 確認服務啟動
    systemctl start iscsid multipathd
@@ -579,7 +579,7 @@ iscsiadm -m session -P 3
    multipathd reconfigure
    ```
 
-2. **重啟 PVE 服務：**
+2. **重啟 PVE 服務**：
    ```bash
    systemctl restart pvedaemon pveproxy
    ```
@@ -615,7 +615,7 @@ vol delete -vserver <svm> -volume <vol-name>
 
 ## 無法刪除 Volume：Plugin 管理的 LUN 上有 LVM
 
-**症狀：**
+**症狀**：
 ```
 Cannot delete volume 'vm-XXXXX-disk-0': device /dev/mapper/3600a... is still in use.
 [HOLDERS] Device has N holder(s):
@@ -624,14 +624,14 @@ Cannot delete volume 'vm-XXXXX-disk-0': device /dev/mapper/3600a... is still in 
   Detected LVM VG(s): pbs
 ```
 
-**原因：** 有人直接在 plugin 管理的 multipath LUN（或其 partition）上，於 PVE 主機層級建立了 LVM volume group。常見情境：
+**原因**：有人直接在 plugin 管理的 multipath LUN（或其 partition）上，於 PVE 主機層級建立了 LVM volume group。常見情境：
 - 在 plugin LUN 的 partition 上建立 PBS（Proxmox Backup Server）儲存
 - 在 plugin LUN 上手動建立 LVM VG 作為主機層級儲存
 - 主機 LVM 自動啟用了 VM 磁碟內部的 VG（PVE 7->8->9 升級時未設定 lvm.conf global_filter）
 
 Plugin 管理的 LUN 設計上專供 PVE 作為 VM/CT 磁碟使用（整顆 LUN 傳遞給 QEMU）。在上面建立主機層級的 LVM 會與 plugin 的生命週期管理衝突。
 
-**解決方式：**
+**解決方式**：
 
 1. 確認 LVM VG 資料已不再需要（或已遷移至其他位置）。
 
@@ -653,7 +653,7 @@ Plugin 管理的 LUN 設計上專供 PVE 作為 VM/CT 磁碟使用（整顆 LUN 
    pvesm free <storage>:<volname>
    ```
 
-**預防措施：**
+**預防措施**：
 - 不要在 plugin 管理的 LUN 上建立 LVM、PBS 儲存或任何主機層級儲存
 - 主機層級 LVM 需求請使用客戶自行管理的儲存（例如手動 iSCSI LVM）
 - 在 `/etc/lvm/lvm.conf` 中加入 `global_filter` 以防止自動啟用：
@@ -663,15 +663,15 @@ Plugin 管理的 LUN 設計上專供 PVE 作為 VM/CT 磁碟使用（整顆 LUN 
 
 ## 無法刪除 Volume：Bare Partition Holders (v0.2.7 已修復)
 
-**症狀（v0.2.6 及更早版本）：**
+**症狀（v0.2.6 及更早版本）**：
 ```
 Cannot delete volume: device is still in use (mounted, has holders, or open by process)
 ```
 所有磁碟刪除都失敗，即使磁碟上沒有 LVM 或掛載。
 
-**原因：** 當 kernel 偵測到 VM 磁碟內有 partition table 時，會自動在 multipath LUN 上建立 partition dm 裝置。在 v0.2.7 之前，`is_device_in_use()` 將所有 holder 都視為「使用中」，包括這些無害的 partition 殘留。
+**原因**：當 kernel 偵測到 VM 磁碟內有 partition table 時，會自動在 multipath LUN 上建立 partition dm 裝置。在 v0.2.7 之前，`is_device_in_use()` 將所有 holder 都視為「使用中」，包括這些無害的 partition 殘留。
 
-**解決方式：** 升級至 v0.2.7 或更新版本。Plugin 現在能正確忽略 bare kpartx partition holder（上面沒有 LVM/掛載/swap），同時在 partition 有真正的 sub-holder 時仍會阻擋刪除。
+**解決方式**：升級至 v0.2.7 或更新版本。Plugin 現在能正確忽略 bare kpartx partition holder（上面沒有 LVM/掛載/swap），同時在 partition 有真正的 sub-holder 時仍會阻擋刪除。
 
 ---
 
@@ -864,7 +864,7 @@ pvesm set <storage-id> --ontap-password "$omeP@ss"  # 錯誤
 
 ## 取得協助
 
-1. **收集診斷資訊：**
+1. **收集診斷資訊**：
    ```bash
    pvesm status
    iscsiadm -m session
@@ -872,12 +872,12 @@ pvesm set <storage-id> --ontap-password "$omeP@ss"  # 錯誤
    journalctl -xeu pvedaemon --since "1 hour ago" > pvedaemon.log
    ```
 
-2. **查閱文件：**
+2. **查閱文件**：
    - [QUICKSTART_zh-TW.md](QUICKSTART_zh-TW.md)
    - [CONFIGURATION_zh-TW.md](CONFIGURATION_zh-TW.md)
    - [NAMING_CONVENTIONS_zh-TW.md](NAMING_CONVENTIONS_zh-TW.md)
 
-3. **回報問題：**
+3. **回報問題**：
    - GitHub Issues：https://github.com/jasoncheng7115/jt-pve-storage-netapp/issues
    - 請提供：PVE 版本、ONTAP 版本、錯誤訊息、日誌
 

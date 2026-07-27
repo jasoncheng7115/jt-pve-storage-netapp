@@ -2,6 +2,43 @@
 
 NetApp ONTAP Storage Plugin for Proxmox VE 的所有重要變更都記錄在此。
 
+## [0.2.26] - 2026-07-27
+
+### FC：不再於每次輪詢發出 LIP，並為 rescan 迴圈加上時間上限
+
+**僅影響 FC —— iSCSI 環境不受這兩項變更影響。**
+
+#### Fabric 擾動：每次輪詢都發一次 LIP
+
+`rescan_fc_hosts()` 在每次呼叫時都會發出 **Loop Initialization Primitive**，而 `activate_storage()` 是無條件呼叫它的。由於 pvestatd 大約每 10 秒就會在每個節點執行一次 `activate_storage`，FC 環境等於**每個 HBA port 每 ~10 秒發出一次 LIP，且永不停止**。
+
+`issue_lip` 會重置 FC port 並強制 fabric 重新登入，短暫擾動**該 HBA 後方的每一顆 LUN**——不只是本外掛的。要在一個已經登入的 port 上發現新對應的 LUN，只需要單純的 SCSI `- - -` scan；LIP 是給真正的拓撲變更用的。
+
+- **修正**：LIP 改為選用（`lip => 1`）且**預設關閉**。五個呼叫點中，只有 `_get_snapshot_path()` 裡「裝置始終沒有出現」的 fallback 會要求它。`activate_storage()`、`activate_volume()` 與 `path()` 的重試迴圈都改為僅 scan，因此 LIP 絕不可能從輪詢或重試迴圈中被發出。
+
+#### 沒有上限的迴圈
+
+同一個函式沒有總時間預算。它的單次寫入逾時（10 秒）界定的是**一次** sysfs 寫入，而非整個迴圈，因此擁有四個 HBA port 的節點可能在 `activate_storage` 內耗費 4 × (10 + 10) = 約 80 秒。這正是 v0.2.20 的教訓——單次呼叫的逾時永遠無法界定迴圈的總時間——而該教訓先前只套用在 iSCSI 登入迴圈上。
+
+- **修正**：`rescan_fc_hosts()` 現在接受總時間預算（預設 30 秒），兩個迴圈都會遵守。
+
+#### 本實驗環境無法測試
+
+此處沒有 FC HBA 可用，因此**這兩項變更都是程式碼審查得出的修正，僅由靜態與單元斷言覆蓋**。在真實 FC 環境中，請另以 `journalctl -k | grep -i lip` 確認正常輪詢期間不會發出 LIP。此限制已明確記載於 `docs/TESTING.md` 第 33.1 節，而非隱而不宣。
+
+### 稽核：LXC／vzdump 端到端實測，結果乾淨
+
+無任何缺陷。在真實叢集與真實 ONTAP 上執行：以本外掛作為 rootfs 建立 CT（`alloc_image` → mkfs → mount）、啟動、**在執行中**建立快照、`vzdump --mode snapshot`、倒回、線上擴充 rootfs、銷毀。
+
+- 倒回確實還原了較舊的內容——快照之後建立的檔案在倒回後已消失。
+- 線上擴充讓 CT 從 2.0 G 增至 2.9 G，LUN 為 3.0 GiB。
+- 銷毀後 ONTAP 上 0 個 volume、0 個 NETAPP multipath map、0 個 `sd` slave。
+- 一個**中途被中斷**的備份留下了完全符合預期的殘留（一個 `vzdump` 快照加上 `tmpclone_<vol>_pve_snap_vzdump`），並在移除該快照後完全復原——正是 v0.2.13／v0.2.14 的事故情境，主機端完整拆除且無 `tur checker` 洗版。
+
+已記錄於 `docs/TESTING.md` 第 33 節，避免日後重新推導。
+
+**測試**：`make test` 6/6、podchecker OK、單元 **208/208**、對真實 ONTAP 模擬器的功能測試 **53/53**，另加上述 LXC／vzdump 端到端測試。
+
 ## [0.2.25] - 2026-07-27
 
 ### `path()`：讓合成的裝置路徑每個 volume 皆唯一

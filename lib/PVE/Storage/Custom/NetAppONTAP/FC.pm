@@ -197,55 +197,84 @@ sub get_fc_host_info {
 
 # Rescan FC hosts for new LUNs
 # This triggers a LIP (Loop Initialization Primitive) or fabric rescan
+# Rescan FC hosts for newly mapped LUNs.
+#
+# %opts:
+#   lip    - issue a Loop Initialization Primitive first (default OFF, see below)
+#   budget - wall-clock ceiling in seconds for the whole call (default 30)
+#   delay  - settle time after scanning (default 2)
+#
+# LIP IS OFF BY DEFAULT, DELIBERATELY. issue_lip resets the FC port and forces a
+# fabric re-login; it briefly disturbs every LUN behind that HBA, not just ours.
+# activate_storage() runs on the pvestatd path roughly every 10 seconds on every
+# node, and it used to call this unconditionally -- so an FC installation was
+# issuing a LIP per HBA port every ~10s, forever. Discovering a newly mapped LUN
+# on a port that is already logged in only needs the plain SCSI "- - -" scan
+# below; LIP is for genuine topology changes and belongs on the "the device never
+# appeared" fallback path, not on a poll.
+#
+# The wall-clock budget matters for the same reason it did for the iSCSI login
+# loop in v0.2.20: the per-write timeouts (10s each) bound ONE write, not the
+# loop. With four HBA ports the old code could spend 4 x (10 + 10) = 80s inside
+# activate_storage -- a per-call timeout never bounds a loop's total time.
 sub rescan_fc_hosts {
     my (%opts) = @_;
 
     my $hosts = get_fc_hosts();
-    my $rescanned = 0;
+    my $deadline = time() + ($opts{budget} // 30);
+    my $scanned = 0;
 
-    for my $host (@$hosts) {
-        # Method 1: Issue LIP (Loop Initialization Primitive)
-        my $issue_lip_file = FC_HOST_PATH . "/$host/issue_lip";
-        if (-w $issue_lip_file) {
-            if (sysfs_write_with_timeout($issue_lip_file, "1\n", 10)) {
-                $rescanned++;
-            } else {
-                warn "FC rescan failed for $host (issue_lip): timed out\n";
+    if ($opts{lip}) {
+        for my $host (@$hosts) {
+            if (time() >= $deadline) {
+                warn "FC rescan: wall-clock budget spent before issuing LIP on all "
+                   . "hosts; remaining hosts skipped this round\n";
+                last;
             }
+            my $issue_lip_file = FC_HOST_PATH . "/$host/issue_lip";
+            next unless -w $issue_lip_file;
+            sysfs_write_with_timeout($issue_lip_file, "1\n", 10)
+                or warn "FC rescan failed for $host (issue_lip): timed out\n";
         }
     }
 
-    # Also trigger SCSI host scan for new devices on the FC hosts only.
+    # Trigger a SCSI host scan for new devices on the FC hosts ONLY.
     #
-    # CRITICAL: do NOT iterate all of /sys/class/scsi_host/. Writing
-    # "- - -" to a non-FC host's scan file (e.g. smartpqi RAID
-    # controllers, USB SD readers, virtio-scsi, megaraid, mpt3sas)
-    # triggers driver-side full rescans that can hang for hundreds of
-    # seconds in HBA/RAID drivers. Observed in production on HPE
-    # ProLiant with smartpqi: 600+ seconds D-state blocking all
-    # subsequent storage operations.
+    # CRITICAL: do NOT iterate all of /sys/class/scsi_host/. Writing "- - -" to a
+    # non-FC host's scan file (e.g. smartpqi RAID controllers, USB SD readers,
+    # virtio-scsi, megaraid, mpt3sas) triggers driver-side full rescans that can
+    # hang for hundreds of seconds in HBA/RAID drivers. Observed in production on
+    # HPE ProLiant with smartpqi: 600+ seconds D-state blocking all subsequent
+    # storage operations.
     #
-    # Instead, only rescan the SCSI hosts corresponding to the FC hosts
-    # we enumerated via /sys/class/fc_host/. Each FC host is also a
-    # SCSI host with the same hostN name, so /sys/class/scsi_host/hostN
-    # maps to /sys/class/fc_host/hostN for the same N.
+    # Instead, only rescan the SCSI hosts corresponding to the FC hosts we
+    # enumerated via /sys/class/fc_host/. Each FC host is also a SCSI host with the
+    # same hostN name, so /sys/class/scsi_host/hostN maps to
+    # /sys/class/fc_host/hostN for the same N.
     my $scsi_host_path = '/sys/class/scsi_host';
     for my $host (@$hosts) {
+        if (time() >= $deadline) {
+            warn "FC rescan: wall-clock budget spent; remaining hosts are scanned "
+               . "on a later call\n";
+            last;
+        }
         # Untaint host name (comes from get_fc_hosts() which validates)
-        ($host) = $host =~ /^(host\d+)$/;
-        next unless $host;
+        my ($safe) = $host =~ /^(host\d+)$/;
+        next unless $safe;
 
-        my $scan_file = "$scsi_host_path/$host/scan";
-        if (-w $scan_file) {
-            sysfs_write_with_timeout($scan_file, "- - -\n", 10)
-                or warn "SCSI rescan failed for $host: timed out\n";
+        my $scan_file = "$scsi_host_path/$safe/scan";
+        next unless -w $scan_file;
+        if (sysfs_write_with_timeout($scan_file, "- - -\n", 10)) {
+            $scanned++;
+        } else {
+            warn "SCSI rescan failed for $safe: timed out\n";
         }
     }
 
     # Give the kernel time to discover devices
     sleep($opts{delay} // 2);
 
-    return $rescanned;
+    return $scanned;
 }
 
 # Get FC remote port (target) information

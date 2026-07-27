@@ -2986,7 +2986,10 @@ sub _get_snapshot_path {
     if (!$device || ! -b $device) {
         # One more rescan attempt
         if ($protocol eq 'fc') {
-            rescan_fc_hosts(delay => 2);
+            # Last resort after the device failed to appear: this is the one place
+            # a LIP is justified (see FC::rescan_fc_hosts -- it is disruptive to
+            # every LUN behind the HBA, so it must never run on a poll or in a loop).
+            rescan_fc_hosts(delay => 2, lip => 1);
         } else {
             rescan_sessions();
             rescan_scsi_hosts();

@@ -1,3 +1,45 @@
+jt-pve-storage-netapp (0.2.26-1) stable; urgency=medium
+
+  * FC: stop issuing a LIP on every poll, and bound the rescan loop
+  * Requirements: Proxmox VE 9.0 or later
+  * FC ONLY -- iSCSI installations are unaffected by both changes.
+  * Fabric disruption: rescan_fc_hosts() issued a Loop Initialization Primitive
+    on every call, and activate_storage() called it unconditionally. Since
+    pvestatd runs activate_storage roughly every 10 seconds on every node, an FC
+    installation was issuing a LIP per HBA port every ~10 seconds, indefinitely.
+    issue_lip resets the FC port and forces a fabric re-login, briefly disturbing
+    EVERY LUN behind that HBA -- not only this plugin's. Discovering a newly
+    mapped LUN on a port that is already logged in needs only the plain SCSI
+    "- - -" scan; LIP is for genuine topology changes.
+    - LIP is now opt-in (lip => 1) and OFF by default. Of the five call sites,
+      only the "the device never appeared" fallback in _get_snapshot_path() asks
+      for it. activate_storage(), activate_volume() and the path() retry loop are
+      now scan-only, so a LIP can never be issued from a poll or from inside a
+      retry loop.
+  * Unbounded loop: the same function had no wall-clock budget. Its per-write
+    timeouts (10s) bound ONE sysfs write, not the loop, so a node with four HBA
+    ports could spend 4 x (10 + 10) = ~80s inside activate_storage. This is the
+    v0.2.20 lesson -- a per-call timeout never bounds a loop's total time -- which
+    had only ever been applied to the iSCSI login loop. rescan_fc_hosts() now
+    takes a budget (default 30s) and both loops honour it.
+  * NOT TESTABLE IN OUR LAB: there is no FC HBA available, so both changes are
+    code-review fixes covered by static and unit assertions only. On a real FC
+    system, additionally confirm via 'journalctl -k | grep -i lip' that no LIP is
+    issued during normal polling. This limitation is stated in docs/TESTING.md
+    section 33.1 rather than left implicit.
+  * Audit: LXC/rootdir and vzdump were exercised end-to-end against the real
+    cluster and ONTAP and found CLEAN -- no defects. Covered: create a CT with its
+    rootfs on the plugin, start, snapshot while running, vzdump --mode snapshot,
+    rollback (verified it really restored older content), online rootfs grow
+    (2.0G -> 2.9G, LUN 3.0 GiB), destroy with zero host and ONTAP residue. A
+    backup that was interrupted mid-flight left exactly the expected residue and
+    recovered completely when the snapshot was removed -- the v0.2.13/v0.2.14
+    incident scenario. Recorded in docs/TESTING.md section 33.
+  * Testing: make test 6/6, podchecker OK, units 208/208, functional against a
+    real ONTAP simulator 53/53, plus the LXC/vzdump end-to-end above.
+
+ -- Jason Cheng <jason@jason.tools>  Mon, 27 Jul 2026 20:30:00 +0800
+
 jt-pve-storage-netapp (0.2.25-1) stable; urgency=medium
 
   * path(): make the synthetic device path unique per volume

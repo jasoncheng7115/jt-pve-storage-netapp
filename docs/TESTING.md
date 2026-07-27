@@ -2748,6 +2748,72 @@ $P->free_image($S,$scfg,$vol,0,"raw");'
 
 ---
 
+## 33. FC Rescan Safety + LXC/vzdump End-to-End (v0.2.26)
+
+### 33.1 FC: LIP must be opt-in and the loop wall-clock bounded (CORE, no FC HBA needed)
+
+`issue_lip` resets the FC port and disturbs **every LUN behind that HBA**. It must
+never run on a poll path or inside a retry loop.
+
+```bash
+F=lib/PVE/Storage/Custom/NetAppONTAP/FC.pm
+P=lib/PVE/Storage/Custom/NetAppONTAPPlugin.pm
+sed -n '/^sub rescan_fc_hosts/,/^}/p' $F | grep -c 'if ($opts{lip})'          # Expected: 1
+sed -n '/^sub rescan_fc_hosts/,/^}/p' $F | grep -c 'time() >= $deadline'      # Expected: 2
+grep -o 'rescan_fc_hosts([^)]*)' $P | grep -c 'lip => 1'                      # Expected: 1
+sed -n '/^sub activate_storage/,/^}/p' $P | grep 'rescan_fc_hosts' | grep -c lip  # Expected: 0
+```
+
+Expected: LIP is gated behind an explicit option; both loops honour a wall-clock
+budget; exactly one call site (the "device never appeared" fallback in
+`_get_snapshot_path`) issues a LIP; and `activate_storage` — which pvestatd calls
+every ~10 s on every node — never does.
+
+**Not testable in the current lab** (no FC HBA). These are code-review fixes
+covered by static and unit assertions only. On a real FC system, additionally
+confirm with `journalctl -k | grep -i lip` that no LIP is issued during normal
+polling.
+
+### 33.2 LXC / `rootdir` end-to-end (ONTAP REQUIRED)
+
+```bash
+S=netapp1; C=9960; T=local:vztmpl/ubuntu-22.04-standard_22.04-1_amd64.tar.zst
+pct create $C $T --rootfs $S:2 --hostname lxc-audit --memory 512 --unprivileged 1 \
+    --net0 name=eth0,bridge=vmbr0
+pct start $C && pct exec $C -- df -h /          # rootfs must be /dev/mapper/<wwid>
+pct snapshot $C snap1                            # snapshot a RUNNING CT
+pct exec $C -- touch /audit-ok                   # write AFTER the snapshot
+vzdump $C --mode snapshot --storage local        # drives the temp FlexClone path
+pct rollback $C snap1 && pct start $C
+pct exec $C -- ls /audit-ok                      # MUST be absent -> rollback really restored
+pct resize $C rootfs +1G && pct exec $C -- df -h /   # online grow
+pct stop $C && pct destroy $C --purge
+```
+
+Assert after destroy: `/dev/mapper/<wwid>` absent, every prior `sd` slave gone from
+`/sys/block`, 0 `pve_*` volumes on ONTAP, 0 NETAPP multipath maps.
+
+### 33.3 Interrupted vzdump must recover cleanly (ONTAP REQUIRED)
+
+Kill a snapshot-mode backup mid-flight, then confirm the residue and that removing
+the snapshot cleans it up completely — this is the v0.2.13/v0.2.14 incident.
+
+```bash
+timeout 60 vzdump $C --mode snapshot --storage local   # interrupt it
+# Expect residue: a 'vzdump' snapshot AND tmpclone_<vol>_pve_snap_vzdump
+pct listsnapshot $C
+perl -Ilib -e '...volume_list("tmpclone_*")...'
+
+pct delsnapshot $C vzdump
+# Expect: "Detaching temporary FlexClone ... before snapshot delete",
+#         0 temp clones left, only the other snapshots remain,
+#         and NO leftover multipath map or sd paths for the temp clone.
+multipath -ll | grep -ci 'failed\|faulty'        # Expected: 0
+journalctl --since '5 min ago' | grep -c 'tur checker reports path is down'  # Expected: 0
+```
+
+---
+
 ## Cleanup
 
 ```bash

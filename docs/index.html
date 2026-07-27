@@ -142,7 +142,7 @@
     <div class="hero__glow"></div>
     <div class="hero__glow-left"></div>
     <div class="hero__content">
-        <div class="hero__badge">v0.2.25 <span class="hero__badge-sep"></span> MIT License</div>
+        <div class="hero__badge">v0.2.26 <span class="hero__badge-sep"></span> MIT License</div>
         <h1 class="hero__title">jt-pve-storage-netapp</h1>
         <p class="hero__project-desc">
             <span class="lang-en">NetApp ONTAP SAN/iSCSI/FC Storage Plugin for Proxmox VE</span>
@@ -522,7 +522,7 @@
                 <span class="lang-en">Install the plugin package</span>
                 <span class="lang-zh">安裝 plugin 套件</span>
             </div>
-            <pre><span class="cmd">dpkg</span> <span class="flag">-i</span> jt-pve-storage-netapp_0.2.25-1_all.deb</pre>
+            <pre><span class="cmd">dpkg</span> <span class="flag">-i</span> jt-pve-storage-netapp_0.2.26-1_all.deb</pre>
             <p>
                 <span class="lang-en">The plugin automatically configures multipath and reloads Proxmox VE services (pvedaemon, pvestatd, pveproxy).</span>
                 <span class="lang-zh">Plugin 會自動設定 multipath 並重新載入 Proxmox VE 服務（pvedaemon、pvestatd、pveproxy）。</span>
@@ -596,7 +596,7 @@
                 <span class="lang-en">Install new package</span>
                 <span class="lang-zh">安裝新套件</span>
             </div>
-            <pre><span class="cmd">dpkg</span> <span class="flag">-i</span> jt-pve-storage-netapp_0.2.25-1_all.deb</pre>
+            <pre><span class="cmd">dpkg</span> <span class="flag">-i</span> jt-pve-storage-netapp_0.2.26-1_all.deb</pre>
         </div>
     </div>
     <div class="step">
@@ -1436,6 +1436,15 @@
         <span class="lang-en">Version history. For full details see <a href="https://github.com/jasoncheng7115/jt-pve-storage-netapp/blob/main/CHANGELOG.md">CHANGELOG.md</a>.</span>
         <span class="lang-zh">版本紀錄。完整內容請參閱 <a href="https://github.com/jasoncheng7115/jt-pve-storage-netapp/blob/main/CHANGELOG_zh-TW.md">CHANGELOG_zh-TW.md</a>。</span>
     </p>
+
+    <div class="changelog-entry">
+        <div class="changelog-version">v0.2.26 <span class="changelog-tag changelog-tag--fix">Fix</span></div>
+        <div class="changelog-date">2026-07-27</div>
+        <div class="changelog-summary">
+            <span class="lang-en"><strong>FC only</strong> — iSCSI installations are unaffected. <code>rescan_fc_hosts()</code> issued a Loop Initialization Primitive on every call, and <code>activate_storage()</code> called it unconditionally; since pvestatd runs that roughly every 10 seconds on every node, an FC installation was issuing a LIP per HBA port every ~10 seconds indefinitely. <code>issue_lip</code> resets the FC port and forces a fabric re-login, briefly disturbing every LUN behind that HBA — not only this plugin's. Discovering a newly mapped LUN on an already-logged-in port needs only the plain SCSI scan, so LIP is now opt-in and off by default; of the five call sites only the "device never appeared" fallback asks for it. The same function also had no wall-clock budget — its per-write timeouts bound one sysfs write, not the loop, so four HBA ports could spend ~80 s inside <code>activate_storage</code> (the v0.2.20 lesson, previously applied only to the iSCSI login loop); it now takes a budget, default 30 s. <strong>Not testable in our lab</strong> (no FC HBA): both are code-review fixes covered by static and unit assertions only, which is stated explicitly in the test plan. Separately, LXC/<code>rootdir</code> and vzdump were exercised end-to-end against real hardware and found clean, including a backup interrupted mid-flight, which recovered completely.</span>
+            <span class="lang-zh"><strong>僅影響 FC</strong> —— iSCSI 環境不受影響。<code>rescan_fc_hosts()</code> 在每次呼叫時都會發出 Loop Initialization Primitive，而 <code>activate_storage()</code> 是無條件呼叫它的；由於 pvestatd 大約每 10 秒就會在每個節點執行一次，FC 環境等於每個 HBA port 每 ~10 秒發出一次 LIP，且永不停止。<code>issue_lip</code> 會重置 FC port 並強制 fabric 重新登入，短暫擾動該 HBA 後方的每一顆 LUN——不只是本外掛的。要在已登入的 port 上發現新對應的 LUN 只需單純的 SCSI scan，因此 LIP 改為選用且預設關閉；五個呼叫點中只有「裝置始終沒有出現」的 fallback 會要求它。同一函式亦無總時間預算——其單次寫入逾時界定的是一次 sysfs 寫入而非整個迴圈，因此四個 HBA port 可能在 <code>activate_storage</code> 內耗費約 80 秒（v0.2.20 的教訓，先前只套用於 iSCSI 登入迴圈）；現已加上預算，預設 30 秒。<strong>本實驗環境無法測試</strong>（無 FC HBA）：兩者皆為程式碼審查得出的修正，僅由靜態與單元斷言覆蓋，此點已明確載於測試計畫。另外，LXC／<code>rootdir</code> 與 vzdump 已在真實硬體上端到端實測且結果乾淨，包含一個中途被中斷的備份，其復原完全正常。</span>
+        </div>
+    </div>
 
     <div class="changelog-entry">
         <div class="changelog-version">v0.2.25 <span class="changelog-tag changelog-tag--fix">Fix</span></div>

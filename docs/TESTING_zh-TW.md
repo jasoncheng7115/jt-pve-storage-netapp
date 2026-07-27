@@ -2321,6 +2321,63 @@ $P->free_image($S,$scfg,$vol,0,"raw");'
 
 ---
 
+## 33. FC Rescan 安全性 + LXC／vzdump 端到端（v0.2.26）
+
+### 33.1 FC：LIP 必須為選用，且迴圈需有總時間上限（核心，不需 FC HBA）
+
+`issue_lip` 會重置 FC port，並擾動**該 HBA 後方的每一顆 LUN**。它絕不可執行於輪詢路徑或重試迴圈中。
+
+```bash
+F=lib/PVE/Storage/Custom/NetAppONTAP/FC.pm
+P=lib/PVE/Storage/Custom/NetAppONTAPPlugin.pm
+sed -n '/^sub rescan_fc_hosts/,/^}/p' $F | grep -c 'if ($opts{lip})'          # 預期：1
+sed -n '/^sub rescan_fc_hosts/,/^}/p' $F | grep -c 'time() >= $deadline'      # 預期：2
+grep -o 'rescan_fc_hosts([^)]*)' $P | grep -c 'lip => 1'                      # 預期：1
+sed -n '/^sub activate_storage/,/^}/p' $P | grep 'rescan_fc_hosts' | grep -c lip  # 預期：0
+```
+
+預期：LIP 被明確的選項所控制；兩個迴圈都遵守總時間預算；只有一個呼叫點（`_get_snapshot_path` 中「裝置始終沒出現」的 fallback）會發出 LIP；而 pvestatd 每 ~10 秒在每個節點都會呼叫的 `activate_storage` 則絕不發出。
+
+**目前實驗環境無法測試**（沒有 FC HBA）。這些是程式碼審查得出的修正，僅由靜態與單元斷言覆蓋。在真實 FC 環境中，請另以 `journalctl -k | grep -i lip` 確認正常輪詢期間不會發出 LIP。
+
+### 33.2 LXC／`rootdir` 端到端（需要 ONTAP）
+
+```bash
+S=netapp1; C=9960; T=local:vztmpl/ubuntu-22.04-standard_22.04-1_amd64.tar.zst
+pct create $C $T --rootfs $S:2 --hostname lxc-audit --memory 512 --unprivileged 1 \
+    --net0 name=eth0,bridge=vmbr0
+pct start $C && pct exec $C -- df -h /          # rootfs 必須是 /dev/mapper/<wwid>
+pct snapshot $C snap1                            # 對**執行中**的 CT 建立快照
+pct exec $C -- touch /audit-ok                   # 在快照**之後**寫入
+vzdump $C --mode snapshot --storage local        # 驅動暫存 FlexClone 路徑
+pct rollback $C snap1 && pct start $C
+pct exec $C -- ls /audit-ok                      # **必須不存在** -> 證明倒回確實還原了
+pct resize $C rootfs +1G && pct exec $C -- df -h /   # 線上擴充
+pct stop $C && pct destroy $C --purge
+```
+
+destroy 後斷言：`/dev/mapper/<wwid>` 不存在、先前所有 `sd` slave 都已從 `/sys/block` 移除、ONTAP 上 0 個 `pve_*` volume、0 個 NETAPP multipath map。
+
+### 33.3 被中斷的 vzdump 必須能乾淨復原（需要 ONTAP）
+
+在快照模式備份執行到一半時中斷它，接著確認殘留內容，以及移除該快照後能完全清乾淨 —— 這正是 v0.2.13／v0.2.14 的事故情境。
+
+```bash
+timeout 60 vzdump $C --mode snapshot --storage local   # 中途中斷
+# 預期殘留：一個 'vzdump' 快照，以及 tmpclone_<vol>_pve_snap_vzdump
+pct listsnapshot $C
+perl -Ilib -e '...volume_list("tmpclone_*")...'
+
+pct delsnapshot $C vzdump
+# 預期：出現 "Detaching temporary FlexClone ... before snapshot delete"、
+#       剩餘 0 個暫存 clone、只留下其他快照，
+#       且該暫存 clone 沒有殘留的 multipath map 或 sd 路徑。
+multipath -ll | grep -ci 'failed\|faulty'        # 預期：0
+journalctl --since '5 min ago' | grep -c 'tur checker reports path is down'  # 預期：0
+```
+
+---
+
 ## 清除
 
 ```bash

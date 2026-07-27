@@ -2,6 +2,43 @@
 
 All notable changes to the NetApp ONTAP Storage Plugin for Proxmox VE are documented here.
 
+## [0.2.26] - 2026-07-27
+
+### FC: Stop Issuing a LIP on Every Poll, and Bound the Rescan Loop
+
+**FC only — iSCSI installations are unaffected by both changes.**
+
+#### Fabric disruption: a LIP on every poll
+
+`rescan_fc_hosts()` issued a **Loop Initialization Primitive** on every call, and `activate_storage()` called it unconditionally. Since pvestatd runs `activate_storage` roughly every 10 seconds on every node, an FC installation was issuing a LIP **per HBA port every ~10 seconds, indefinitely**.
+
+`issue_lip` resets the FC port and forces a fabric re-login, briefly disturbing **every LUN behind that HBA** — not only this plugin's. Discovering a newly mapped LUN on a port that is already logged in needs only the plain SCSI `- - -` scan; LIP is for genuine topology changes.
+
+- **Fix:** LIP is now opt-in (`lip => 1`) and **off by default**. Of the five call sites, only the "the device never appeared" fallback in `_get_snapshot_path()` asks for it. `activate_storage()`, `activate_volume()` and the `path()` retry loop are scan-only, so a LIP can never be issued from a poll or from inside a retry loop.
+
+#### Unbounded loop
+
+The same function had no wall-clock budget. Its per-write timeouts (10 s) bound **one** sysfs write, not the loop, so a node with four HBA ports could spend 4 × (10 + 10) = ~80 s inside `activate_storage`. This is the v0.2.20 lesson — a per-call timeout never bounds a loop's total time — which had only ever been applied to the iSCSI login loop.
+
+- **Fix:** `rescan_fc_hosts()` now takes a budget (default 30 s) and both loops honour it.
+
+#### Not testable in our lab
+
+There is no FC HBA available here, so **both changes are code-review fixes covered by static and unit assertions only**. On a real FC system, additionally confirm via `journalctl -k | grep -i lip` that no LIP is issued during normal polling. This limitation is stated in `docs/TESTING.md` section 33.1 rather than left implicit.
+
+### Audit: LXC / vzdump exercised end-to-end and found clean
+
+No defects. Run against the real cluster and real ONTAP: create a CT with its rootfs on the plugin (`alloc_image` → mkfs → mount), start, snapshot **while running**, `vzdump --mode snapshot`, rollback, online rootfs grow, destroy.
+
+- The rollback genuinely restored older content — a file created after the snapshot was gone afterwards.
+- The online grow took the CT from 2.0 G to 2.9 G with the LUN at 3.0 GiB.
+- Destroy left 0 ONTAP volumes, 0 NETAPP multipath maps and 0 `sd` slaves.
+- A backup **interrupted mid-flight** left exactly the expected residue (a `vzdump` snapshot plus `tmpclone_<vol>_pve_snap_vzdump`) and recovered completely when the snapshot was removed — the v0.2.13/v0.2.14 incident scenario, with full host-side teardown and no `tur checker` spam.
+
+Recorded in `docs/TESTING.md` section 33 so it does not have to be re-derived.
+
+**Testing:** `make test` 6/6, podchecker OK, units **208/208**, functional against a real ONTAP simulator **53/53**, plus the LXC/vzdump end-to-end above.
+
 ## [0.2.25] - 2026-07-27
 
 ### `path()`: Make the Synthetic Device Path Unique per Volume

@@ -337,6 +337,22 @@ netappontap: <storage-id>
   ```
 - 檢視該 queue：在 ONTAP CLI 執行 `volume recovery-queue show`。
 
+### 憑證處理
+
+ONTAP API 憑證與其他儲存設定一同存放於 `/etc/pve/storage.cfg`（權限 `0640`，擁有者 `root:www-data`）。
+
+**請為本外掛建立專用的 ONTAP 帳號**，不要直接使用叢集的 `admin` 帳號：
+
+```
+security login create -user-or-group-name pve-plugin -application http \
+    -authentication-method password -role vsadmin -vserver <svm>
+```
+
+**注意事項**：
+- 將該帳號的權限範圍限縮在外掛實際使用的 **SVM**，而非整個叢集。外掛只需要管理該 SVM 內的 volume、LUN、igroup 與快照。
+- 在 Proxmox VE 中限制哪些人擁有此 storage 的 `Datastore.Allocate` 權限——正是該權限允許透過 API 讀回儲存設定。
+- 輪換憑證的方式：先在 ONTAP 上更新，接著執行 `pvesm set <storeid> --ontap-password <新密碼>`；外掛的 API client 最多快取 5 分鐘，`activate_storage` 會在下一輪輪詢時重新認證。
+
 ## 標準 PVE 選項
 
 ### content

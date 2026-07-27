@@ -3025,9 +3025,24 @@ sub path {
     # Try to get WWID - LUN might not exist (orphaned volume, partial cleanup, etc.)
     my $wwid = eval { $api->lun_get_wwid($lun_path); };
     if (!$wwid) {
-        # LUN doesn't exist - return synthetic path based on volume name
-        # This allows delete operations to proceed via ONTAP API
-        my $synthetic_wwid = "3600a0980" . unpack('H*', substr($ontap_volname, 0, 12));
+        # LUN doesn't exist - return a placeholder path so callers that only need
+        # a path (and check -b before touching it) can proceed; delete operations
+        # go through the ONTAP API and never use this.
+        #
+        # It MUST be unique per volume. The old form hex-encoded the first 12
+        # characters of the ONTAP volume name, which is the shared
+        # "pve_{storage}_" prefix -- so EVERY volume of a storage produced the
+        # identical placeholder. That made the warning useless for diagnosis and
+        # meant one fabricated identifier stood in for many volumes. Derive it
+        # from the whole name instead. (Nothing destructive consumes path(): the
+        # verified callers are free_image, both reapers, _remove_temp_clone and
+        # deactivate_storage, none of which use it.)
+        my $digest = 0;
+        for my $c (split //, $ontap_volname) {
+            $digest = ($digest * 33 + ord($c)) % (2**48);
+        }
+        my $synthetic_wwid = sprintf("3600a0980%012x%012x",
+            $digest, length($ontap_volname));
         warn "LUN $lun_path not found on ONTAP, returning synthetic path for cleanup\n";
         return ("/dev/mapper/$synthetic_wwid", $parsed->{vmid}, 'raw');
     }

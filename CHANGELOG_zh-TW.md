@@ -2,6 +2,28 @@
 
 NetApp ONTAP Storage Plugin for Proxmox VE 的所有重要變更都記錄在此。
 
+## [0.2.25] - 2026-07-27
+
+### `path()`：讓合成的裝置路徑每個 volume 皆唯一
+
+當 LUN 在 ONTAP 上不存在時，`path()` 會回傳一個佔位用的裝置路徑，讓「只需要一個路徑、且在使用前會檢查 `-b`」的呼叫者能繼續執行。該佔位值原本只將 ONTAP volume 名稱的**前 12 個字元**做十六進位編碼，而那正是共用的 `pve_{storage}_` 前綴。因此同一個 storage 的每一個 volume 都會產生完全相同的偽造識別碼，且形狀與真實的 NetApp WWID（`3600a0980` + 24 個十六進位字元）一模一樣：
+
+```
+pve_netapp1_100_disk0     -> 3600a09807076655f6e6574617070315f
+pve_netapp1_200_disk3     -> 3600a09807076655f6e6574617070315f
+pve_netapp1_999_cloudinit -> 3600a09807076655f6e6574617070315f
+```
+
+- **修正**：該佔位值現改由完整的 volume 名稱推導，因此每個 volume 皆唯一。
+- **影響範圍有限，且此點經過實際查證而非假設**：沒有任何破壞性程式路徑會使用 `path()`。`free_image()`、`_cleanup_orphaned_devices()`、`_reap_stale_scsi_paths()`、`_remove_temp_clone()` 與 `deactivate_storage()` 全都直接從 ONTAP 取得 WWID，因此該佔位值只會產生一個不存在的路徑，呼叫者會透過 `-b` 直接拒絕。真正的缺陷在於一個偽造識別碼代表了多個 volume，使得隨附的警告訊息在診斷時毫無用處，並留下一個形狀與真實 WWID 相同、理論上可能與真實裝置重疊的識別碼。
+- 對任何可正常運作的設定**皆無行為變更**。
+
+### 文件
+
+- `CONFIGURATION.md` 與其 zh-TW 對應版本新增**憑證處理**章節，建議使用權限範圍限縮於外掛所用 SVM 的專用最小權限 ONTAP 帳號，而非叢集的 `admin` 帳號；並提供限制 `Datastore.Allocate` 與輪換憑證的指引。
+
+**測試**：`make test` 6/6、podchecker OK、單元 **199/199**（`audit_fixes` 151、`status_timeout` 20、`stale_sd_reaper` 20、`activate_budget` 8）、對真實 ONTAP 模擬器的功能測試 **53/53**。
+
 ## [0.2.24] - 2026-07-27
 
 ### 資料安全稽核：刪除、覆寫、斷線與死鎖檢視

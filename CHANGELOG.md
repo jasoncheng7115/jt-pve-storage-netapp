@@ -2,6 +2,28 @@
 
 All notable changes to the NetApp ONTAP Storage Plugin for Proxmox VE are documented here.
 
+## [0.2.25] - 2026-07-27
+
+### `path()`: Make the Synthetic Device Path Unique per Volume
+
+When a LUN is absent on ONTAP, `path()` returns a placeholder device path so callers that only need a path — and that check `-b` before touching it — can proceed. That placeholder hex-encoded only the **first 12 characters** of the ONTAP volume name, which is the shared `pve_{storage}_` prefix. Every volume of a storage therefore produced the identical fabricated identifier, shaped exactly like a real NetApp WWID (`3600a0980` + 24 hex):
+
+```
+pve_netapp1_100_disk0     -> 3600a09807076655f6e6574617070315f
+pve_netapp1_200_disk3     -> 3600a09807076655f6e6574617070315f
+pve_netapp1_999_cloudinit -> 3600a09807076655f6e6574617070315f
+```
+
+- **Fix:** the placeholder is now derived from the whole volume name, so it is unique per volume.
+- **Impact was limited, and this was verified rather than assumed:** no destructive code path consumes `path()`. `free_image()`, `_cleanup_orphaned_devices()`, `_reap_stale_scsi_paths()`, `_remove_temp_clone()` and `deactivate_storage()` all obtain the WWID from ONTAP directly, so the placeholder only ever produced a non-existent path that callers reject via `-b`. The defect was that one fabricated identifier stood in for many volumes, which made the accompanying warning useless for diagnosis and left a NetApp-shaped identifier that could in principle alias a real device.
+- **No behaviour change** for any working configuration.
+
+### Documentation
+
+- `CONFIGURATION.md` and its zh-TW counterpart gain a **credential handling** section recommending a dedicated, least-privilege ONTAP account scoped to the SVM the plugin uses, rather than the cluster `admin` account, together with guidance on restricting `Datastore.Allocate` and on rotating the credential.
+
+**Testing:** `make test` 6/6, podchecker OK, units **199/199** (`audit_fixes` 151, `status_timeout` 20, `stale_sd_reaper` 20, `activate_budget` 8), functional against a real ONTAP simulator **53/53**.
+
 ## [0.2.24] - 2026-07-27
 
 ### Data-Safety Audit: Delete, Overwrite, Disconnect and Deadlock Review

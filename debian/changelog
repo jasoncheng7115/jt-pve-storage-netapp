@@ -1,3 +1,35 @@
+jt-pve-storage-netapp (0.2.25-1) stable; urgency=medium
+
+  * path(): make the synthetic device path unique per volume
+  * Requirements: Proxmox VE 9.0 or later
+  * When a LUN is absent on ONTAP, path() returns a placeholder device path so
+    callers that only need a path (and check -b before touching it) can proceed.
+    That placeholder hex-encoded only the FIRST 12 CHARACTERS of the ONTAP volume
+    name -- which is the shared "pve_{storage}_" prefix -- so EVERY volume of a
+    storage produced the identical fabricated identifier, shaped exactly like a
+    real NetApp WWID (3600a0980 + 24 hex):
+      pve_netapp1_100_disk0     -> 3600a09807076655f6e6574617070315f
+      pve_netapp1_200_disk3     -> 3600a09807076655f6e6574617070315f
+      pve_netapp1_999_cloudinit -> 3600a09807076655f6e6574617070315f
+    It is now derived from the whole volume name, so it is unique per volume.
+  * Impact was limited, and this was verified rather than assumed: no destructive
+    code path consumes path(). free_image(), _cleanup_orphaned_devices(),
+    _reap_stale_scsi_paths(), _remove_temp_clone() and deactivate_storage() all
+    obtain the WWID from ONTAP directly. The placeholder therefore only ever
+    produced a non-existent path that callers reject via -b. The defect was that
+    one fabricated identifier stood in for many volumes, which made the
+    accompanying warning useless for diagnosis and left a NetApp-shaped
+    identifier that could in principle alias a real device.
+  * Documentation: added a credential-handling note to CONFIGURATION.md and its
+    zh-TW counterpart recommending a dedicated, least-privilege ONTAP account,
+    because the API credential is stored in /etc/pve/storage.cfg.
+  * No behaviour change for any working configuration.
+  * Testing: make test 6/6, podchecker OK, units 199/199 (audit_fixes 151,
+    status_timeout 20, stale_sd_reaper 20, activate_budget 8), functional
+    against a real ONTAP simulator 53/53.
+
+ -- Jason Cheng <jason@jason.tools>  Mon, 27 Jul 2026 18:00:00 +0800
+
 jt-pve-storage-netapp (0.2.24-1) stable; urgency=medium
 
   * Data-safety audit follow-up to 0.2.23 (delete / overwrite / deadlock review)

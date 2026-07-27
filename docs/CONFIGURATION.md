@@ -337,6 +337,22 @@ netappontap: <storage-id>
   ```
 - To inspect the queue: `volume recovery-queue show` on the ONTAP CLI.
 
+### Credential handling
+
+The ONTAP API credential is stored in `/etc/pve/storage.cfg` (mode `0640`, owner `root:www-data`) together with the rest of the storage definition.
+
+**Use a dedicated ONTAP account for the plugin**, rather than the cluster `admin` account:
+
+```
+security login create -user-or-group-name pve-plugin -application http \
+    -authentication-method password -role vsadmin -vserver <svm>
+```
+
+**Notes:**
+- Scope the account to the **SVM** the plugin uses, not the whole cluster. The plugin only needs to manage volumes, LUNs, igroups and snapshots inside that SVM.
+- Restrict who holds `Datastore.Allocate` on this storage in Proxmox VE — that permission is what allows reading the storage configuration back through the API.
+- Rotate the credential by updating it on ONTAP and then `pvesm set <storeid> --ontap-password <new>`; the plugin caches its API client for at most 5 minutes, and `activate_storage` re-authenticates on the next poll.
+
 ## Standard PVE Options
 
 ### content

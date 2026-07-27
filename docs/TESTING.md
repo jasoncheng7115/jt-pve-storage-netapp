@@ -2758,8 +2758,8 @@ never run on a poll path or inside a retry loop.
 ```bash
 F=lib/PVE/Storage/Custom/NetAppONTAP/FC.pm
 P=lib/PVE/Storage/Custom/NetAppONTAPPlugin.pm
-sed -n '/^sub rescan_fc_hosts/,/^}/p' $F | grep -c 'if ($opts{lip})'          # Expected: 1
-sed -n '/^sub rescan_fc_hosts/,/^}/p' $F | grep -c 'time() >= $deadline'      # Expected: 2
+sed -n '/^sub rescan_fc_hosts/,/^}/p' $F | grep -cF 'if ($opts{lip})'          # Expected: 1
+sed -n '/^sub rescan_fc_hosts/,/^}/p' $F | grep -cF 'time() >= $deadline'      # Expected: 2
 grep -o 'rescan_fc_hosts([^)]*)' $P | grep -c 'lip => 1'                      # Expected: 1
 sed -n '/^sub activate_storage/,/^}/p' $P | grep 'rescan_fc_hosts' | grep -c lip  # Expected: 0
 ```

@@ -2330,8 +2330,8 @@ $P->free_image($S,$scfg,$vol,0,"raw");'
 ```bash
 F=lib/PVE/Storage/Custom/NetAppONTAP/FC.pm
 P=lib/PVE/Storage/Custom/NetAppONTAPPlugin.pm
-sed -n '/^sub rescan_fc_hosts/,/^}/p' $F | grep -c 'if ($opts{lip})'          # 預期：1
-sed -n '/^sub rescan_fc_hosts/,/^}/p' $F | grep -c 'time() >= $deadline'      # 預期：2
+sed -n '/^sub rescan_fc_hosts/,/^}/p' $F | grep -cF 'if ($opts{lip})'          # 預期：1
+sed -n '/^sub rescan_fc_hosts/,/^}/p' $F | grep -cF 'time() >= $deadline'      # 預期：2
 grep -o 'rescan_fc_hosts([^)]*)' $P | grep -c 'lip => 1'                      # 預期：1
 sed -n '/^sub activate_storage/,/^}/p' $P | grep 'rescan_fc_hosts' | grep -c lip  # 預期：0
 ```

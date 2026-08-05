@@ -146,6 +146,31 @@ journalctl -xeu pvedaemon | grep -i "netapp\|ontap" | tail -20
   ```
 - Do NOT manually `multipath -f` or remove devices during the flap — let it recover.
 
+**If it does NOT clear — it stays `inactive` for the whole takeover — check
+`ontap-portal` first.**
+
+A takeover should cost a few seconds of API reachability, not minutes. If the
+storage stays `inactive` until giveback while running VMs keep working normally,
+the usual cause is that `ontap-portal` points at the **node** management LIF of
+the controller that went down. Node management LIFs do not migrate; cluster and
+SVM management LIFs do.
+
+```bash
+# What is the storage actually pointing at?
+pvesm status --storage <storeid>
+grep -A5 "^netappontap: <storeid>" /etc/pve/storage.cfg
+
+# On ONTAP -- is that address a cluster-mgmt LIF?
+network interface show -role cluster-mgmt
+
+# Fix: repoint at the cluster management LIF (no downtime, no data impact)
+pvesm set <storeid> --ontap-portal <cluster-mgmt-ip>
+```
+
+The data path is unrelated to this setting — iSCSI/FC LIFs are discovered from
+ONTAP separately, so repointing `ontap-portal` does not disturb multipath or
+running I/O.
+
 ### Re-enabling a Storage That Was Disabled During an ONTAP Outage/Upgrade
 
 If you disabled a storage (`pvesm set <storeid> --disable 1`) to ride out an ONTAP outage, **upgrade the plugin on ALL cluster nodes to the latest version BEFORE re-enabling**, then enable. Enabling first while nodes still run an older plugin can re-trigger the original problem (a request storm that overwhelms ONTAP's management gateway).

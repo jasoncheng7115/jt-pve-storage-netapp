@@ -709,8 +709,8 @@
             </tr></thead>
             <tbody>
                 <tr><td><code>ontap-portal</code></td><td>
-                    <span class="lang-en">ONTAP management IP or hostname</span>
-                    <span class="lang-zh">ONTAP 管理 IP 或主機名稱</span>
+                    <span class="lang-en">ONTAP management IP or hostname. Use the <strong>cluster</strong> management LIF (or the SVM management LIF for SVM-scoped users) &mdash; both migrate during a controller takeover. A <strong>node</strong> management LIF does not, so if the controller hosting it fails, the storage stays <code>inactive</code> until giveback even though I/O has already failed over.</span>
+                    <span class="lang-zh">ONTAP 管理 IP 或主機名稱。請使用<strong>叢集</strong>管理 LIF (SVM 層級使用者則用 SVM 管理 LIF) &mdash; 這兩種在控制器 takeover 時都會遷移。<strong>節點</strong>管理 LIF 不會，因此承載它的控制器故障時，即使 I/O 早已完成切換，該儲存仍會維持 <code>inactive</code> 直到 giveback。</span>
                 </td><td><code>192.168.1.100</code></td></tr>
                 <tr><td><code>ontap-svm</code></td><td>
                     <span class="lang-en">Storage Virtual Machine (SVM/Vserver) name</span>

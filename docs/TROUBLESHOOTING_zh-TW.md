@@ -146,6 +146,28 @@ journalctl -xeu pvedaemon | grep -i "netapp\|ontap" | tail -20
   ```
 - 閃爍期間**不要**手動 `multipath -f` 或移除裝置——讓它自己恢復。
 
+**若一直沒有恢復**——整段 takeover 期間都維持 `inactive`——**請先檢查
+`ontap-portal`**。
+
+takeover 造成的 API 中斷應該是數秒，而不是數分鐘。若執行中的 VM 一切正常，該儲存
+卻一直 `inactive` 到 giveback 為止，最常見的原因是 `ontap-portal` 指向了故障那台
+控制器的**節點**管理 LIF。節點管理 LIF 不會遷移，叢集管理 LIF 與 SVM 管理 LIF 才會。
+
+```bash
+# 該儲存實際指向哪個位址？
+pvesm status --storage <storeid>
+grep -A5 "^netappontap: <storeid>" /etc/pve/storage.cfg
+
+# 在 ONTAP 上——那個位址是叢集管理 LIF 嗎？
+network interface show -role cluster-mgmt
+
+# 修正：改指向叢集管理 LIF (不需停機,不影響資料)
+pvesm set <storeid> --ontap-portal <cluster-mgmt-ip>
+```
+
+這個設定與資料路徑無關——iSCSI／FC LIF 是另外向 ONTAP 查詢取得的，因此變更
+`ontap-portal` 不會影響 multipath 或執行中的 I/O。
+
 ### 重新啟用「在 ONTAP 故障期間被停用」的儲存
 
 若你曾用 `pvesm set <storeid> --disable 1` 停用儲存以度過 ONTAP 故障，**重新啟用前，請先把所有叢集節點的外掛升級到最新版**，再啟用。若在某些節點還跑舊版外掛時就先啟用，可能會再次觸發原本的問題(請求風暴打爆 ONTAP 管理閘道)。

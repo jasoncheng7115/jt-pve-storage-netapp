@@ -49,6 +49,28 @@ netappontap: <storage-id>
 - 對於 SVM 層級的使用者，請使用 SVM 管理 LIF
 - 固定使用 HTTPS (port 443)
 
+**重要**：請**不要**指向節點管理 LIF (node management LIF)。
+
+請使用**叢集**管理 LIF (cluster management LIF)，SVM 層級的使用者則使用 SVM 管理
+LIF。這兩種 LIF 在控制器 takeover 時都會遷移到存活的節點。**節點**管理 LIF 不會
+——它屬於某一台特定控制器，該控制器離線時它也跟著離線。
+
+這個影響很容易被忽略，因為資料路徑完全不受影響：
+
+| `ontap-portal` 指向 | 控制器 takeover 時 |
+|---|---|
+| 叢集／SVM 管理 LIF | LIF 會遷移。API 中斷數秒後自行恢復。 |
+| 存活節點的節點管理 LIF | 無影響。 |
+| 故障節點的節點管理 LIF | **API 中斷直到 giveback 為止**。multipath 早已完成 I/O 切換，執行中的 VM 仍正常運作，但 Proxmox VE 會把該儲存標示為 `inactive`，且新增／刪除／快照／擴充等操作在整段故障期間都會失敗。 |
+
+確認目前用的是哪一種：
+
+```bash
+# 在 ONTAP 上——叢集管理 LIF 的 role/service-policy 為 cluster-mgmt
+network interface show -role cluster-mgmt
+network interface show -vserver <svm> -service-policy *management*
+```
+
 ### ontap-svm
 
 **類型**：string
@@ -1048,6 +1070,11 @@ vserver iscsi reservation modify -vserver <svm> -timeout 30
 iSCSI / SAN LIF 在 takeover 時**不會自動遷移**。路徑切換是由 host 端 MPIO 透過 ALUA 路徑優先權處理。當某個 controller 故障（或被 takeover），該 controller 上的 LIF 會離線；活著的 controller 上的 LIF 繼續服務 I/O。一般 takeover 和 giveback 切換時間都**小於 10 秒**。
 
 外掛的 `status()` 在切換期間可能短暫 timeout。流程：
+
+> 這裡的「短暫」前提是 `ontap-portal` 指向**會遷移的管理 LIF**——叢集管理 LIF 或
+> SVM 管理 LIF。若指向的是故障那台控制器的**節點**管理 LIF，REST API 會一直無法
+> 存取直到 giveback，即使 I/O 早已完成切換，該儲存仍會在整段故障期間維持
+> `inactive`。詳見「必要選項」中的 `ontap-portal` 段落。
 
 1. Controller A 故障，A 上的 LIF 變得無法存取
 2. Multipath kernel module 將通往 A 的路徑標記為 `failed faulty`

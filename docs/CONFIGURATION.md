@@ -49,6 +49,29 @@ netappontap: <storage-id>
 - For SVM-scoped users, use the SVM management LIF
 - HTTPS is always used (port 443)
 
+**Important -- do NOT point this at a node management LIF.**
+
+Use the **cluster** management LIF (or the SVM management LIF for SVM-scoped
+users). Both of those migrate to a surviving node during a controller takeover.
+A **node** management LIF does not: it belongs to one specific controller and
+goes offline with it.
+
+The consequence is easy to miss, because the data path is unaffected:
+
+| `ontap-portal` points at | During a controller takeover |
+|---|---|
+| Cluster / SVM management LIF | LIF migrates. API unreachable for a few seconds, then recovers. |
+| Node management LIF of the surviving node | No impact. |
+| Node management LIF of the failed node | **API unreachable until giveback.** Multipath has already failed I/O over, so running VMs keep working -- but Proxmox VE marks the storage `inactive`, and new operations (create/delete/snapshot/resize) fail for the whole outage. |
+
+Verify which kind you are using:
+
+```bash
+# On ONTAP -- the cluster management LIF has role/service-policy "cluster-mgmt"
+network interface show -role cluster-mgmt
+network interface show -vserver <svm> -service-policy *management*
+```
+
 ### ontap-svm
 
 **Type:** string
@@ -1048,6 +1071,13 @@ After a node failure, VMs can restart on a healthy node 30 seconds sooner. Going
 iSCSI/SAN LIFs do NOT migrate during takeover. Path failover is driven by the host's MPIO using ALUA path priorities. When a controller fails (or is taken over), the LIFs on that controller go offline; LIFs on the surviving controller continue serving I/O. Typical takeover and giveback completion times are **less than 10 seconds**.
 
 The plugin's `status()` may briefly time out during the takeover window. Sequence:
+
+> **This "briefly" assumes `ontap-portal` points at a management LIF that
+> migrates** -- the cluster management LIF, or the SVM management LIF. If it
+> points at the *node* management LIF of the controller that went down, the REST
+> API stays unreachable until giveback, and the storage stays `inactive` for the
+> whole outage even though I/O has already failed over. See the `ontap-portal`
+> section under Required Options.
 
 1. Controller A goes down. LIFs hosted on controller A become unreachable.
 2. Multipath kernel module marks paths through controller A as `failed faulty`.

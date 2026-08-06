@@ -1,3 +1,41 @@
+jt-pve-storage-netapp (0.2.28-1) stable; urgency=medium
+
+  * Store ontap-password under /etc/pve/priv/ instead of storage.cfg
+  * Fix: the ONTAP password could never be changed
+    - 'ontap-password' was declared fixed => 1, and PVE drops fixed properties
+      from the update schema entirely, so 'pvesm set --ontap-password' was
+      rejected and the only way to change it was to remove and re-add the
+      storage. It is now optional (it cannot be required: PVE extracts a
+      sensitive property before check_config runs).
+  * Credential storage
+    - plugindata() now declares 'sensitive-properties', so PVE strips the
+      password from the parameters before writing /etc/pve/storage.cfg (mode
+      0640, readable by www-data) and hands it to the hooks instead. It is
+      written to /etc/pve/priv/storage/<storeid>.pw (mode 0600, root-only),
+      the same location and mechanism used by PVEs own PBS and CIFS plugins.
+    - New on_update_hook_full / on_delete_hook. PVE calls on_update_hook_full
+      (not on_update_hook) for any plugin whose api() is >= 13, which is every
+      version this plugin supports.
+    - The API client cache is invalidated when the password changes, so a
+      rotation takes effect immediately instead of after the 5 minute TTL.
+  * Upgrade safety: EXISTING STORAGES ARE NOT AFFECTED AND NEED NO ACTION
+    - The read path prefers the priv file and falls back to the inline
+      ontap-password, so a storage created before 0.2.28 keeps working exactly
+      as before, on upgraded and not-yet-upgraded nodes alike.
+    - There is deliberately NO automatic migration. /etc/pve/storage.cfg and
+      /etc/pve/priv are both cluster-wide, so removing the cleartext takes
+      effect on every node at once, while a node still running < 0.2.28 reads
+      only the inline value. Migrating during a rolling upgrade would break the
+      storage on every not-yet-upgraded node.
+    - To migrate, AFTER every node in the cluster runs 0.2.28 or later:
+          pvesm set <storeid> --ontap-password '<password>'
+      This writes the priv file and removes the cleartext from storage.cfg.
+    - Downgrading after migrating requires putting ontap-password back into
+      storage.cfg by hand; the old code does not know about the priv file.
+  * No change to the data path, device handling or ONTAP API usage.
+
+ -- Jason Cheng <jason@jason.tools>  Wed, 06 Aug 2026 18:20:00 +0800
+
 jt-pve-storage-netapp (0.2.27-1) stable; urgency=medium
 
   * Implement volume_export / volume_import (raw+size); fix path() wantarray

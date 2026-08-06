@@ -2414,6 +2414,135 @@ grep -cF "return wantarray ? (\$device, \$parsed->{vmid}, 'raw') : \$device;" $P
 
 ---
 
+## 35. 憑證儲存：`ontap-password` 改存 `/etc/pve/priv/`（v0.2.28）
+
+密碼原本會寫進 `/etc/pve/storage.cfg`（權限 `0640`、`root:www-data`），因為我們的
+鍵名 `ontap-password` 與 `sensitive_properties()` 的硬編碼退回清單不符。現在已宣告
+為敏感屬性，並存放於 `/etc/pve/priv/storage/<storeid>.pw`（權限 `0600`）。
+
+**最關鍵的是升級相關的驗證**：既有儲存必須原封不動地繼續運作，且不得有任何自動遷移。
+
+### 35.1 單元測試（不需 ONTAP、不需叢集）
+
+```bash
+perl -Ilib tests/audit_fixes.t
+# 預期：206/206 PASS。憑證區塊會驗證：
+#   - plugindata 宣告 'sensitive-properties' => ontap-password
+#   - options()：ontap-password 為 optional，且不是 fixed
+#   - 有覆寫 on_update_hook_full（api() >= 13 時 PVE 不會呼叫 on_update_hook）
+#   - 每一個 _get_api() 呼叫點都有傳 storeid（共 23 處）
+#   - 讀取路徑優先 priv 檔，找不到才回退 storage.cfg
+#   - 檔案權限為 0600
+#   - on_add_hook 會拒絕完全沒有密碼的儲存
+#   - 無關的更新不會自動遷移 legacy 密碼
+#   - 明確設定密碼會遷移，並清除明文
+#   - on_delete_hook 會移除該檔案
+```
+
+### 35.2 以真實 Proxmox VE 設定 API 實測（不需 ONTAP）
+
+使用 `--disable 1` 讓 Proxmox VE 跳過啟用檢查，否則該檢查需要可連線的後端。
+
+```bash
+NODE=$(hostname)
+pvesm add netappontap zztest --ontap-portal 192.0.2.77 --ontap-svm svmtest \
+    --ontap-aggregate aggr1 --ontap-username tester \
+    --ontap-password 'TestOnly-Secret-123' --content images \
+    --nodes "$NODE" --disable 1
+
+grep -c 'TestOnly-Secret-123' /etc/pve/storage.cfg     # 預期：0
+ls -l /etc/pve/priv/storage/zztest.pw                  # 預期：-rw-------（0600）
+[ "$(cat /etc/pve/priv/storage/zztest.pw)" = 'TestOnly-Secret-123' ] && echo MATCH
+
+# 輪換 —— 0.2.28 之前該屬性是 fixed => 1，根本做不到
+pvesm set zztest --ontap-password 'Rotated-Secret-456'
+[ "$(cat /etc/pve/priv/storage/zztest.pw)" = 'Rotated-Secret-456' ] && echo ROTATED
+
+# 無關的更新不得動到密碼
+pvesm set zztest --ontap-thin 0
+[ "$(cat /etc/pve/priv/storage/zztest.pw)" = 'Rotated-Secret-456' ] && echo UNTOUCHED
+
+# 刪除儲存應一併移除密碼檔
+pvesm remove zztest
+[ ! -e /etc/pve/priv/storage/zztest.pw ] && echo CLEANED
+```
+
+### 35.3 升級安全性（不需 ONTAP）—— 最重要的測試
+
+從 0.2.28 以前升級上來的安裝，密碼仍內嵌在設定檔中。它必須持續可用，且任何一般操作
+都不得無聲地搬動或刪除它。
+
+```bash
+# (a) 對每一個真實儲存，讀取路徑取得的密碼必須與升級前相同
+perl -e '
+use PVE::Storage; use PVE::Storage::Custom::NetAppONTAPPlugin;
+my $cfg = PVE::Storage::config();
+for my $sid (sort keys %{$cfg->{ids}}) {
+    my $scfg = $cfg->{ids}{$sid};
+    next unless ($scfg->{type} // "") eq "netappontap";
+    my $got = PVE::Storage::Custom::NetAppONTAPPlugin::_get_ontap_password($sid, $scfg);
+    my $inline = $scfg->{"ontap-password"};
+    printf "%-12s match=%s\n", $sid,
+        ((defined $got && defined $inline && $got eq $inline) ? "YES" : "n/a");
+}'
+# 尚未遷移的儲存預期：match=YES
+
+# (b) 無關的更新不得清掉 legacy 內嵌密碼。
+#     先建立一個 legacy 形狀的儲存，再對它做各種操作。
+pvesm add netappontap zzlegacy --ontap-portal 192.0.2.78 --ontap-svm svmL \
+    --ontap-aggregate aggr1 --ontap-username tester --ontap-password 'X' \
+    --content images --nodes "$(hostname)" --disable 1
+rm -f /etc/pve/priv/storage/zzlegacy.pw
+# 在 /etc/pve/storage.cfg 的 zzlegacy 區段加入 "ontap-password LegacyPw-ABC"
+
+pvesm set zzlegacy --ontap-thin 0
+pvesm set zzlegacy --content images,rootdir
+grep -c 'LegacyPw-ABC' /etc/pve/storage.cfg     # 預期：1（仍在，未被遷移）
+[ ! -e /etc/pve/priv/storage/zzlegacy.pw ] && echo 'NO SILENT MIGRATION'
+
+# (c) 明確遷移才會搬動它並清除明文
+pvesm set zzlegacy --ontap-password 'LegacyPw-ABC'
+grep -c 'LegacyPw-ABC' /etc/pve/storage.cfg     # 預期：0
+[ -e /etc/pve/priv/storage/zzlegacy.pw ] && echo MIGRATED
+
+pvesm remove zzlegacy
+```
+
+### 35.4 僅存在 priv 檔的密碼能否通過認證（需要 ONTAP）
+
+這是唯一無法在沒有後端的情況下驗證的項目：密碼**只**存在於 priv 檔的儲存，必須真的
+能通過認證。
+
+```bash
+# 在一個正常運作的儲存上，且叢集每個節點都已是 0.2.28 以上之後：
+pvesm set <storeid> --ontap-password '<真實密碼>'
+grep -c 'ontap-password' /etc/pve/storage.cfg   # 應比先前少一
+pvesm status --storage <storeid>                # 預期：active，顯示真實容量
+
+perl -Ilib tests/sim_functional.pl              # 預期：13/13 PASS
+```
+
+### 35.5 靜態守門
+
+```bash
+P=lib/PVE/Storage/Custom/NetAppONTAPPlugin.pm
+# 注意：下列含有 $ ( ) { } 的 pattern 一律使用 grep -F。
+# GNU grep 會把 pattern 中間的 $ 當成行尾錨點，因此 BRE 的
+# '_get_api($scfg, ...' 永遠不會匹配，且會安靜地回傳 0。
+grep -cF "'sensitive-properties' => {" $P                 # 預期：1
+grep -cF "'ontap-password'     => { optional => 1 }" $P   # 預期：1
+grep -c '^sub on_update_hook_full' $P                     # 預期：1
+grep -c '^sub on_delete_hook' $P                          # 預期：1
+grep -cF '/etc/pve/priv/storage' $P                       # 預期：1
+# ontap-password 不得在任何地方被宣告為 fixed
+grep -cF "'ontap-password'     => { fixed => 1 }" $P      # 預期：0
+# 每一個 _get_api() 呼叫點都必須帶 storeid
+grep -cF '_get_api($scfg, storeid =>' $P                  # 預期：23
+grep -cF '_get_api($scfg)' $P                             # 預期：0
+```
+
+---
+
 ## 清除
 
 ```bash
@@ -2439,6 +2568,39 @@ pvesm list $STORAGE
 ## 發佈測試結果
 
 每次發佈前都必須通過上述所有測試。結果記錄如下。
+
+### v0.2.28-1 憑證儲存：ontap-password 改存 /etc/pve/priv/（2026-08-06）
+
+**狀態：所有測試 PASS**。
+
+**環境**：proxmox-ve 9.2.0／pve-manager 9.2.5／libpve-storage-perl 9.1.6（APIVER 15）／kernel 7.0.2-7-pve。ONTAP 模擬器（重建後）`ontap-sim`，NetApp Release 9.16.1P1，SVM svm1 @ 192.168.1.194，aggregate aggr1，2 個 iSCSI LIF（都在同一節點 —— 外掛正確發出警告）。
+
+| 測試套件 | 結果 |
+|---------|------|
+| `make test`（Perl 語法，6 個模組） | 6/6 PASS |
+| `podchecker` 主外掛 | PASS |
+| `tests/audit_fixes.t` | 206/206 PASS |
+| `tests/status_timeout.t` | 20/20 PASS |
+| `tests/stale_sd_reaper.t` | 20/20 PASS |
+| `tests/activate_budget.t` | 8/8 PASS |
+| `tests/sim_functional.pl`（真實 ONTAP） | 13/13 PASS |
+| `tests/sim_snapshot_safety.pl`（真實 ONTAP） | 34/34 PASS |
+| `tests/cleanup_load.pl`（真實 ONTAP） | 6/6 PASS |
+| `tests/sim_export_import.pl`（真實 ONTAP） | 8/8 PASS |
+| **單元測試合計** | **254/254** |
+| **功能測試合計** | **61/61** |
+
+**第 35 節結果**：
+
+- **35.2／35.3（以真實 Proxmox VE 設定 API 實測）**：新增時 `storage.cfg` 內不留任何密碼，並寫出權限 0600、內容正確的 priv 檔；輪換可行（先前該屬性是 `fixed`，根本做不到）；無關的更新（`--ontap-thin`、`--content`、`--disable`）不會動到 priv 檔密碼，也不會動到 legacy 內嵌密碼；legacy 儲存**不會**被自動遷移；明確設定密碼才會遷移並清除明文；刪除儲存會一併移除 priv 檔。
+- **35.4（需要 ONTAP）PASS**：密碼**只**存在於 `/etc/pve/priv/storage/<storeid>.pw`（`storage.cfg` 內 0 筆 `ontap-password`）的儲存，成功通過真實 ONTAP 認證並回報真實容量 —— 且在 **status 路徑**與（服務完整重啟後的）**資料路徑**都驗證過：`pvesm alloc` 實際建立 1 GiB LUN、multipath 裝置正常出現，`pvesm free` 完成刪除與完整主機端拆除（mapper 消失、無殘留 sd）。
+- **回退機制已對真實 ONTAP 驗證**：兩個既有儲存（密碼仍內嵌於 `storage.cfg`）在 0.2.28 下認證與容量回報均與先前相同。
+
+**備註**：
+
+- 本次執行中 `sim_export_import.pl` 出現的一次失敗（殘留 `4 pve_* volumes`），是先前一次執行被測試環境的 2 分鐘指令逾時砍掉所留下的殘留，並非外掛缺陷。從乾淨狀態重跑：8/8 PASS，0 殘留。
+- 過程中出現的 `multipath -f ... failed/timed out, trying dmsetup remove --force` 是 v0.2.3 設計中的退回機制，不是錯誤。
+- 本機既有的手動 `na_iscsi_node1` NetApp LUN 在所有外掛操作中都未被觸碰（跨儲存安全）。
 
 ### v0.2.23-1 Proxmox VE 9.0／9.1／9.2 相容性稽核 + 快照安全（2026-07-26）
 
@@ -2615,7 +2777,7 @@ Section 1 / 2 / 3 / 12 / 19.6 / 24(snapshot delete + temp clone cleanup)/ 靜態
 
 **範圍**：Section 25(新增：跨儲存殘留偵測)+ Section 1 regression + Section 24 regression。
 
-**環境**：單節點測試於 `pc-pve3`(PVE 9.1，部署 0.2.15-1)。ONTAP simulator。**配置兩個 netappontap storage(`netapp1` + 新加的 `netapp2`)**指向同一個 SVM，各自有 LUN — 忠實重現客戶的 multi-storage 情境。
+**環境**：單節點測試於 `pc-pve3`(PVE 9.1，部署 0.2.15-1)。ONTAP simulator。**配置兩個 netappontap storage**（`netapp1` + 新加的 `netapp2`）指向同一個 SVM，各自有 LUN — 忠實重現客戶的 multi-storage 情境。
 
 #### Section 25: 跨儲存殘留偵測
 

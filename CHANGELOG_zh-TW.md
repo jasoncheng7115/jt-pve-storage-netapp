@@ -2,6 +2,52 @@
 
 NetApp ONTAP Storage Plugin for Proxmox VE 的所有重要變更都記錄在此。
 
+## [0.2.28] - 2026-08-06
+
+### 憑證：`ontap-password` 改存於 `/etc/pve/priv/`，不再寫入 `storage.cfg`
+
+`/etc/pve/storage.cfg` 的權限是 `0640`、擁有者 `root:www-data`，因此寫在裡面的任何內容 `pveproxy` 都讀得到。Proxmox VE 對儲存機密的作法是改放 `/etc/pve/priv/`（僅 root 可讀），機制是 `plugindata()` 的 `sensitive-properties` —— 但我們的鍵名是 `ontap-password`，而 `PVE::Storage::Plugin::sensitive_properties()` 在未宣告時會退回一份硬編碼清單，其中只有 `password` 這個名稱，**並不相符**。密碼因此被原樣寫進 `storage.cfg`。
+
+外掛現在會宣告該屬性為敏感，Proxmox VE 便會在寫入設定檔之前把它抽走，改以 hook 參數傳入。密碼存放於 `/etc/pve/priv/storage/<storeid>.pw`（權限 `0600`），與 Proxmox VE 內建的 PBS 及 CIFS 外掛使用同一個位置與同一套機制。
+
+`PBSPlugin` 是最接近的參考實作：與本外掛結構相同 —— 用密碼向外部 REST 服務認證，且在 `status()` 路徑讀取。這也同時佐證了讀取一定發生在 root context（`API2/Storage/` 底下所有會呼叫外掛的端點都標示 `protected => 1`，會在 `pvedaemon` 執行，而非 `pveproxy`）。
+
+### 修正：ONTAP 密碼過去根本無法變更
+
+`ontap-password` 原本宣告為 `fixed => 1`。Proxmox VE 會把 fixed 屬性**完全排除**在更新 schema 之外（`SectionConfig.pm`），因此 `pvesm set <storeid> --ontap-password ...` 會被拒絕 —— 連參數名稱都不被辨識 —— 要改 ONTAP 密碼只能移除儲存再重新加入。
+
+現在改為 `optional`。它不能宣告為必填：Proxmox VE 會在 `check_config()` 執行**之前**就把敏感屬性從參數中抽走，宣告必填會導致每一次新增都驗證失敗。改由 `on_add_hook()` 檢查密碼是否缺漏，並以明確訊息中止。
+
+API client 快取的有效性檢查現在也納入密碼，因此輪換會在下一次呼叫立即生效，而不必等 5 分鐘的快取逾時。
+
+#### 既有儲存不受影響，不需要任何動作
+
+讀取路徑會優先找 priv 檔，找不到就**回退**讀取內嵌的 `ontap-password`，因此 0.2.28 之前建立的儲存運作完全如常 —— 已升級與尚未升級的節點都一樣。這一點已用真實的儲存設定驗證：新程式碼讀到的密碼與升級前完全相同。
+
+無關的設定變更也不會動到它。`extract_sensitive_params()` 只從傳入的參數中抽取，不會碰既有設定，因此 `pvesm set <storeid> --content ...` 或任何其他選項都會讓內嵌密碼原封不動。
+
+#### 遷移刻意設計為手動
+
+**沒有任何自動遷移**。`/etc/pve/storage.cfg` 與 `/etc/pve/priv` 都是叢集共用，移除明文會同時對所有節點生效，而還在跑舊版外掛的節點只讀內嵌值。在滾動升級途中遷移，會讓所有尚未升級的節點失去該儲存。
+
+**待叢集中每個節點都執行 0.2.28 或更新版本之後**：
+
+```bash
+pvesm set <storeid> --ontap-password '<password>'
+```
+
+這道指令會一次完成：寫入 priv 檔，並從 `storage.cfg` 移除明文。
+
+若遷移後又要降版，必須手動把 `ontap-password` 加回 `storage.cfg`（值可從 `/etc/pve/priv/storage/<storeid>.pw` 取得），舊版程式並不認得 priv 檔。
+
+### 其他
+
+- 新增 `on_update_hook_full` 與 `on_delete_hook`。Proxmox VE 對 `api()` >= 13 的外掛呼叫的是 `on_update_hook_full`，**不是** `on_update_hook`，而這涵蓋本外掛支援的每一個版本；只覆寫後者會是無用程式碼。
+- 全部 23 個 `_get_api()` 呼叫點都改為傳入 `storeid`，這是定位 priv 檔的必要資訊。
+- 資料路徑、裝置處理與 ONTAP API 使用方式均未變更。
+
+**測試**：`make test` 6/6、單元測試 **254/254**（新增 26 項）。並在 Proxmox VE 9.2.0 上以真實的 Proxmox VE 設定 API 實測：新增（密碼未出現在 `storage.cfg`，priv 檔為 `0600` 且內容正確）、輪換、無關更新不影響密碼、legacy 儲存未被自動遷移、明確遷移會清除明文，以及刪除儲存會一併移除 priv 檔。
+
 ## [0.2.27] - 2026-07-27
 
 ### 跨叢集遷移：實作 `volume_export`／`volume_import`

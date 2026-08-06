@@ -146,6 +146,17 @@ sub plugindata {
             { raw => 1 },
             'raw',
         ],
+        # Tells PVE to strip 'ontap-password' out of the parameters before they
+        # are written to /etc/pve/storage.cfg (mode 640, readable by www-data)
+        # and hand it to on_add_hook/on_update_hook as %sensitive instead, so we
+        # can store it under /etc/pve/priv/ (root-only). Without this,
+        # PVE::Storage::Plugin::sensitive_properties() falls back to a hardcoded
+        # list containing the bare name 'password', which does NOT match our
+        # 'ontap-password' -- which is why the secret used to land in
+        # storage.cfg verbatim.
+        'sensitive-properties' => {
+            'ontap-password' => 1,
+        },
     };
 }
 
@@ -306,7 +317,15 @@ sub options {
         'ontap-svm'          => { fixed => 1 },
         'ontap-aggregate'    => { fixed => 1 },
         'ontap-username'     => { fixed => 1 },
-        'ontap-password'     => { fixed => 1 },
+        # NOT fixed, and NOT required:
+        #  - required would fail check_config, because PVE extracts a sensitive
+        #    property out of the parameters BEFORE check_config runs
+        #  - fixed would make the password unchangeable for the life of the
+        #    storage (PVE drops fixed properties from the update schema
+        #    entirely), so it could never be rotated and on_update_hook could
+        #    never fire. Matches PBSPlugin, which declares `password` optional
+        #    for the same reasons.
+        'ontap-password'     => { optional => 1 },
         'ontap-ssl-verify'   => { optional => 1 },
         'ontap-thin'         => { optional => 1 },
         'ontap-igroup-mode'  => { optional => 1 },
@@ -447,12 +466,18 @@ sub _get_api {
         $status_path ? 'status' : 'data',
     );
 
-    # Return cached client if available, config hasn't changed, and cache is fresh
+    my $password = _get_ontap_password($opts{storeid}, $scfg);
+
+    # Return cached client if available, config hasn't changed, and cache is fresh.
+    # The password is part of the validity check so that rotating it takes effect
+    # on the next call instead of after API_CACHE_TTL -- a long-running pvedaemon
+    # would otherwise keep authenticating with the old one for minutes.
     if (my $cached = $api_cache{$cache_key}) {
         my $cache_age = time() - ($cached->{timestamp} // 0);
         if ($cache_age < API_CACHE_TTL &&
             ($cached->{host} // '') eq ($scfg->{'ontap-portal'} // '') &&
-            ($cached->{svm} // '') eq ($scfg->{'ontap-svm'} // '')) {
+            ($cached->{svm} // '') eq ($scfg->{'ontap-svm'} // '') &&
+            ($cached->{password} // '') eq ($password // '')) {
             return $cached->{api};
         }
     }
@@ -462,7 +487,7 @@ sub _get_api {
     my %api_opts = (
         host       => $scfg->{'ontap-portal'},
         username   => $scfg->{'ontap-username'},
-        password   => $scfg->{'ontap-password'},
+        password   => $password,
         svm        => $scfg->{'ontap-svm'},
         aggregate  => $scfg->{'ontap-aggregate'},
         ssl_verify => $ssl_verify,
@@ -480,6 +505,7 @@ sub _get_api {
         api       => $api,
         host      => $scfg->{'ontap-portal'},
         svm       => $scfg->{'ontap-svm'},
+        password  => $password,
         timestamp => time(),
     };
 
@@ -542,11 +568,133 @@ sub _assert_unique_ontap_namespace {
     return 1;
 }
 
+#
+# ONTAP API password storage
+#
+# PVE keeps storage secrets under /etc/pve/priv/ (root-only, cluster-wide via
+# pmxcfs), NOT in /etc/pve/storage.cfg, which is mode 640 root:www-data and so
+# readable by pveproxy. PBSPlugin is the closest reference implementation: same
+# shape as us (a password used to authenticate against an external REST
+# service, read on the status path), same file name and mode.
+#
+# Backward compatibility: storages created before 0.2.28 have the secret inline
+# in storage.cfg. _get_ontap_password() therefore prefers the priv file and
+# FALLS BACK to $scfg->{'ontap-password'}, so an existing storage keeps working
+# with no action required. Any `pvesm set` on that storage migrates it (see
+# on_update_hook_full), and the cleartext copy is removed from storage.cfg at
+# the same time. To migrate immediately without changing anything else:
+#
+#   pvesm set <storeid> --ontap-password '<password>'
+#
+# Package variable so the test suite can redirect writes away from the real
+# /etc/pve/priv. Never reassign it in plugin code.
+our $PRIV_STORAGE_DIR = '/etc/pve/priv/storage';
+
+sub _ontap_password_file {
+    my ($storeid) = @_;
+    return "$PRIV_STORAGE_DIR/${storeid}.pw";
+}
+
+sub _set_ontap_password {
+    my ($storeid, $password) = @_;
+
+    mkdir $PRIV_STORAGE_DIR;
+    PVE::Tools::file_set_contents(
+        _ontap_password_file($storeid), "$password\n", 0600);
+
+    return;
+}
+
+sub _delete_ontap_password {
+    my ($storeid) = @_;
+
+    my $file = _ontap_password_file($storeid);
+    if (-e $file) {
+        unlink($file)
+            or warn "removing ONTAP password file '$file' failed: $!\n";
+    }
+
+    return;
+}
+
+# Returns the password, or undef if neither location has one.
+sub _get_ontap_password {
+    my ($storeid, $scfg) = @_;
+
+    if (defined($storeid)) {
+        my $file = _ontap_password_file($storeid);
+        if (-e $file) {
+            my $pw = eval { PVE::Tools::file_read_firstline($file) };
+            return $pw if defined($pw) && $pw ne '';
+        }
+    }
+
+    # Pre-0.2.28 storage, or a config written by hand.
+    return $scfg->{'ontap-password'};
+}
+
 # Called by PVE before a new storage is written to the config (locked context).
+# %sensitive carries 'ontap-password' because plugindata() declares it in
+# 'sensitive-properties' -- by this point PVE has already removed it from $scfg,
+# so it never reaches storage.cfg.
 sub on_add_hook {
-    my ($class, $storeid, $scfg, %param) = @_;
+    my ($class, $storeid, $scfg, %sensitive) = @_;
 
     _assert_unique_ontap_namespace($storeid, $scfg);
+
+    if (defined($sensitive{'ontap-password'})) {
+        _set_ontap_password($storeid, $sensitive{'ontap-password'});
+    } elsif (!defined($scfg->{'ontap-password'})) {
+        # 'ontap-password' cannot be declared required (see options()), so catch
+        # a missing password here instead of failing later inside an API call.
+        die "storage '$storeid': ontap-password is required\n";
+    }
+
+    return undef;
+}
+
+# PVE calls on_update_hook_full (not on_update_hook) for any plugin whose api()
+# is >= 13, which is every version we support. We override the _full variant
+# because only it receives the CURRENT $scfg -- needed to purge a legacy
+# cleartext password. Mutating $scfg here persists: PVE applies deletions and
+# merges the update into this same hash after the hook returns, then writes it.
+sub on_update_hook_full {
+    my ($class, $storeid, $scfg, $update, $delete, $sensitive) = @_;
+
+    if (exists($sensitive->{'ontap-password'})) {
+        if (defined($sensitive->{'ontap-password'})) {
+            _set_ontap_password($storeid, $sensitive->{'ontap-password'});
+            # Drop any pre-0.2.28 cleartext copy now that the secret is stored
+            # in /etc/pve/priv/.
+            delete $scfg->{'ontap-password'};
+        } else {
+            # Caller asked to remove the password outright.
+            _delete_ontap_password($storeid);
+        }
+        return undef;
+    }
+
+    # Deliberately NO automatic migration of a legacy inline password here.
+    #
+    # Both /etc/pve/storage.cfg and /etc/pve/priv are cluster-wide (pmxcfs).
+    # Removing the cleartext key would take effect on every node at once, while
+    # a node still running < 0.2.28 reads ONLY $scfg->{'ontap-password'} -- so
+    # migrating during a rolling upgrade would break the storage on every
+    # not-yet-upgraded node. Migration is therefore an explicit operator action,
+    # performed after the whole cluster is upgraded:
+    #
+    #     pvesm set <storeid> --ontap-password '<password>'
+    #
+    # Until then the fallback in _get_ontap_password() keeps the storage working
+    # untouched on old and new nodes alike.
+
+    return undef;
+}
+
+sub on_delete_hook {
+    my ($class, $storeid, $scfg) = @_;
+
+    _delete_ontap_password($storeid);
 
     return undef;
 }
@@ -682,7 +830,7 @@ sub _parse_volname {
 sub _find_free_diskid {
     my ($scfg, $storeid, $vmid) = @_;
 
-    my $api = _get_api($scfg);
+    my $api = _get_api($scfg, storeid => $storeid);
 
     # List existing volumes for this VM
     my $prefix = pve_volname_to_ontap($storeid, "vm-${vmid}-disk-0");
@@ -725,7 +873,7 @@ sub activate_storage {
     # time (189s)" -- and pvestatd's sequential storage loop drags sibling
     # netappontap storages on the same node into 'inactive'. The next pvestatd
     # poll (~10s) is the retry, so dropping per-call retries here loses nothing.
-    my $api = eval { _get_api($scfg, status_path => 1); };
+    my $api = eval { _get_api($scfg, storeid => $storeid, status_path => 1); };
     if (!$api || $@) {
         my $err = $@ || "API client not available";
         _record_status_failure($storeid, "activate_storage: API connection failed: $err");
@@ -920,7 +1068,7 @@ sub deactivate_storage {
     warn "Temp FlexClone state cleanup: $@\n" if $@;
 
     # Step 2: Try to connect to ONTAP API
-    my $api = eval { _get_api($scfg); };
+    my $api = eval { _get_api($scfg, storeid => $storeid); };
     if (!$api) {
         warn "WARNING: Cannot connect to ONTAP API.\n";
         warn "  - Local multipath devices cannot be identified for cleanup.\n";
@@ -1863,7 +2011,7 @@ sub status {
 
     # Normal (resilient) client for the BACKGROUND cleanup grandchild below --
     # it runs detached and must not fail-fast on transient blips.
-    my $api = eval { _get_api($scfg); };
+    my $api = eval { _get_api($scfg, storeid => $storeid); };
     if (!$api) {
         warn "Failed to connect to ONTAP API for status check: $@";
         _record_status_failure($storeid, "API connection failed: $@");
@@ -1875,7 +2023,7 @@ sub status {
     # ~ontap-status-timeout seconds so it cannot back up pvestatd and starve
     # sibling storages (see the activate_storage rationale). Construction never
     # touches the network, so this cannot fail here.
-    my $status_api = eval { _get_api($scfg, status_path => 1); } // $api;
+    my $status_api = eval { _get_api($scfg, storeid => $storeid, status_path => 1); } // $api;
 
     # Background cleanup tasks (don't block status check)
     # 1. Old temporary FlexClones
@@ -1937,7 +2085,7 @@ sub alloc_image {
 
     die "unsupported format '$fmt'" if $fmt ne 'raw';
 
-    my $api = _get_api($scfg);
+    my $api = _get_api($scfg, storeid => $storeid);
 
     # Parse the requested volume name to determine type
     my $parsed;
@@ -2207,7 +2355,7 @@ sub _lun_has_active_io {
 sub free_image {
     my ($class, $storeid, $scfg, $volname, $isBase, $format) = @_;
 
-    my $api = _get_api($scfg);
+    my $api = _get_api($scfg, storeid => $storeid);
     my $ontap_volname = pve_volname_to_ontap($storeid, $volname);
     my $lun_path = encode_lun_path($ontap_volname);
 
@@ -2428,7 +2576,7 @@ sub free_image {
 sub list_images {
     my ($class, $storeid, $scfg, $vmid, $vollist, $cache) = @_;
 
-    my $api = _get_api($scfg);
+    my $api = _get_api($scfg, storeid => $storeid);
 
     my @res;
 
@@ -2543,7 +2691,7 @@ sub list_images {
 sub volume_size_info {
     my ($class, $scfg, $storeid, $volname, $timeout) = @_;
 
-    my $api = _get_api($scfg);
+    my $api = _get_api($scfg, storeid => $storeid);
     my $ontap_volname = pve_volname_to_ontap($storeid, $volname);
     my $lun_path = encode_lun_path($ontap_volname);
 
@@ -2574,7 +2722,7 @@ sub volume_resize {
       . "(volume '$volname', snapshot '$snapname')\n"
         if defined $snapname && length $snapname;
 
-    my $api = _get_api($scfg);
+    my $api = _get_api($scfg, storeid => $storeid);
     my $ontap_volname = pve_volname_to_ontap($storeid, $volname);
     my $lun_path = encode_lun_path($ontap_volname);
 
@@ -2758,7 +2906,7 @@ sub volume_import {
         $scfg->{shared},
         undef,
         sub {
-            my $api = _get_api($scfg);
+            my $api = _get_api($scfg, storeid => $storeid);
             my $existing = eval { $api->volume_get(pve_volname_to_ontap($storeid, $volname)); };
             if ($existing) {
                 die "volume '$volname' already exists on storage '$storeid'\n" if !$allow_rename;
@@ -2823,7 +2971,7 @@ sub volume_import {
 sub activate_volume {
     my ($class, $storeid, $scfg, $volname, $snapname, $cache, $hints) = @_;
 
-    my $api = _get_api($scfg);
+    my $api = _get_api($scfg, storeid => $storeid);
     my $ontap_volname = pve_volname_to_ontap($storeid, $volname);
     my $lun_path = encode_lun_path($ontap_volname);
 
@@ -2884,7 +3032,7 @@ sub deactivate_volume {
     # Only flush caches if device is not actively used by another process
     # (prevents sync/flush from blocking during live migration).
 
-    my $api = eval { _get_api($scfg); };
+    my $api = eval { _get_api($scfg, storeid => $storeid); };
     return 1 unless $api;
 
     my $ontap_volname = pve_volname_to_ontap($storeid, $volname);
@@ -3180,7 +3328,7 @@ sub path {
     my $parsed = _parse_volname($volname);
     die "Cannot parse volume name: $volname" unless $parsed;
 
-    my $api = _get_api($scfg);
+    my $api = _get_api($scfg, storeid => $storeid);
     my $ontap_volname = pve_volname_to_ontap($storeid, $volname);
 
     # For snapshot access, create a temporary FlexClone that qemu-img can read
@@ -3300,7 +3448,7 @@ sub filesystem_path {
 sub volume_snapshot_info {
     my ($class, $scfg, $storeid, $volname) = @_;
 
-    my $api = _get_api($scfg);
+    my $api = _get_api($scfg, storeid => $storeid);
     my $ontap_volname = pve_volname_to_ontap($storeid, $volname);
 
     my $snapshots = eval { $api->snapshot_list($ontap_volname, 'pve_snap_*'); } // [];
@@ -3371,7 +3519,7 @@ sub get_identity {
 sub volume_snapshot {
     my ($class, $scfg, $storeid, $volname, $snap) = @_;
 
-    my $api = _get_api($scfg);
+    my $api = _get_api($scfg, storeid => $storeid);
     my $ontap_volname = pve_volname_to_ontap($storeid, $volname);
     my $ontap_snapname = encode_snapshot_name($snap);
     my $lun_path = encode_lun_path($ontap_volname);
@@ -3424,7 +3572,7 @@ sub volume_snapshot {
 sub volume_snapshot_delete {
     my ($class, $scfg, $storeid, $volname, $snap, $running) = @_;
 
-    my $api = _get_api($scfg);
+    my $api = _get_api($scfg, storeid => $storeid);
     my $ontap_volname = pve_volname_to_ontap($storeid, $volname);
     my $ontap_snapname = encode_snapshot_name($snap);
 
@@ -3728,7 +3876,7 @@ sub volume_rollback_is_possible {
 
     $blockers //= [];
 
-    my $api = _get_api($scfg);
+    my $api = _get_api($scfg, storeid => $storeid);
     my $ontap_volname = pve_volname_to_ontap($storeid, $volname);
     my $target = encode_snapshot_name($snap);
 
@@ -3824,7 +3972,7 @@ sub _parse_ontap_time {
 sub volume_snapshot_rollback {
     my ($class, $scfg, $storeid, $volname, $snap) = @_;
 
-    my $api = _get_api($scfg);
+    my $api = _get_api($scfg, storeid => $storeid);
     my $ontap_volname = pve_volname_to_ontap($storeid, $volname);
     my $ontap_snapname = encode_snapshot_name($snap);
     my $lun_path = encode_lun_path($ontap_volname);
@@ -3917,7 +4065,7 @@ sub volume_snapshot_rollback {
 sub volume_snapshot_list {
     my ($class, $scfg, $storeid, $volname) = @_;
 
-    my $api = _get_api($scfg);
+    my $api = _get_api($scfg, storeid => $storeid);
     my $ontap_volname = pve_volname_to_ontap($storeid, $volname);
 
     my $snapshots = $api->snapshot_list($ontap_volname, 'pve_snap_*');
@@ -4008,7 +4156,7 @@ sub create_base {
     die "create_base on wrong vtype '$vtype'\n" if $vtype ne 'images';
     die "create_base not possible with base image\n" if $isBase;
 
-    my $api = _get_api($scfg);
+    my $api = _get_api($scfg, storeid => $storeid);
     my $ontap_volname = pve_volname_to_ontap($storeid, $volname);
     my $lun_path = encode_lun_path($ontap_volname);
 
@@ -4040,7 +4188,7 @@ sub rename_volume {
 
     die "rename_volume on wrong vtype '$vtype'\n" if $vtype ne 'images';
 
-    my $api = _get_api($scfg);
+    my $api = _get_api($scfg, storeid => $storeid);
 
     # Determine target volume name if not provided
     if (!$target_volname) {
@@ -4099,7 +4247,7 @@ sub find_free_diskname {
 sub clone_image {
     my ($class, $scfg, $storeid, $volname, $vmid, $snap) = @_;
 
-    my $api = _get_api($scfg);
+    my $api = _get_api($scfg, storeid => $storeid);
 
     # Check FlexClone license
     unless ($api->license_has_flexclone()) {

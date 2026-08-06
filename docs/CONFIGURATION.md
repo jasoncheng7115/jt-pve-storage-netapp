@@ -130,7 +130,8 @@ network interface show -vserver <svm> -service-policy *management*
 
 **Notes:**
 - Use single quotes to prevent shell expansion of special characters
-- Password is stored in `/etc/pve/storage.cfg` (cluster-wide, root-only access)
+- Since 0.2.28 the password is stored in `/etc/pve/priv/storage/<storeid>.pw` (mode `0600`, root-only), **not** in `/etc/pve/storage.cfg`. See [Credential handling](#credential-handling).
+- It can be changed at any time with `pvesm set <storeid> --ontap-password '<new>'`. Before 0.2.28 the property was `fixed`, which made it unchangeable.
 
 ## Optional Options
 
@@ -362,7 +363,27 @@ network interface show -vserver <svm> -service-policy *management*
 
 ### Credential handling
 
-The ONTAP API credential is stored in `/etc/pve/storage.cfg` (mode `0640`, owner `root:www-data`) together with the rest of the storage definition.
+**Since 0.2.28** the ONTAP API password is stored in `/etc/pve/priv/storage/<storeid>.pw` (mode `0600`, owner `root`), separate from the rest of the storage definition. This is the same location and mechanism Proxmox VE's own PBS and CIFS plugins use.
+
+Before 0.2.28 it was stored inline in `/etc/pve/storage.cfg`, which is mode `0640`, owner `root:www-data` — readable by `pveproxy`.
+
+#### Upgrading from a version before 0.2.28
+
+**Nothing breaks and no action is required.** The plugin prefers the priv file and falls back to the inline value, so an existing storage keeps working unchanged, on upgraded and not-yet-upgraded nodes alike.
+
+To actually move the secret out of `storage.cfg`, run this **after every node in the cluster is running 0.2.28 or later**:
+
+```bash
+pvesm set <storeid> --ontap-password '<password>'
+```
+
+It writes the priv file and removes the cleartext from `storage.cfg` in one step.
+
+> **Do not run it during a rolling upgrade.** `/etc/pve/storage.cfg` and `/etc/pve/priv` are both cluster-wide, so removing the cleartext takes effect on every node at once — and a node still running an older plugin reads only the inline value, so that storage would stop working there until it is upgraded.
+
+There is deliberately no automatic migration, for the same reason.
+
+If you later downgrade below 0.2.28, add `ontap-password` back into `/etc/pve/storage.cfg` by hand (the value is in `/etc/pve/priv/storage/<storeid>.pw`) — older code does not know about the priv file.
 
 **Use a dedicated ONTAP account for the plugin**, rather than the cluster `admin` account:
 
@@ -374,7 +395,7 @@ security login create -user-or-group-name pve-plugin -application http \
 **Notes:**
 - Scope the account to the **SVM** the plugin uses, not the whole cluster. The plugin only needs to manage volumes, LUNs, igroups and snapshots inside that SVM.
 - Restrict who holds `Datastore.Allocate` on this storage in Proxmox VE — that permission is what allows reading the storage configuration back through the API.
-- Rotate the credential by updating it on ONTAP and then `pvesm set <storeid> --ontap-password <new>`; the plugin caches its API client for at most 5 minutes, and `activate_storage` re-authenticates on the next poll.
+- Rotate the credential by updating it on ONTAP and then `pvesm set <storeid> --ontap-password '<new>'`. Since 0.2.28 the API client cache keys on the password, so the new one is used on the very next call rather than after the 5-minute cache TTL.
 
 ## Standard PVE Options
 
@@ -668,8 +689,9 @@ The clone uses NetApp FlexClone:
 Templates created before v0.1.5 need manual fix:
 
 ```bash
-# 1. Get storage credentials from storage.cfg
+# 1. Get the storage settings, and the password (0.2.28+ keeps it separately)
 grep -A10 "netappontap:" /etc/pve/storage.cfg
+cat /etc/pve/priv/storage/<storeid>.pw     # pre-0.2.28: the password is in storage.cfg
 
 # 2. Create __pve_base__ snapshot (replace with your values)
 perl -e '
@@ -693,23 +715,26 @@ sed -i 's/vm-107-disk-0/base-107-disk-0/g' /etc/pve/qemu-server/107.conf
 
 ### 1. Password Storage
 
-Passwords are stored in plaintext in `/etc/pve/storage.cfg`. This is the **standard PVE design** used by all storage plugins that require authentication (Ceph, iSCSI CHAP, ZFS over iSCSI, etc.).
+Since 0.2.28 the password is stored in `/etc/pve/priv/storage/<storeid>.pw`, not in `/etc/pve/storage.cfg`. Proxmox VE's own plugins that authenticate against an external service (PBS, CIFS) do the same.
 
 **File Permissions:**
 ```
--rw-r----- root www-data /etc/pve/storage.cfg (mode 0640)
+-rw------- root      /etc/pve/priv/storage/<storeid>.pw   (mode 0600)
+-rw-r----- root www-data /etc/pve/storage.cfg              (mode 0640)
 ```
 
-| User/Group | Access | Reason |
-|------------|--------|--------|
+| User/Group | Access to the password file | Reason |
+|------------|------------------------------|--------|
 | root | Read/Write | System administrator |
-| www-data | Read-only | PVE services (pvedaemon, pveproxy) |
+| www-data | **No access** | `pveproxy` does not need it — every storage API endpoint that reaches a plugin is `protected`, so it runs as root in `pvedaemon` |
 | Other users | No access | Protected by file permissions |
-| Cluster nodes | Read | Replicated via pmxcfs (cluster filesystem) |
+| Cluster nodes | Read (as root) | Replicated via pmxcfs, like the rest of `/etc/pve/priv` |
+
+Storages created before 0.2.28 keep the password inline in `storage.cfg` until they are migrated — see [Credential handling](#credential-handling).
 
 **Risk Assessment:**
-- Regular users cannot read the file
-- Users who can access it (root, cluster admins) already have full system privileges
+- The password is no longer exposed to the `www-data` group, so a compromise of `pveproxy` alone does not disclose it
+- Users who can read `/etc/pve/priv` (root, cluster admins) already have full system privileges
 - The ONTAP API account should have limited permissions, minimizing impact if compromised
 
 **Additional Hardening (Optional):**

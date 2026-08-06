@@ -2,6 +2,52 @@
 
 All notable changes to the NetApp ONTAP Storage Plugin for Proxmox VE are documented here.
 
+## [0.2.28] - 2026-08-06
+
+### Credentials: store `ontap-password` under `/etc/pve/priv/`, not in `storage.cfg`
+
+`/etc/pve/storage.cfg` is mode `0640`, owner `root:www-data`, so anything written there is readable by `pveproxy`. Proxmox VE keeps storage secrets under `/etc/pve/priv/` (root-only) instead, via `plugindata()`'s `sensitive-properties` — but our key is `ontap-password`, and `PVE::Storage::Plugin::sensitive_properties()` falls back to a hardcoded list containing the bare name `password`, which does **not** match it. The secret therefore landed in `storage.cfg` verbatim.
+
+The plugin now declares the property as sensitive, so Proxmox VE strips it from the parameters before writing the config and hands it to the hooks instead. It is stored at `/etc/pve/priv/storage/<storeid>.pw` (mode `0600`), the same location and mechanism used by Proxmox VE's own PBS and CIFS plugins.
+
+`PBSPlugin` is the closest reference: same shape as this plugin — a password used to authenticate against an external REST service, read on the `status()` path — which also confirms the read always happens in a root context (every `API2/Storage/` endpoint that reaches a plugin is `protected => 1`, so it runs in `pvedaemon`, not in `pveproxy`).
+
+### Bug fix: the ONTAP password could never be changed
+
+`ontap-password` was declared `fixed => 1`. Proxmox VE drops fixed properties from the update schema **entirely** (`SectionConfig.pm`), so `pvesm set <storeid> --ontap-password ...` was rejected — the parameter was not even recognised — and the only way to change an ONTAP password was to remove and re-add the storage.
+
+It is now `optional`. It cannot be declared required: Proxmox VE extracts a sensitive property from the parameters **before** `check_config()` runs, so a required declaration would fail validation on every add. `on_add_hook()` checks for a missing password instead and fails with an actionable message.
+
+The API client cache now includes the password in its validity check, so a rotation takes effect on the next call instead of after the 5-minute cache TTL.
+
+#### Existing storages are not affected and need no action
+
+The read path prefers the priv file and **falls back** to the inline `ontap-password`, so a storage created before 0.2.28 keeps working exactly as before — on upgraded and not-yet-upgraded nodes alike. Verified against real storage definitions: the password read under the new code is identical to the one read before.
+
+Unrelated configuration changes do not disturb it either. `extract_sensitive_params()` only extracts from the parameters passed in, never from the stored config, so `pvesm set <storeid> --content ...` (or any other option) leaves the inline password in place.
+
+#### Migration is deliberately manual
+
+There is **no automatic migration**. `/etc/pve/storage.cfg` and `/etc/pve/priv` are both cluster-wide, so removing the cleartext takes effect on every node at once, while a node still running an older plugin reads only the inline value. Migrating during a rolling upgrade would break the storage on every not-yet-upgraded node.
+
+**After every node in the cluster runs 0.2.28 or later:**
+
+```bash
+pvesm set <storeid> --ontap-password '<password>'
+```
+
+This writes the priv file and removes the cleartext from `storage.cfg` in one step.
+
+Downgrading after migrating requires putting `ontap-password` back into `storage.cfg` by hand (the value is in `/etc/pve/priv/storage/<storeid>.pw`); older code does not know about the priv file.
+
+### Other
+
+- New `on_update_hook_full` and `on_delete_hook`. Proxmox VE calls `on_update_hook_full` — **not** `on_update_hook` — for any plugin whose `api()` is >= 13, which is every version this plugin supports; overriding only the latter would have been dead code.
+- All 23 `_get_api()` call sites now pass `storeid`, which is required to locate the priv file.
+- No change to the data path, device handling or ONTAP API usage.
+
+**Testing:** `make test` 6/6, units **254/254** (26 new). Live verification on Proxmox VE 9.2.0 against the real Proxmox VE config API: add (password absent from `storage.cfg`, priv file `0600` with correct content), rotation, unrelated updates leaving the secret untouched, legacy storages not auto-migrated, explicit migration clearing the cleartext, and storage deletion removing the priv file.
+
 ## [0.2.27] - 2026-07-27
 
 ### Cluster-to-Cluster Migration: Implement `volume_export` / `volume_import`

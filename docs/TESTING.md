@@ -2856,6 +2856,138 @@ FlexClone and is untested.
 
 ---
 
+## 35. Credential Storage: `ontap-password` under `/etc/pve/priv/` (v0.2.28)
+
+The password used to land in `/etc/pve/storage.cfg` (mode `0640`, `root:www-data`)
+because our key `ontap-password` does not match `sensitive_properties()`'s
+hardcoded fallback list. It is now declared sensitive and stored in
+`/etc/pve/priv/storage/<storeid>.pw` (mode `0600`).
+
+**The load-bearing assertions are the upgrade ones**: an existing storage must
+keep working untouched, and nothing may migrate it automatically.
+
+### 35.1 Unit tests (no ONTAP, no cluster)
+
+```bash
+perl -Ilib tests/audit_fixes.t
+# Expected: 206/206 PASS. The credential block asserts:
+#   - plugindata declares 'sensitive-properties' => ontap-password
+#   - options(): ontap-password is optional, NOT fixed
+#   - on_update_hook_full is overridden (PVE never calls on_update_hook at api() >= 13)
+#   - every _get_api() call site passes storeid (23 of them)
+#   - read path prefers the priv file, falls back to storage.cfg
+#   - the file is mode 0600
+#   - on_add_hook refuses a storage with no password anywhere
+#   - an unrelated update does NOT auto-migrate a legacy secret
+#   - an explicit set migrates it AND clears the cleartext
+#   - on_delete_hook removes the file
+```
+
+### 35.2 Live verification against the real Proxmox VE config API (NO ONTAP NEEDED)
+
+Uses `--disable 1` so Proxmox VE skips the activation check, which is what
+otherwise requires a reachable backend.
+
+```bash
+NODE=$(hostname)
+pvesm add netappontap zztest --ontap-portal 192.0.2.77 --ontap-svm svmtest \
+    --ontap-aggregate aggr1 --ontap-username tester \
+    --ontap-password 'TestOnly-Secret-123' --content images \
+    --nodes "$NODE" --disable 1
+
+grep -c 'TestOnly-Secret-123' /etc/pve/storage.cfg     # Expected: 0
+ls -l /etc/pve/priv/storage/zztest.pw                  # Expected: -rw------- (0600)
+[ "$(cat /etc/pve/priv/storage/zztest.pw)" = 'TestOnly-Secret-123' ] && echo MATCH
+
+# Rotation -- impossible before 0.2.28, when the property was fixed => 1
+pvesm set zztest --ontap-password 'Rotated-Secret-456'
+[ "$(cat /etc/pve/priv/storage/zztest.pw)" = 'Rotated-Secret-456' ] && echo ROTATED
+
+# An unrelated update must not disturb the secret
+pvesm set zztest --ontap-thin 0
+[ "$(cat /etc/pve/priv/storage/zztest.pw)" = 'Rotated-Secret-456' ] && echo UNTOUCHED
+
+# Deleting the storage removes the secret
+pvesm remove zztest
+[ ! -e /etc/pve/priv/storage/zztest.pw ] && echo CLEANED
+```
+
+### 35.3 Upgrade safety (NO ONTAP NEEDED) -- the tests that matter most
+
+An installation upgraded from below 0.2.28 still has the password inline. It must
+keep working, and no ordinary operation may silently move or drop it.
+
+```bash
+# (a) The read path returns the SAME password as before, for every real storage
+perl -e '
+use PVE::Storage; use PVE::Storage::Custom::NetAppONTAPPlugin;
+my $cfg = PVE::Storage::config();
+for my $sid (sort keys %{$cfg->{ids}}) {
+    my $scfg = $cfg->{ids}{$sid};
+    next unless ($scfg->{type} // "") eq "netappontap";
+    my $got = PVE::Storage::Custom::NetAppONTAPPlugin::_get_ontap_password($sid, $scfg);
+    my $inline = $scfg->{"ontap-password"};
+    printf "%-12s match=%s\n", $sid,
+        ((defined $got && defined $inline && $got eq $inline) ? "YES" : "n/a");
+}'
+# Expected for a not-yet-migrated storage: match=YES
+
+# (b) Unrelated updates must NOT strip a legacy inline password.
+#     Create a legacy-shaped storage, then poke it.
+pvesm add netappontap zzlegacy --ontap-portal 192.0.2.78 --ontap-svm svmL \
+    --ontap-aggregate aggr1 --ontap-username tester --ontap-password 'X' \
+    --content images --nodes "$(hostname)" --disable 1
+rm -f /etc/pve/priv/storage/zzlegacy.pw
+# add "ontap-password LegacyPw-ABC" to the zzlegacy section of /etc/pve/storage.cfg
+
+pvesm set zzlegacy --ontap-thin 0
+pvesm set zzlegacy --content images,rootdir
+grep -c 'LegacyPw-ABC' /etc/pve/storage.cfg     # Expected: 1 (still there, NOT migrated)
+[ ! -e /etc/pve/priv/storage/zzlegacy.pw ] && echo 'NO SILENT MIGRATION'
+
+# (c) The explicit migration does move it and clear the cleartext
+pvesm set zzlegacy --ontap-password 'LegacyPw-ABC'
+grep -c 'LegacyPw-ABC' /etc/pve/storage.cfg     # Expected: 0
+[ -e /etc/pve/priv/storage/zzlegacy.pw ] && echo MIGRATED
+
+pvesm remove zzlegacy
+```
+
+### 35.4 Authentication with a priv-only password (ONTAP REQUIRED)
+
+The one assertion that cannot be made without a backend: a storage whose password
+exists **only** in the priv file must actually authenticate.
+
+```bash
+# On a working storage, AFTER every node runs 0.2.28+:
+pvesm set <storeid> --ontap-password '<the real password>'
+grep -c 'ontap-password' /etc/pve/storage.cfg   # one fewer than before
+pvesm status --storage <storeid>                # Expected: active, real capacity
+
+perl -Ilib tests/sim_functional.pl              # Expected: 13/13 PASS
+```
+
+### 35.5 Static guards
+
+```bash
+P=lib/PVE/Storage/Custom/NetAppONTAPPlugin.pm
+# NOTE: every pattern below that contains $ ( ) { or } uses grep -F.
+# GNU grep treats a mid-pattern $ as an end-of-line anchor, so a BRE
+# '_get_api($scfg, ...' can never match and silently returns 0.
+grep -cF "'sensitive-properties' => {" $P                 # Expected: 1
+grep -cF "'ontap-password'     => { optional => 1 }" $P   # Expected: 1
+grep -c '^sub on_update_hook_full' $P                     # Expected: 1
+grep -c '^sub on_delete_hook' $P                          # Expected: 1
+grep -cF '/etc/pve/priv/storage' $P                       # Expected: 1
+# ontap-password must NOT be fixed anywhere
+grep -cF "'ontap-password'     => { fixed => 1 }" $P      # Expected: 0
+# every _get_api() call site carries the storeid
+grep -cF '_get_api($scfg, storeid =>' $P                  # Expected: 23
+grep -cF '_get_api($scfg)' $P                             # Expected: 0
+```
+
+---
+
 ## Cleanup
 
 ```bash
@@ -2881,6 +3013,39 @@ pvesm list $STORAGE
 ## Release Test Results
 
 Each release must pass all tests above before publishing. Results are recorded below.
+
+### v0.2.28-1 Credential Storage: ontap-password under /etc/pve/priv/ (2026-08-06)
+
+**Status: all tests PASS.**
+
+**Environment:** proxmox-ve 9.2.0 / pve-manager 9.2.5 / libpve-storage-perl 9.1.6 (APIVER 15) / kernel 7.0.2-7-pve. ONTAP simulator (rebuilt) `ontap-sim`, NetApp Release 9.16.1P1, SVM svm1 @ 192.168.1.194, aggregate aggr1, 2 iSCSI LIFs (both on one node -- the plugin correctly warns).
+
+| Suite | Result |
+|-------|--------|
+| `make test` (Perl syntax, 6 modules) | 6/6 PASS |
+| `podchecker` on the main plugin | PASS |
+| `tests/audit_fixes.t` | 206/206 PASS |
+| `tests/status_timeout.t` | 20/20 PASS |
+| `tests/stale_sd_reaper.t` | 20/20 PASS |
+| `tests/activate_budget.t` | 8/8 PASS |
+| `tests/sim_functional.pl` (real ONTAP) | 13/13 PASS |
+| `tests/sim_snapshot_safety.pl` (real ONTAP) | 34/34 PASS |
+| `tests/cleanup_load.pl` (real ONTAP) | 6/6 PASS |
+| `tests/sim_export_import.pl` (real ONTAP) | 8/8 PASS |
+| **Units total** | **254/254** |
+| **Functional total** | **61/61** |
+
+**Section 35 results:**
+
+- **35.2 / 35.3 (live, real Proxmox VE config API):** add stores nothing in `storage.cfg` and writes a 0600 priv file with the correct content; rotation works (impossible before, the property was `fixed`); unrelated updates (`--ontap-thin`, `--content`, `--disable`) leave both a priv-stored and a legacy inline password untouched; a legacy storage is NOT auto-migrated; an explicit set migrates it and clears the cleartext; deleting the storage removes the priv file.
+- **35.4 (ONTAP required) PASS:** a storage whose password exists **only** in `/etc/pve/priv/storage/<storeid>.pw` (zero `ontap-password` lines in `storage.cfg`) authenticates against real ONTAP and reports real capacity -- verified on both the **status path** and, after a full service restart, the **data path**: `pvesm alloc` created a real 1 GiB LUN, the multipath device appeared, and `pvesm free` removed it with the full host-side teardown (mapper gone, no orphan sd).
+- **Fallback verified against real ONTAP:** the two pre-existing storages, whose password is still inline in `storage.cfg`, authenticate and report capacity unchanged under 0.2.28.
+
+**Notes:**
+
+- The one `sim_export_import.pl` failure seen during this run (`4 pve_* volumes` left) was residue from an earlier invocation that the test harness killed at a 2-minute command timeout, not a plugin defect. Re-run from a clean state: 8/8 PASS with 0 leftovers.
+- `multipath -f ... failed/timed out, trying dmsetup remove --force` appears throughout and is the designed v0.2.3 fallback, not an error.
+- The pre-existing manual `na_iscsi_node1` NetApp LUN on this host was never touched by any plugin operation (cross-storage safety).
 
 ### v0.2.23-1 Proxmox VE 9.0/9.1/9.2 Compatibility Audit + Snapshot Safety (2026-07-26)
 

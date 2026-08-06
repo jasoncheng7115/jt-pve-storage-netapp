@@ -194,6 +194,37 @@ pvesm set <storeid> --disable 0
 journalctl -u pvestatd -f                        # watch "status update time" stay low
 ```
 
+### Authentication Fails After Migrating the Password (0.2.28+)
+
+**Symptoms:**
+- The storage worked, then stopped authenticating right after `pvesm set <storeid> --ontap-password ...` was run.
+- It fails on *some* nodes but works on others.
+
+**Cause:** since 0.2.28 the password lives in `/etc/pve/priv/storage/<storeid>.pw` instead of `/etc/pve/storage.cfg`, and migrating removes the cleartext from `storage.cfg`. Both files are cluster-wide, so the removal takes effect everywhere at once — but a node still running a plugin older than 0.2.28 reads only the inline value and now has no password at all.
+
+**Fix:** upgrade the remaining nodes.
+
+```bash
+# Which nodes are still on an old plugin?
+for n in $(pvecm nodes | awk 'NR>3 {print $3}' | tr -d '()'); do
+    echo -n "$n: "; ssh "$n" "dpkg-query -W -f='\${Version}' jt-pve-storage-netapp"; echo
+done
+
+# On every node that is behind:
+dpkg -i jt-pve-storage-netapp_<version>-1_all.deb
+systemctl restart pvestatd pvedaemon pveproxy
+```
+
+**Migrate only after every node runs 0.2.28 or later.** This is also why the plugin performs no automatic migration.
+
+**If you need to roll back below 0.2.28**, put the password back into `/etc/pve/storage.cfg` by hand — the old code does not know about the priv file:
+
+```bash
+cat /etc/pve/priv/storage/<storeid>.pw     # the value to restore
+# then add a line to that storage's section:
+#         ontap-password <value>
+```
+
 ### Invalid Configuration
 
 **Symptoms:**

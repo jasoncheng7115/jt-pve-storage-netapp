@@ -129,7 +129,8 @@ network interface show -vserver <svm> -service-policy *management*
 
 **備註**：
 - 請使用單引號以避免特殊字元被 shell 展開
-- 密碼會以明文儲存在 `/etc/pve/storage.cfg` (叢集範圍、僅 root 可存取)
+- 自 0.2.28 起，密碼儲存於 `/etc/pve/priv/storage/<storeid>.pw`（權限 `0600`，僅 root 可讀），**不再**寫入 `/etc/pve/storage.cfg`。詳見[憑證處理](#憑證處理)。
+- 可隨時以 `pvesm set <storeid> --ontap-password '<新密碼>'` 變更。0.2.28 之前該屬性為 `fixed`，根本無法變更。
 
 ## 選填選項
 
@@ -361,7 +362,27 @@ network interface show -vserver <svm> -service-policy *management*
 
 ### 憑證處理
 
-ONTAP API 憑證與其他儲存設定一同存放於 `/etc/pve/storage.cfg`（權限 `0640`，擁有者 `root:www-data`）。
+**自 0.2.28 起**，ONTAP API 密碼存放於 `/etc/pve/priv/storage/<storeid>.pw`（權限 `0600`，擁有者 `root`），與其餘儲存設定分開。這與 Proxmox VE 內建的 PBS、CIFS 外掛採用同一個位置與機制。
+
+0.2.28 之前是內嵌於 `/etc/pve/storage.cfg`，該檔權限為 `0640`、擁有者 `root:www-data`，`pveproxy` 讀得到。
+
+#### 從 0.2.28 之前的版本升級
+
+**不會有任何中斷，也不需要任何動作**。外掛會優先讀 priv 檔、找不到才回退讀內嵌值，因此既有儲存運作如常，已升級與尚未升級的節點都一樣。
+
+若要真正把密碼移出 `storage.cfg`，請在**叢集中每個節點都已執行 0.2.28 或更新版本之後**執行：
+
+```bash
+pvesm set <storeid> --ontap-password '<密碼>'
+```
+
+這道指令會一次完成：寫入 priv 檔，並從 `storage.cfg` 移除明文。
+
+> **請勿在滾動升級途中執行**。`/etc/pve/storage.cfg` 與 `/etc/pve/priv` 都是叢集共用，移除明文會同時對所有節點生效 —— 而還在跑舊版外掛的節點只讀內嵌值，該儲存在那些節點上會停止運作，直到它們升級為止。
+
+基於同樣理由，外掛刻意不做任何自動遷移。
+
+若日後要降版到 0.2.28 之前，請手動把 `ontap-password` 加回 `/etc/pve/storage.cfg`（值可從 `/etc/pve/priv/storage/<storeid>.pw` 取得）—— 舊版程式並不認得 priv 檔。
 
 **請為本外掛建立專用的 ONTAP 帳號**，不要直接使用叢集的 `admin` 帳號：
 
@@ -373,7 +394,7 @@ security login create -user-or-group-name pve-plugin -application http \
 **注意事項**：
 - 將該帳號的權限範圍限縮在外掛實際使用的 **SVM**，而非整個叢集。外掛只需要管理該 SVM 內的 volume、LUN、igroup 與快照。
 - 在 Proxmox VE 中限制哪些人擁有此 storage 的 `Datastore.Allocate` 權限——正是該權限允許透過 API 讀回儲存設定。
-- 輪換憑證的方式：先在 ONTAP 上更新，接著執行 `pvesm set <storeid> --ontap-password <新密碼>`；外掛的 API client 最多快取 5 分鐘，`activate_storage` 會在下一輪輪詢時重新認證。
+- 輪換憑證的方式：先在 ONTAP 上更新，接著執行 `pvesm set <storeid> --ontap-password '<新密碼>'`。自 0.2.28 起 API client 快取會納入密碼比對，新密碼在下一次呼叫就生效，不必等 5 分鐘的快取逾時。
 
 ## 標準 PVE 選項
 
@@ -667,8 +688,9 @@ Clone 採用 NetApp FlexClone：
 v0.1.5 之前建立的範本需手動修正：
 
 ```bash
-# 1. 從 storage.cfg 取得儲存憑證
+# 1. 取得儲存設定與密碼 (0.2.28+ 密碼另存他處)
 grep -A10 "netappontap:" /etc/pve/storage.cfg
+cat /etc/pve/priv/storage/<storeid>.pw     # 0.2.28 之前：密碼在 storage.cfg 內
 
 # 2. 建立 __pve_base__ 快照 (請替換為實際值)
 perl -e '
@@ -692,23 +714,26 @@ sed -i 's/vm-107-disk-0/base-107-disk-0/g' /etc/pve/qemu-server/107.conf
 
 ### 1. 密碼儲存
 
-密碼以明文儲存在 `/etc/pve/storage.cfg`。這是 **PVE 標準設計**，所有需要認證的儲存外掛皆採此方式 (Ceph、iSCSI CHAP、ZFS over iSCSI 等)。
+自 0.2.28 起，密碼儲存於 `/etc/pve/priv/storage/<storeid>.pw`，不再寫入 `/etc/pve/storage.cfg`。Proxmox VE 內建、同樣需要向外部服務認證的外掛（PBS、CIFS）也是這個作法。
 
 **檔案權限**：
 ```
--rw-r----- root www-data /etc/pve/storage.cfg (mode 0640)
+-rw------- root      /etc/pve/priv/storage/<storeid>.pw   (mode 0600)
+-rw-r----- root www-data /etc/pve/storage.cfg              (mode 0640)
 ```
 
-| 使用者/群組 | 存取權限 | 原因 |
-|------------|---------|------|
+| 使用者/群組 | 對密碼檔的存取權限 | 原因 |
+|------------|-------------------|------|
 | root | 讀寫 | 系統管理員 |
-| www-data | 唯讀 | PVE 服務 (pvedaemon、pveproxy) |
+| www-data | **無存取** | `pveproxy` 不需要它 —— 所有會呼叫外掛的儲存 API 端點都標示 `protected`，會以 root 在 `pvedaemon` 中執行 |
 | 其他使用者 | 無存取 | 由檔案權限保護 |
-| 叢集節點 | 讀取 | 由 pmxcfs (叢集檔案系統) 複寫 |
+| 叢集節點 | 以 root 讀取 | 與 `/etc/pve/priv` 其餘內容一樣由 pmxcfs 複寫 |
+
+0.2.28 之前建立的儲存，密碼仍內嵌於 `storage.cfg`，直到執行遷移為止 —— 詳見[憑證處理](#憑證處理)。
 
 **風險評估**：
-- 一般使用者無法讀取此檔案
-- 具存取權者 (root、叢集管理員) 本身已擁有完整系統權限
+- 密碼不再暴露給 `www-data` 群組，因此單獨攻陷 `pveproxy` 並不會取得密碼
+- 能讀取 `/etc/pve/priv` 者 (root、叢集管理員) 本身已擁有完整系統權限
 - ONTAP API 帳號應限制權限，以降低外洩時的影響
 
 **額外強化 (選用)**：

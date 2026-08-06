@@ -142,7 +142,7 @@
     <div class="hero__glow"></div>
     <div class="hero__glow-left"></div>
     <div class="hero__content">
-        <div class="hero__badge">v0.2.27 <span class="hero__badge-sep"></span> MIT License</div>
+        <div class="hero__badge">v0.2.28 <span class="hero__badge-sep"></span> MIT License</div>
         <h1 class="hero__title">jt-pve-storage-netapp</h1>
         <p class="hero__project-desc">
             <span class="lang-en">NetApp ONTAP SAN/iSCSI/FC Storage Plugin for Proxmox VE</span>
@@ -537,7 +537,7 @@
                 <span class="lang-en">Install the plugin package</span>
                 <span class="lang-zh">安裝 plugin 套件</span>
             </div>
-            <pre><span class="cmd">dpkg</span> <span class="flag">-i</span> jt-pve-storage-netapp_0.2.27-1_all.deb</pre>
+            <pre><span class="cmd">dpkg</span> <span class="flag">-i</span> jt-pve-storage-netapp_0.2.28-1_all.deb</pre>
             <p>
                 <span class="lang-en">The plugin automatically configures multipath and reloads Proxmox VE services (pvedaemon, pvestatd, pveproxy).</span>
                 <span class="lang-zh">Plugin 會自動設定 multipath 並重新載入 Proxmox VE 服務（pvedaemon、pvestatd、pveproxy）。</span>
@@ -611,7 +611,7 @@
                 <span class="lang-en">Install new package</span>
                 <span class="lang-zh">安裝新套件</span>
             </div>
-            <pre><span class="cmd">dpkg</span> <span class="flag">-i</span> jt-pve-storage-netapp_0.2.27-1_all.deb</pre>
+            <pre><span class="cmd">dpkg</span> <span class="flag">-i</span> jt-pve-storage-netapp_0.2.28-1_all.deb</pre>
         </div>
     </div>
     <div class="step">
@@ -1451,6 +1451,15 @@
         <span class="lang-en">Version history. For full details see <a href="https://github.com/jasoncheng7115/jt-pve-storage-netapp/blob/main/CHANGELOG.md">CHANGELOG.md</a>.</span>
         <span class="lang-zh">版本紀錄。完整內容請參閱 <a href="https://github.com/jasoncheng7115/jt-pve-storage-netapp/blob/main/CHANGELOG_zh-TW.md">CHANGELOG_zh-TW.md</a>。</span>
     </p>
+
+    <div class="changelog-entry">
+        <div class="changelog-version">v0.2.28 <span class="changelog-tag changelog-tag--feature">Security</span></div>
+        <div class="changelog-date">2026-08-06</div>
+        <div class="changelog-summary">
+            <span class="lang-en"><strong>The ONTAP password no longer lives in storage.cfg.</strong> <code>/etc/pve/storage.cfg</code> is mode 0640, owner <code>root:www-data</code>, so anything written there is readable by <code>pveproxy</code>. Proxmox VE keeps storage secrets under <code>/etc/pve/priv/</code> instead, via <code>plugindata()</code>&#39;s <code>sensitive-properties</code> — but the hardcoded fallback list only matches the bare name <code>password</code>, which does not match our <code>ontap-password</code>, so the secret was written verbatim. It is now declared sensitive and stored at <code>/etc/pve/priv/storage/&lt;storeid&gt;.pw</code> (mode 0600), the same location and mechanism used by Proxmox VE&#39;s own PBS and CIFS plugins. <strong>Also fixes a bug that had been there since the beginning:</strong> the password could never be changed. It was declared <code>fixed</code>, and Proxmox VE drops fixed properties from the update schema entirely, so <code>pvesm set --ontap-password</code> was not even a recognised parameter — the only way to change an ONTAP password was to remove and re-add the storage. <strong>Existing storages need no action:</strong> the read path falls back to the inline value, so they keep working on upgraded and not-yet-upgraded nodes alike. There is deliberately no automatic migration, because both files are cluster-wide and removing the cleartext would break every node still running an older plugin. Migrate with <code>pvesm set &lt;storeid&gt; --ontap-password &#39;&lt;password&gt;&#39;</code> once the whole cluster is upgraded.</span>
+            <span class="lang-zh"><strong>ONTAP 密碼不再存放於 storage.cfg。</strong><code>/etc/pve/storage.cfg</code> 權限為 0640、擁有者 <code>root:www-data</code>，因此寫在裡面的任何內容 <code>pveproxy</code> 都讀得到。Proxmox VE 對儲存機密的作法是改放 <code>/etc/pve/priv/</code>，機制為 <code>plugindata()</code> 的 <code>sensitive-properties</code>——但未宣告時的硬編碼退回清單只比對 <code>password</code> 這個名稱，與我們的 <code>ontap-password</code> 不符，因此密碼被原樣寫入。現在已宣告為敏感屬性，改存於 <code>/etc/pve/priv/storage/&lt;storeid&gt;.pw</code>（權限 0600），與 Proxmox VE 內建的 PBS、CIFS 外掛採用同一位置與機制。<strong>同時修正一個從一開始就存在的問題</strong>：密碼過去根本無法變更。它被宣告為 <code>fixed</code>，而 Proxmox VE 會把 fixed 屬性完全排除在更新 schema 之外，因此 <code>pvesm set --ontap-password</code> 連參數名稱都不被辨識——要改 ONTAP 密碼只能移除儲存再重新加入。<strong>既有儲存不需要任何動作</strong>：讀取路徑會回退讀取內嵌值，因此已升級與尚未升級的節點都能正常運作。外掛刻意不做自動遷移，因為這兩個檔案都是叢集共用，移除明文會讓所有還在跑舊版外掛的節點失效。待整個叢集都升級完成後，再以 <code>pvesm set &lt;storeid&gt; --ontap-password &#39;&lt;密碼&gt;&#39;</code> 遷移。</span>
+        </div>
+    </div>
 
     <div class="changelog-entry">
         <div class="changelog-version">v0.2.27 <span class="changelog-tag changelog-tag--feature">Feature</span></div>

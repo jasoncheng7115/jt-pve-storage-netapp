@@ -189,6 +189,37 @@ pvesm set <storeid> --disable 0
 journalctl -u pvestatd -f                        # 觀察 status update time 維持低值
 ```
 
+### 遷移密碼之後認證失敗（0.2.28 以上）
+
+**症狀**：
+- 儲存原本正常，執行 `pvesm set <storeid> --ontap-password ...` 之後就無法認證。
+- 有些節點失敗、有些節點正常。
+
+**原因**：自 0.2.28 起密碼改存於 `/etc/pve/priv/storage/<storeid>.pw`，不再放 `/etc/pve/storage.cfg`，而遷移動作會把明文從 `storage.cfg` 移除。這兩個檔案都是叢集共用，移除會同時對所有節點生效 —— 但還在跑 0.2.28 以前版本的節點只讀內嵌值，現在等於完全沒有密碼。
+
+**修正方式**：把其餘節點升級。
+
+```bash
+# 哪些節點的外掛還是舊版？
+for n in $(pvecm nodes | awk 'NR>3 {print $3}' | tr -d '()'); do
+    echo -n "$n: "; ssh "$n" "dpkg-query -W -f='\${Version}' jt-pve-storage-netapp"; echo
+done
+
+# 在每個版本落後的節點上：
+dpkg -i jt-pve-storage-netapp_<version>-1_all.deb
+systemctl restart pvestatd pvedaemon pveproxy
+```
+
+**請務必在叢集中每個節點都是 0.2.28 或更新版本之後才執行遷移**。這也是外掛刻意不做自動遷移的原因。
+
+**若需要降版到 0.2.28 以前**，請手動把密碼加回 `/etc/pve/storage.cfg` —— 舊版程式並不認得 priv 檔：
+
+```bash
+cat /etc/pve/priv/storage/<storeid>.pw     # 要還原的值
+# 然後在該儲存的區段中加入一行：
+#         ontap-password <值>
+```
+
 ### 設定錯誤
 
 **症狀**：

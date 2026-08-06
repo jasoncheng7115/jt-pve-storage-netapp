@@ -3047,6 +3047,26 @@ Each release must pass all tests above before publishing. Results are recorded b
 - `multipath -f ... failed/timed out, trying dmsetup remove --force` appears throughout and is the designed v0.2.3 fallback, not an error.
 - The pre-existing manual `na_iscsi_node1` NetApp LUN on this host was never touched by any plugin operation (cross-storage safety).
 
+**Cluster deployment verification (2026-08-06, after publishing the tag):**
+
+The items below were NOT covered by the suites above -- they exercise the `.deb`
+upgrade path and the real migration, which is the risky one.
+
+| Step | Result |
+|------|--------|
+| `dpkg -i` upgrade 0.2.27-1 -> 0.2.28-1 on all 3 nodes | PASS (postinst ran, service checks OK, the v0.2.22 "restart pvestatd, do not rely on reload" warning printed) |
+| `systemctl restart pvestatd` on all 3, PID must change | PASS (all 3 PIDs changed) |
+| All 3 nodes: version / `api()` / warnings | 0.2.28-1, `api()` = 15 = `APIVER`, **0** "older storage API" warnings |
+| All 3 nodes BEFORE migration, both storages | active with real capacity -- the fallback path working cluster-wide on real ONTAP |
+| Migrate `netapp1` (`pvesm set --ontap-password`), keep `netapp2` inline as a control | cleartext count in `storage.cfg` 2 -> 1; `netapp1` section has 0 password lines; `/etc/pve/priv/storage/netapp1.pw` mode 0600; no priv file for `netapp2` |
+| All 3 nodes AFTER migration, both storages | active -- migrated and non-migrated storages both work everywhere |
+| Data path on the **migrated** storage from a **different** node (pc-pve3, which did not perform the migration) | `pvesm alloc` + `pvesm free` both succeeded; the priv file is visible there via pmxcfs; afterwards 0 ONTAP volumes, 0 NETAPP multipath devices, 0 NETAPP sd devices, tracking files empty |
+
+The correct rollout order was followed and is the one documented: **upgrade every
+node first, then migrate.** The control storage (`netapp2`, still inline) proves
+the fallback keeps working alongside a migrated one.
+
+
 ### v0.2.23-1 Proxmox VE 9.0/9.1/9.2 Compatibility Audit + Snapshot Safety (2026-07-26)
 
 **Status: all runnable tests PASS. Not yet published** — `make deb`, install on the node, section 31.8 (`qm`-level end-to-end), the `github/` sync, README deb filenames and the tag are still outstanding.

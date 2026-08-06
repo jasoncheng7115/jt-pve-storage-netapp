@@ -2602,6 +2602,23 @@ pvesm list $STORAGE
 - 過程中出現的 `multipath -f ... failed/timed out, trying dmsetup remove --force` 是 v0.2.3 設計中的退回機制，不是錯誤。
 - 本機既有的手動 `na_iscsi_node1` NetApp LUN 在所有外掛操作中都未被觸碰（跨儲存安全）。
 
+**叢集部署驗證（2026-08-06，於推送 tag 之後）**：
+
+以下項目未被上述測試套件涵蓋 —— 它們驗證的是 `.deb` 升級路徑與真實遷移，也就是風險最高的部分。
+
+| 步驟 | 結果 |
+|------|------|
+| 三個節點 `dpkg -i` 由 0.2.27-1 升級到 0.2.28-1 | PASS（postinst 正常執行、服務檢查 OK、印出 v0.2.22 那則「請 restart pvestatd，不要只靠 reload」警告） |
+| 三個節點 `systemctl restart pvestatd`，PID 必須改變 | PASS（三台 PID 皆改變） |
+| 三個節點的版本／`api()`／警告 | 0.2.28-1、`api()` = 15 = `APIVER`、**0** 則「older storage API」警告 |
+| 遷移**前**三個節點的兩個儲存 | 皆 active 且回報真實容量 —— 回退路徑在真實叢集與真實 ONTAP 上運作正常 |
+| 遷移 `netapp1`（`pvesm set --ontap-password`），`netapp2` 保持內嵌作為對照組 | `storage.cfg` 內明文筆數 2 -> 1；`netapp1` 區段 0 筆密碼；`/etc/pve/priv/storage/netapp1.pw` 權限 0600；`netapp2` 無 priv 檔 |
+| 遷移**後**三個節點的兩個儲存 | 皆 active —— 已遷移與未遷移的儲存在各節點都正常 |
+| 從**其他節點**（pc-pve3，非執行遷移者）對**已遷移**的儲存跑資料路徑 | `pvesm alloc` 與 `pvesm free` 皆成功；該節點透過 pmxcfs 讀得到 priv 檔；事後 ONTAP 0 個 volume、0 個 NETAPP multipath 裝置、0 個 NETAPP sd 裝置、追蹤檔為空 |
+
+本次遵循並驗證了文件所載的正確順序：**先升級每個節點，再執行遷移**。對照組（`netapp2`，仍為內嵌）證明回退機制能與已遷移的儲存並存運作。
+
+
 ### v0.2.23-1 Proxmox VE 9.0／9.1／9.2 相容性稽核 + 快照安全（2026-07-26）
 
 **狀態：所有可執行的測試皆 PASS，尚未發佈** —— `make deb`、在節點上安裝、第 31.8 節（`qm` 層級端到端）、`github/` 同步、README 的 deb 檔名與 tag 都還沒做。

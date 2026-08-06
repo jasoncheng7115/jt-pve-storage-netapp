@@ -1,0 +1,113 @@
+name: Release
+
+# Publishes a GitHub Release when a version tag is pushed.
+#
+# Tags are lightweight and named X.Y.Z-N (e.g. 0.2.28-1), matching the Debian
+# package version. The release notes are built from CHANGELOG.md and
+# CHANGELOG_zh-TW.md, and the .deb already committed under releases/ is attached.
+#
+# Nothing here builds the package. The .deb is built and tested locally before
+# the tag is pushed, so the artifact attached to the release is byte-identical
+# to the one that was tested -- a rebuild in CI would not be.
+
+on:
+  push:
+    tags:
+      - '[0-9]+.[0-9]+.[0-9]+-[0-9]+'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Existing tag to publish a release for (e.g. 0.2.28-1)'
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Resolve tag
+        id: tag
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            TAG='${{ inputs.tag }}'
+          else
+            TAG="${GITHUB_REF#refs/tags/}"
+          fi
+          case "$TAG" in
+            [0-9]*.[0-9]*.[0-9]*-[0-9]*) ;;
+            *) echo "ERROR: '$TAG' is not a X.Y.Z-N version tag"; exit 1 ;;
+          esac
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "deb=jt-pve-storage-netapp_${TAG}_all.deb" >> "$GITHUB_OUTPUT"
+
+      # No explicit ref: on a tag push this checks out the tag itself; on a
+      # manual run it checks out the branch the run was started from. That
+      # matters for publishing a release for a tag created BEFORE this workflow
+      # existed -- checking out such a tag would not contain the script below.
+      # fetch-depth: 0 so `gh release create --verify-tag` can see the tag.
+      - name: Check out
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Verify the tag exists
+        run: |
+          git rev-parse -q --verify "refs/tags/${{ steps.tag.outputs.tag }}" >/dev/null \
+            || { echo "ERROR: tag ${{ steps.tag.outputs.tag }} does not exist"; exit 1; }
+
+      - name: Verify the artifact matches the tag
+        run: |
+          DEB="releases/${{ steps.tag.outputs.deb }}"
+          if [ ! -f "$DEB" ]; then
+            echo "ERROR: $DEB is not committed in this repository."
+            echo "The .deb must be built, tested and committed before tagging."
+            exit 1
+          fi
+          # Guard against attaching a package that is not what the tag claims.
+          PKG_VER=$(dpkg-deb -f "$DEB" Version)
+          if [ "$PKG_VER" != "${{ steps.tag.outputs.tag }}" ]; then
+            echo "ERROR: $DEB declares Version '$PKG_VER', tag is '${{ steps.tag.outputs.tag }}'"
+            exit 1
+          fi
+          PKG_NAME=$(dpkg-deb -f "$DEB" Package)
+          if [ "$PKG_NAME" != "jt-pve-storage-netapp" ]; then
+            echo "ERROR: $DEB is package '$PKG_NAME', not jt-pve-storage-netapp"
+            exit 1
+          fi
+          echo "OK: $DEB is $PKG_NAME $PKG_VER"
+
+      - name: Refuse to publish an untested version
+        run: |
+          # debian/changelog must not still say UNRELEASED at this tag.
+          if head -1 debian/changelog | grep -q 'UNRELEASED'; then
+            echo "ERROR: debian/changelog is still marked UNRELEASED at this tag."
+            echo "Per the project's release rule, a tag is only pushed after the"
+            echo "full test suite has passed and the distribution is set to stable."
+            exit 1
+          fi
+
+      - name: Build release notes from the CHANGELOGs
+        run: python3 .github/scripts/release-notes.py '${{ steps.tag.outputs.tag }}'
+
+      - name: Publish the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TAG='${{ steps.tag.outputs.tag }}'
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "Release $TAG already exists; updating notes and asset."
+            gh release edit "$TAG" \
+              --title "$(cat RELEASE_TITLE.txt)" \
+              --notes-file RELEASE_NOTES.md
+            gh release upload "$TAG" "releases/${{ steps.tag.outputs.deb }}" --clobber
+          else
+            gh release create "$TAG" \
+              --verify-tag \
+              --title "$(cat RELEASE_TITLE.txt)" \
+              --notes-file RELEASE_NOTES.md \
+              "releases/${{ steps.tag.outputs.deb }}"
+          fi
+          echo "Published: $(gh release view "$TAG" --json url -q .url)"

@@ -30,11 +30,6 @@ def section(path, version):
     return body
 
 
-def first_heading(body):
-    m = re.search(r"^#{3,4} (.+)$", body, re.M)
-    return m.group(1).strip() if m else None
-
-
 def main():
     if len(sys.argv) != 2:
         sys.exit("usage: release-notes.py <tag>   e.g. 0.2.28-1")
@@ -44,9 +39,9 @@ def main():
     en = section("CHANGELOG.md", version)
     zh = section("CHANGELOG_zh-TW.md", version)
 
-    heading = first_heading(en)
-    # Em-dash between the version and the name, never a colon (project style).
-    title = f"{tag} — {heading}" if heading else tag
+    # The title is the version and nothing else, matching every earlier release.
+    # A summary line was tried once and wrapped over three lines in the UI.
+    title = tag
 
     deb = f"jt-pve-storage-netapp_{tag}_all.deb"
     body = f"""## Installation

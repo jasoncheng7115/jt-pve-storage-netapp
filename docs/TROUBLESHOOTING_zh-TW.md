@@ -160,9 +160,16 @@ grep -A5 "^netappontap: <storeid>" /etc/pve/storage.cfg
 
 # 在 ONTAP 上——那個位址是叢集管理 LIF 嗎？
 network interface show -role cluster-mgmt
+```
 
-# 修正：改指向叢集管理 LIF (不需停機,不影響資料)
-pvesm set <storeid> --ontap-portal <cluster-mgmt-ip>
+**如何改指向**：`ontap-portal` 是 *fixed* 屬性，無法用 `pvesm set` 變更(PVE 會把
+fixed 屬性完全排除在更新 API 之外)。請改為直接編輯 `/etc/pve/storage.cfg`——它位於
+叢集檔案系統上，在任一節點編輯一次即全叢集生效，PVE 下次讀取時就會採用，不需重啟服務。
+
+```
+netappontap: <storeid>
+        ontap-portal <cluster-mgmt-ip>      # <-- 改這一行
+        ...
 ```
 
 這個設定與資料路徑無關——iSCSI／FC LIF 是另外向 ONTAP 查詢取得的，因此變更

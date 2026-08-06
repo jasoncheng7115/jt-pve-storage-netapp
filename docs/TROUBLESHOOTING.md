@@ -162,9 +162,18 @@ grep -A5 "^netappontap: <storeid>" /etc/pve/storage.cfg
 
 # On ONTAP -- is that address a cluster-mgmt LIF?
 network interface show -role cluster-mgmt
+```
 
-# Fix: repoint at the cluster management LIF (no downtime, no data impact)
-pvesm set <storeid> --ontap-portal <cluster-mgmt-ip>
+**Repointing it:** `ontap-portal` is a *fixed* property, so `pvesm set` cannot
+change it (PVE excludes fixed properties from the update API entirely). Edit
+`/etc/pve/storage.cfg` instead — it lives on the cluster filesystem, so editing
+it once on any node applies cluster-wide, and PVE picks the change up on the
+next read without a service restart.
+
+```
+netappontap: <storeid>
+        ontap-portal <cluster-mgmt-ip>      # <-- change this line
+        ...
 ```
 
 The data path is unrelated to this setting — iSCSI/FC LIFs are discovered from

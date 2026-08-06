@@ -348,18 +348,33 @@
     <h3 class="subsection-title">Proxmox VE</h3>
     <div class="table-wrap">
         <table>
-            <thead><tr><th>PVE Version</th><th>Storage API</th><th>
+            <thead><tr><th>libpve-storage-perl</th><th>Storage APIVER</th><th>
+                <span class="lang-en">Plugin reports</span>
+                <span class="lang-zh">plugin 回報</span>
+            </th><th>
                 <span class="lang-en">Compatibility</span>
                 <span class="lang-zh">相容性</span>
             </th></tr></thead>
             <tbody>
-                <tr><td>PVE 9.1+</td><td>13</td><td><span class="status-badge status-badge--supported">
+                <tr><td>9.0.16 - 9.1.2</td><td>13</td><td>13</td><td><span class="status-badge status-badge--supported">
+                    <span class="lang-en">Supported</span>
+                    <span class="lang-zh">支援</span>
+                </span></td></tr>
+                <tr><td>9.1.3 - 9.1.5</td><td>14</td><td>14</td><td><span class="status-badge status-badge--supported">
+                    <span class="lang-en">Supported</span>
+                    <span class="lang-zh">支援</span>
+                </span></td></tr>
+                <tr><td>9.1.6+</td><td>15</td><td>15</td><td><span class="status-badge status-badge--supported">
                     <span class="lang-en">Supported</span>
                     <span class="lang-zh">支援</span>
                 </span></td></tr>
             </tbody>
         </table>
     </div>
+    <p>
+        <span class="lang-en">Proxmox VE raised the storage API version twice within the 9.1 point releases, so the required value depends on <code>libpve-storage-perl</code>, not on the Proxmox VE release number. The plugin negotiates it at load time, so no "implementing an older storage API" warning is emitted. Check yours with <code>dpkg -l libpve-storage-perl</code>.</span>
+        <span class="lang-zh">Proxmox VE 在 9.1 的小版本之中兩度調高 storage API 版本，因此所需的版本取決於 <code>libpve-storage-perl</code>，而不是 Proxmox VE 的版號。plugin 會在載入時自行協商，因此不會出現「implementing an older storage API」警告。可用 <code>dpkg -l libpve-storage-perl</code> 確認目前版本。</span>
+    </p>
 
     <h3 class="subsection-title">NetApp ONTAP</h3>
     <ul>

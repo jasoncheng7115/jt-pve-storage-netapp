@@ -120,11 +120,19 @@ Plugin 安裝時會偵測這些設定並顯示醒目警告。詳見 [docs/CONFIG
 ### Proxmox VE
 
 - **Proxmox VE 9.0 或更新版本**（Storage API 版本 9～15；plugin 會針對執行中的 Proxmox VE 協商 API 版本，因此 9.0、9.1、9.2 皆支援）
-- 已測試版本：PVE 9.1
+- 已測試版本：Proxmox VE 9.2.0（pve-manager 9.2.5、libpve-storage-perl 9.1.6、Storage APIVER 15）
 
-| PVE 版本 | Storage API | 相容性 |
-|----------|-------------|--------|
-| PVE 9.1+ | 13 | 支援 |
+Proxmox VE 在 9.1 的小版本之中兩度調高 storage API 版本，因此 plugin 該回報哪個版本
+取決於 `libpve-storage-perl`，而不是 Proxmox VE 的版號。plugin 會在載入時自行協商並
+回報相符的版本，因此在下列任一組合都不會出現「implementing an older storage API」警告：
+
+| libpve-storage-perl | Storage APIVER | plugin 回報 | 狀態 |
+|---------------------|----------------|-------------|------|
+| 9.0.16 - 9.1.2 | 13 | 13 | 支援 |
+| 9.1.3 - 9.1.5 | 14 | 14 | 支援 |
+| 9.1.6 以上 | 15 | 15 | 支援 |
+
+可用 `dpkg -l libpve-storage-perl` 確認目前版本。
 
 ### NetApp ONTAP
 

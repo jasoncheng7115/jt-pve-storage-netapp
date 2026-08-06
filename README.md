@@ -120,11 +120,20 @@ You do **not** need to manually clean stale devices after upgrading to v0.2.2. T
 ### Proxmox VE
 
 - **Proxmox VE 9.0 or later** (Storage API version 9-15; the plugin negotiates the API version against the running Proxmox VE, so 9.0, 9.1 and 9.2 are all supported)
-- Tested on: PVE 9.1
+- Tested on: Proxmox VE 9.2.0 (pve-manager 9.2.5, libpve-storage-perl 9.1.6, Storage APIVER 15)
 
-| PVE Version | Storage API | Compatibility |
-|-------------|-------------|---------------|
-| PVE 9.1+ | 13 | Supported |
+Proxmox VE raised the storage API version twice within the 9.1 point releases, so
+what the plugin must report depends on `libpve-storage-perl`, not on the Proxmox VE
+release number. The plugin negotiates this at load time and reports the matching
+version, so no "implementing an older storage API" warning is emitted on any of them:
+
+| libpve-storage-perl | Storage APIVER | Plugin reports | Status |
+|---------------------|----------------|----------------|--------|
+| 9.0.16 - 9.1.2 | 13 | 13 | Supported |
+| 9.1.3 - 9.1.5 | 14 | 14 | Supported |
+| 9.1.6 and later | 15 | 15 | Supported |
+
+Check yours with `dpkg -l libpve-storage-perl`.
 
 ### NetApp ONTAP
 

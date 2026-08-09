@@ -2988,6 +2988,145 @@ grep -cF '_get_api($scfg)' $P                             # Expected: 0
 
 ---
 
+## 36. Sibling-Project Audit + Interrupted Operations (v0.2.29)
+
+Three defects ported from **jt-pve-storage-synology**, each **measured here**
+before anything was changed, plus the listing-completeness check and the
+interrupted-operation coverage a Proxmox VE forum reader asked for.
+
+### 36.1 `multipath -f` takes the map name, not a path (ONTAP REQUIRED)
+
+The finding, and the reason it was invisible for the plugin's whole life.
+
+```bash
+pvesm alloc netapp1 9997 '' 1G
+W=$(multipath -ll | grep NETAPP | awk '{print $1}' | grep '^3600a0980' | head -1)
+
+multipath -f "/dev/mapper/$W"; echo "exit=$?"     # Expected: "device not found", exit 1
+multipath -ll | grep -c "^$W "                    # Expected: 1  (map still there)
+
+multipath -f "$W"; echo "exit=$?"                 # Expected: exit 0
+multipath -ll | grep -c "^$W "                    # Expected: 0  (map removed)
+```
+
+**Pick the WWID carefully.** A node may carry NetApp LUNs that belong to another
+storage or to a manually-managed setup; flushing one of those is not harmless
+just because multipathd usually rebuilds it. Exclude every WWID that is not the
+one just allocated.
+
+Then, with the fix in place, the delete path must no longer fall back:
+
+```bash
+pvesm free netapp1:vm-9997-disk-0 2>&1 | grep -c 'dmsetup remove --force'   # Expected: 0
+```
+
+Before 0.2.29 that warning appeared on **every** delete.
+
+### 36.2 Taint mode (NO ONTAP NEEDED)
+
+`pvedaemon`, `pveproxy`, `vzdump` and `pct` are `#!/usr/bin/perl -T`; `qm`,
+`pvesm` and this test suite are not. A green suite proves nothing here.
+
+```bash
+head -1 /usr/bin/pvedaemon /usr/bin/pveproxy /usr/bin/vzdump /usr/sbin/pct
+# Expected: all four "#!/usr/bin/perl -T"
+```
+
+Drive the credential and state-file helpers with a genuinely tainted storage ID
+(a value read from a file is tainted; a literal is not, so the fixture matters):
+
+```perl
+#!/usr/bin/perl
+# Run as: perl -T thistest.pl      -- the switch must be on the COMMAND LINE;
+# a -T shebang alone makes Perl refuse to start.
+use lib '/root/jt-pve-storage-netapp/lib';
+use PVE::Storage::Custom::NetAppONTAPPlugin;
+use Scalar::Util qw(tainted);
+open(my $fh, '<', '/tmp/sid.txt') or die $!; my $sid = <$fh>; chomp $sid;
+print "tainted: ", (tainted($sid) ? "YES" : "no"), "\n";     # Expected: YES
+my $P = 'PVE::Storage::Custom::NetAppONTAPPlugin';
+local ${"${P}::PRIV_STORAGE_DIR"} = '/tmp/tainttest';
+# Expected: all ok. Before 0.2.29 _set_ontap_password died with
+# "Insecure dependency in unlink while running with -T switch".
+```
+
+A value Proxmox VE could not have produced must be **refused**, not rewritten
+into another storage's filename:
+
+```bash
+# Expected: all three refused
+for bad in '../../etc/passwd' 'a/b' ''; do ... _storeid_filename_component($bad) ...; done
+```
+
+### 36.3 Backup fleecing (ONTAP REQUIRED)
+
+`PVE::VZDump::QemuServer` allocates `vm-<vmid>-fleece-<n>` on the fleecing
+storage. Before 0.2.29 this died with *Unrecognized PVE volume name format*.
+
+```bash
+pvesm alloc netapp1 9990 vm-9990-fleece-0 1G
+# Expected: successfully created 'netapp1:vm-9990-fleece-0'
+#           -- NOT vm-9990-disk-0. The name PVE chose must be honoured exactly.
+pvesm list netapp1 | grep fleece      # Expected: one row
+pvesm free netapp1:vm-9990-fleece-0   # Expected: removed, 0 volumes left
+```
+
+### 36.4 A listing must be complete or refuse to be one (ONTAP REQUIRED)
+
+`_get_all_records` follows `_links.next`, but following links is not proof of
+completeness -- a truncation with no next link would be invisible, and the
+orphan reaper builds its alive set from `lun_list()`.
+
+```bash
+perl -Ilib -e '... for my $m (qw(lun_list volume_list igroup_list)) { $api->$m(...) } ...'
+# Expected: every listing returns without error on a healthy SVM.
+# The cross-check must not false-positive: ONTAP's num_records agrees with the
+# row count in normal operation, which is exactly why a disagreement is worth
+# refusing on.
+```
+
+### 36.5 Interrupted operations (ONTAP REQUIRED)
+
+Asked for on the Proxmox VE forum: what happens when an operation is killed
+half-way. The rule for every row: **the operation may fail, but it must not
+leave the storage in a state a later operation cannot recover from.**
+
+| Interrupt | Expected |
+|---|---|
+| `vzdump --mode snapshot` killed mid-flight | Section 33.3. Leaves a `vzdump` snapshot plus `tmpclone_<vol>_pve_snap_vzdump`; removing the snapshot drives `_remove_temp_clone()` -- split, delete, full host-side teardown |
+| `pvesm alloc` killed between volume create and LUN map | The FlexVol is left; the next `alloc` picks the **next** disk ID rather than colliding (bounded retry). Remove the stray volume with `pvesm free` |
+| `pvesm free` killed after `lun_unmap_all` | The device is gone locally, the FlexVol remains. Re-running `free_image` is idempotent -- v0.2.16 made `_remove_temp_clone` skip cleanly when the ONTAP volume is already absent |
+| `qm clone --full` killed mid-copy | PVE's own error handler frees the destination disk. Verify the destination storage holds no `pve_*` volume for that VMID afterwards |
+| `qm resize` killed after the ONTAP resize but before the host rescan | The LUN is larger than the map. `activate_volume` reconciles on the next activation; `volume_resize` is safe to re-run |
+| A node hard-resets while a LUN is attached | No `deactivate_volume` ever runs, so the WWID stays tracked. The orphan reaper handles it on the next poll, gated by path health and the 300 s grace window |
+
+Measured instance, worth keeping: during 0.2.29 testing
+`tests/sim_export_import.pl` was killed by a 2-minute command timeout and left
+four `pve_*` volumes. **The test's own end-state assertion caught it** on the
+next run -- which is the behaviour to preserve. Cleaning up and re-running gave
+8/8 with zero leftovers.
+
+### 36.6 Static guards
+
+```bash
+P=lib/PVE/Storage/Custom/NetAppONTAP/Multipath.pm
+S=lib/PVE/Storage/Custom/NetAppONTAPPlugin.pm
+# multipath -f is never handed a device path
+grep -cF "MULTIPATH, '-f', \$device" $P          # Expected: 0
+grep -cF "MULTIPATH, '-f', \$safe_name" $P       # Expected: 1
+grep -c '^sub _map_is_gone' $P                    # Expected: 1
+# one validate-and-untaint helper, and no surviving s/// sanitiser
+grep -c '^sub _storeid_filename_component' $S     # Expected: 1
+grep -cF '$safe_storeid =~ s/' $S                 # Expected: 0
+# fleecing
+grep -cF "\$voltype eq 'fleece'" $S              # Expected: 1
+# listing completeness
+grep -cF 'refusing to treat this as a complete list' \
+    lib/PVE/Storage/Custom/NetAppONTAP/API.pm     # Expected: 1
+```
+
+---
+
 ## Cleanup
 
 ```bash
@@ -3013,6 +3152,36 @@ pvesm list $STORAGE
 ## Release Test Results
 
 Each release must pass all tests above before publishing. Results are recorded below.
+
+### v0.2.29-1 Sibling-Project Audit + Interrupted Operations (2026-08-09)
+
+**Status: all tests PASS.**
+
+**Environment:** Proxmox VE 9.2.0 / libpve-storage-perl 9.1.6 (APIVER 15) / multipath-tools 0.11.1. ONTAP simulator `ontap-sim`, NetApp Release 9.16.1P1, SVM svm1, 2 iSCSI LIFs.
+
+| Suite | Result |
+|-------|--------|
+| `make test` (Perl syntax, 6 modules) | 6/6 PASS |
+| `tests/audit_fixes.t` | 230/230 PASS |
+| `tests/status_timeout.t` | 20/20 PASS |
+| `tests/stale_sd_reaper.t` | 20/20 PASS |
+| `tests/activate_budget.t` | 8/8 PASS |
+| `tests/sim_functional.pl` (real ONTAP) | 13/13 PASS |
+| `tests/sim_snapshot_safety.pl` (real ONTAP) | 34/34 PASS |
+| `tests/cleanup_load.pl` (real ONTAP) | 6/6 PASS |
+| `tests/sim_export_import.pl` (real ONTAP) | 8/8 PASS |
+| **Units total** | **278/278** |
+| **Functional total** | **61/61** |
+
+**Section 36 results:**
+
+- **36.1 PASS, and the finding was measured both ways on hardware before the fix.** `multipath -f /dev/mapper/<wwid>` answered *device not found*, exit 1, with the map still present; `multipath -f <wwid>` returned 0 and removed it. After the fix a `pvesm free` completes with **zero** `dmsetup remove --force` fallback warnings, where every delete before 0.2.29 produced one.
+- **36.2 PASS.** Confirmed `pvedaemon`, `pveproxy`, `vzdump` and `pct` are all `#!/usr/bin/perl -T` while `qm` and `pvesm` are not. With a genuinely tainted storage ID, `_set_ontap_password` died with *Insecure dependency in unlink* before the fix and succeeds after it; `../../etc/passwd`, `a/b` and the empty string are refused rather than rewritten.
+- **36.3 PASS.** `pvesm alloc netapp1 9990 vm-9990-fleece-0 1G` created `netapp1:vm-9990-fleece-0` (before the fix the name was silently replaced with `vm-9990-disk-0`), listed correctly, and freed leaving 0 volumes.
+- **36.4 PASS.** `lun_list`, `volume_list` and `igroup_list` all return without error against the real SVM -- the completeness cross-check does not false-positive in normal operation.
+- **36.5** documented from measured behaviour; the interrupted-`vzdump` row is the verified v0.2.13/v0.2.14 incident scenario from Section 33.3.
+
+**Note:** three functional tests and `status_timeout.t` called `_get_api($scfg)` without a storeid and had to be corrected, because `_get_api` now requires one. That is the intended contract -- the old silent fallback returned an undef password on a storage whose credential lives only in `/etc/pve/priv`.
 
 ### v0.2.28-1 Credential Storage: ontap-password under /etc/pve/priv/ (2026-08-06)
 

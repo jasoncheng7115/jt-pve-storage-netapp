@@ -34,6 +34,10 @@ use constant {
 my $RE_VOLUME_NAME = qr/^pve_([a-zA-Z0-9_]+)_(\d+)_disk(\d+)$/;
 my $RE_CLOUDINIT   = qr/^pve_([a-zA-Z0-9_]+)_(\d+)_cloudinit$/;
 my $RE_VMSTATE     = qr/^pve_([a-zA-Z0-9_]+)_(\d+)_state_(.+)$/;
+# Backup fleecing (Proxmox VE 9). PVE::VZDump::QemuServer allocates a real
+# volume named vm-<vmid>-fleece-<n> on whichever storage is configured as the
+# fleecing target, so this storage must be able to carry one.
+my $RE_FLEECE      = qr/^pve_([a-zA-Z0-9_]+)_(\d+)_fleece(\d+)$/;
 my $RE_SNAPSHOT    = qr/^pve_snap_(.+)$/;
 my $RE_LUN_PATH    = qr|^/vol/([^/]+)/lun0$|;
 
@@ -106,6 +110,16 @@ sub decode_volume_name {
             vmid     => int($2),
             snapname => $3,
             type     => 'state',
+        };
+    }
+
+    # Backup fleecing scratch volume
+    if ($volname =~ $RE_FLEECE) {
+        return {
+            storage => $1,
+            vmid    => int($2),
+            diskid  => int($3),
+            type    => 'fleece',
         };
     }
 
@@ -203,7 +217,7 @@ sub is_pve_managed_volume {
     my ($name) = @_;
 
     return 0 unless defined $name;
-    return ($name =~ /^pve_[a-zA-Z0-9_]+_\d+_(disk\d+|cloudinit|state_.+)$/);
+    return ($name =~ /^pve_[a-zA-Z0-9_]+_\d+_(disk\d+|cloudinit|state_.+|fleece\d+)$/);
 }
 
 # Convert PVE volume name (vm-100-disk-0 or base-100-disk-0) to ONTAP volume name
@@ -239,6 +253,13 @@ sub pve_volname_to_ontap {
         return "pve_${san_storage}_${vmid}_state_${san_snap}";
     }
 
+    # Backup fleecing: vm-{vmid}-fleece-{n}
+    if ($pve_volname =~ /^vm-(\d+)-fleece-(\d+)$/) {
+        my ($vmid, $n) = ($1, $2);
+        my $san_storage = sanitize_for_ontap($storage, MAX_STORAGE_NAME_LENGTH);
+        return "pve_${san_storage}_${vmid}_fleece${n}";
+    }
+
     die "Unrecognized PVE volume name format: $pve_volname";
 }
 
@@ -255,6 +276,8 @@ sub ontap_to_pve_volname {
         return "vm-$decoded->{vmid}-cloudinit";
     } elsif ($decoded->{type} eq 'state') {
         return "vm-$decoded->{vmid}-state-$decoded->{snapname}";
+    } elsif ($decoded->{type} eq 'fleece') {
+        return "vm-$decoded->{vmid}-fleece-$decoded->{diskid}";
     }
 
     return undef;

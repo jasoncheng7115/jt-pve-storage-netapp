@@ -2,6 +2,43 @@
 
 NetApp ONTAP Storage Plugin for Proxmox VE 的所有重要變更都記錄在此。
 
+## [0.2.29] - 2026-08-09
+
+三個缺陷，全部來自閱讀相關專案 **jt-pve-storage-synology** 的變更記錄，並且**在本專案實際測量**，而不是假設結論可以直接套用。
+
+### `multipath -f` 一直被餵入裝置路徑，所以從來沒有成功過
+
+在 multipath-tools 0.11.1 上實測：
+
+```
+multipath -f /dev/mapper/<wwid>   ->  "device not found"，exit 1，map 仍在
+multipath -f <wwid>               ->  exit 0，map 已移除
+```
+
+該符號連結存在、也指向正確的 dm 裝置，但 `multipath` 不接受這種形式。因此**本外掛歷來每一次 flush 都是失敗的**，全部落到 `dmsetup remove --force` 的退路 —— 而退路有效，所以看起來一切正常。過程中印出的警告（`multipath -f ... failed/timed out, trying dmsetup remove --force`）每次刪除都會出現，讀起來像是逾時，而不是參數給錯。
+
+`multipath_flush()` 現在傳入經過 untaint 的 **map 名稱**，並且**回頭確認 map 真的不見了**，而不是相信 exit status，同時回報是否真的完成。`multipath_remove()` 有完全相同的缺陷 —— 同一段程序寫了兩次，兩份都錯。
+
+### 污染模式：storage ID 進到檔名
+
+**`s///` 不會 untaint，只有 capture 會**。WWID 狀態檔與鎖檔用取代來消毒 storage ID —— 看起來消毒過了，實際上仍帶著污染 —— 而 0.2.28 新增的密碼檔則完全沒有消毒。因此 `file_set_contents`、`rename` 與 `unlink` 會以 *Insecure dependency in unlink while running with -T switch* 中止。
+
+`pvedaemon`、`pveproxy`、`vzdump`、`pct` 都是 `#!/usr/bin/perl -T`；`qm`、`pvesm` 以及本專案整套測試都不是 —— 這就是它一直沒被發現的原因：用 `pvesm set` 設定密碼正常，同一個呼叫改走 API（網頁客戶端、Ansible、Terraform）就中止。
+
+現在統一由 `_storeid_filename_component()` 依 Proxmox VE 自己的 storage ID 規則驗證，並在同一個運算中 untaint。PVE 不可能產生的值會被**拒絕**，而不是被改寫成別的儲存的檔名 —— `../../etc/passwd` 與 `a/b` 都會被拒絕，不會被改寫。
+
+### 支援 Proxmox VE 9 的備份 fleecing
+
+`PVE::VZDump::QemuServer` 會在設定為 fleecing 目標的儲存上，配置一個名為 `vm-<vmid>-fleece-<n>` 的真實 volume。本外掛先前會以 *Unrecognized PVE volume name format* 中止，而 `parse_volname` 則會回傳 undef —— 正是它自己註解所警告的那種「錯誤在遠處才浮現」的失敗模式。
+
+現在已完整支援，且完全沿用 PVE 選定的名稱：不做空號搜尋、也不做碰撞重試，因為 PVE 會在整個備份期間持有該 volume ID，並以該名稱釋放它。`efi-enroll` 一併查證過，它是 QEMU storage daemon 的 id 而非 volume，因此刻意不處理。
+
+### 其他
+
+- `_get_api()` 現在要求必須帶 `storeid`，不再於「憑證只存在 `/etc/pve/priv`」的儲存上安靜地退化成 undef 密碼。
+
+**測試**：`make test` 6/6、單元測試 **230/230**（新增 24 項）、對真實 ONTAP 的功能測試 **61/61**。multipath 的發現在修正前後都於實機上雙向測量；污染模式的修正以 `perl -T` 搭配真正被污染的 storage ID 驗證；fleecing 則完整跑過配置、列出與釋放。
+
 ## [0.2.28] - 2026-08-06
 
 ### 憑證：`ontap-password` 改存於 `/etc/pve/priv/`，不再寫入 `storage.cfg`

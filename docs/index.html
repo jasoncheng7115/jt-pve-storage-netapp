@@ -142,7 +142,7 @@
     <div class="hero__glow"></div>
     <div class="hero__glow-left"></div>
     <div class="hero__content">
-        <div class="hero__badge">v0.2.28 <span class="hero__badge-sep"></span> MIT License</div>
+        <div class="hero__badge">v0.2.29 <span class="hero__badge-sep"></span> MIT License</div>
         <h1 class="hero__title">jt-pve-storage-netapp</h1>
         <p class="hero__project-desc">
             <span class="lang-en">NetApp ONTAP SAN/iSCSI/FC Storage Plugin for Proxmox VE</span>
@@ -537,7 +537,7 @@
                 <span class="lang-en">Install the plugin package</span>
                 <span class="lang-zh">安裝 plugin 套件</span>
             </div>
-            <pre><span class="cmd">dpkg</span> <span class="flag">-i</span> jt-pve-storage-netapp_0.2.28-1_all.deb</pre>
+            <pre><span class="cmd">dpkg</span> <span class="flag">-i</span> jt-pve-storage-netapp_0.2.29-1_all.deb</pre>
             <p>
                 <span class="lang-en">The plugin automatically configures multipath and reloads Proxmox VE services (pvedaemon, pvestatd, pveproxy).</span>
                 <span class="lang-zh">Plugin 會自動設定 multipath 並重新載入 Proxmox VE 服務（pvedaemon、pvestatd、pveproxy）。</span>
@@ -611,7 +611,7 @@
                 <span class="lang-en">Install new package</span>
                 <span class="lang-zh">安裝新套件</span>
             </div>
-            <pre><span class="cmd">dpkg</span> <span class="flag">-i</span> jt-pve-storage-netapp_0.2.28-1_all.deb</pre>
+            <pre><span class="cmd">dpkg</span> <span class="flag">-i</span> jt-pve-storage-netapp_0.2.29-1_all.deb</pre>
         </div>
     </div>
     <div class="step">
@@ -1451,6 +1451,15 @@
         <span class="lang-en">Version history. For full details see <a href="https://github.com/jasoncheng7115/jt-pve-storage-netapp/blob/main/CHANGELOG.md">CHANGELOG.md</a>.</span>
         <span class="lang-zh">版本紀錄。完整內容請參閱 <a href="https://github.com/jasoncheng7115/jt-pve-storage-netapp/blob/main/CHANGELOG_zh-TW.md">CHANGELOG_zh-TW.md</a>。</span>
     </p>
+
+    <div class="changelog-entry">
+        <div class="changelog-version">v0.2.29 <span class="changelog-tag changelog-tag--fix">Fix</span></div>
+        <div class="changelog-date">2026-08-09</div>
+        <div class="changelog-summary">
+            <span class="lang-en"><strong>Three defects found by auditing a sibling project, each measured here before anything was changed.</strong> <strong>1.</strong> <code>multipath -f</code> takes the map name, never a <code>/dev/mapper/</code> path &mdash; measured on multipath-tools 0.11.1, the path form answers &quot;device not found&quot; and leaves the map. So every flush this plugin ever issued failed and fell through to the <code>dmsetup remove --force</code> fallback, which worked, so nothing ever looked wrong. It now passes the map name, verifies the map is actually gone instead of trusting the exit status, and reports whether it happened. <strong>2.</strong> A substitution does not untaint &mdash; only a capture does. The state, lock and credential file names carried a tainted storage ID, so writes died with &quot;Insecure dependency&quot; under <code>-T</code>. <code>pvedaemon</code>, <code>pveproxy</code>, <code>vzdump</code> and <code>pct</code> all run with taint checks on; <code>qm</code>, <code>pvesm</code> and the whole test suite do not, which is why it was invisible. <strong>3.</strong> Proxmox VE 9 backup fleecing is now supported: PVE allocates a real <code>vm-&lt;vmid&gt;-fleece-&lt;n&gt;</code> volume on the fleecing storage and the plugin used to refuse the name outright. Also: an ONTAP listing is now cross-checked against the total ONTAP itself reports, and refuses to be treated as complete if the two disagree.</span>
+            <span class="lang-zh"><strong>透過稽核相關專案找到三個缺陷，每一個都在本專案實際測量過才動手。</strong><strong>一、</strong><code>multipath -f</code> 收的是 map 名稱而非 <code>/dev/mapper/</code> 路徑 —— 在 multipath-tools 0.11.1 上實測，路徑形式回應「device not found」且 map 仍在。因此本外掛歷來每一次 flush 都失敗，全部落到 <code>dmsetup remove --force</code> 退路；退路有效，所以看起來一切正常。現在改傳 map 名稱，並回頭確認 map 真的不見了，而不是相信 exit status，同時回報是否真的完成。<strong>二、</strong>取代不會 untaint，只有 capture 會。狀態檔、鎖檔與密碼檔的檔名都帶著被污染的 storage ID，因此在 <code>-T</code> 下寫入會以「Insecure dependency」中止。<code>pvedaemon</code>、<code>pveproxy</code>、<code>vzdump</code>、<code>pct</code> 都開啟污染檢查，而 <code>qm</code>、<code>pvesm</code> 與整套測試都沒有，這就是它一直沒被發現的原因。<strong>三、</strong>支援 Proxmox VE 9 的備份 fleecing：PVE 會在 fleecing 儲存上配置真實的 <code>vm-&lt;vmid&gt;-fleece-&lt;n&gt;</code> volume，而外掛先前會直接拒絕這個名稱。另外，ONTAP 清單現在會與 ONTAP 自己回報的總數交叉核對，兩者不符時拒絕被當成完整清單。</span>
+        </div>
+    </div>
 
     <div class="changelog-entry">
         <div class="changelog-version">v0.2.28 <span class="changelog-tag changelog-tag--feature">Security</span></div>

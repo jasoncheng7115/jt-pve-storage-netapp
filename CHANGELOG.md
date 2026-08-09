@@ -2,6 +2,43 @@
 
 All notable changes to the NetApp ONTAP Storage Plugin for Proxmox VE are documented here.
 
+## [0.2.29] - 2026-08-09
+
+Three defects, all found by reading the sibling **jt-pve-storage-synology** project's changelog and then **measuring the same thing here** rather than assuming it transferred.
+
+### `multipath -f` was handed a device path, so it never worked
+
+Measured on multipath-tools 0.11.1:
+
+```
+multipath -f /dev/mapper/<wwid>   ->  "device not found", exit 1, map stays
+multipath -f <wwid>               ->  exit 0, map removed
+```
+
+The symlink exists and points at the right dm device; `multipath` does not accept that form. So **every flush this plugin has ever issued failed** and fell through to the `dmsetup remove --force` fallback — which worked, so nothing ever looked wrong. The warning it printed on the way (`multipath -f ... failed/timed out, trying dmsetup remove --force`) appeared on every single delete and read as a timeout rather than as a wrong argument.
+
+`multipath_flush()` now passes the untainted **map name**, **verifies the map is actually gone** instead of trusting the exit status, and returns whether it happened. `multipath_remove()` carried the identical defect — the same procedure written twice, both copies wrong.
+
+### Taint mode: a storage ID reaching a filename
+
+**`s///` does not untaint; only a capture does.** The WWID state and lock files sanitised the storage ID with a substitution — which looks sanitised and still carries the taint — and the credential file added in 0.2.28 did not sanitise at all. So `file_set_contents`, `rename` and `unlink` died with *Insecure dependency in unlink while running with -T switch*.
+
+`pvedaemon`, `pveproxy`, `vzdump` and `pct` are all `#!/usr/bin/perl -T`. `qm`, `pvesm` and this project's whole test suite are not — which is why it was invisible: setting a password from `pvesm set` worked, and the same call through the API (a web client, Ansible, Terraform) died.
+
+There is now one `_storeid_filename_component()` that validates against Proxmox VE's own storage-ID rule and untaints in the same operation. A value PVE could not have produced is **refused** rather than mangled into another storage's filename — `../../etc/passwd` and `a/b` are rejected, not rewritten.
+
+### Proxmox VE 9 backup fleecing is now supported
+
+`PVE::VZDump::QemuServer` allocates a real volume named `vm-<vmid>-fleece-<n>` on whichever storage is configured as the fleecing target. This plugin died with *Unrecognized PVE volume name format*, and `parse_volname` would have returned undef — the failure mode its own comment warns about, surfacing far from the cause.
+
+Handled end to end now, with the name PVE chose honoured exactly: no free-ID search and no collision retry, because PVE holds that volume ID for the rest of the backup and frees it by that name. `efi-enroll` was checked at the same time and is a QEMU storage-daemon id rather than a volume, so it is deliberately not handled.
+
+### Also
+
+- `_get_api()` now requires a `storeid` instead of silently falling back to an undef password on a storage whose credential lives only in `/etc/pve/priv`.
+
+**Testing:** `make test` 6/6, units **230/230** (24 new), functional against a real ONTAP **61/61**. The multipath finding was measured on real hardware both ways before and after the fix; the taint fix was verified under `perl -T` with a genuinely tainted storage ID; fleecing was allocated, listed and freed end to end.
+
 ## [0.2.28] - 2026-08-06
 
 ### Credentials: store `ontap-password` under `/etc/pve/priv/`, not in `storage.cfg`

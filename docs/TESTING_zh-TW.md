@@ -2543,6 +2543,125 @@ grep -cF '_get_api($scfg)' $P                             # 預期：0
 
 ---
 
+## 36. 相關專案稽核 + 中斷的操作（v0.2.29）
+
+三個從 **jt-pve-storage-synology** 移植過來的缺陷，每一個都在**本專案實際測量**過才動手；另加清單完整性檢查，以及一位 Proxmox VE 論壇讀者要求的中斷情境覆蓋。
+
+### 36.1 `multipath -f` 收的是 map 名稱而非路徑（需要 ONTAP）
+
+這個發現，以及它為何在整個外掛生命週期中都沒被看見。
+
+```bash
+pvesm alloc netapp1 9997 '' 1G
+W=$(multipath -ll | grep NETAPP | awk '{print $1}' | grep '^3600a0980' | head -1)
+
+multipath -f "/dev/mapper/$W"; echo "exit=$?"     # 預期："device not found"，exit 1
+multipath -ll | grep -c "^$W "                    # 預期：1（map 仍在）
+
+multipath -f "$W"; echo "exit=$?"                 # 預期：exit 0
+multipath -ll | grep -c "^$W "                    # 預期：0（map 已移除）
+```
+
+**選 WWID 要小心**。節點上可能同時掛著屬於其他儲存、或人工管理的 NetApp LUN；把那種裝置的 map 沖掉並不會因為 multipathd 通常會自動重建就變得無害。請排除掉每一個不是剛配置出來的 WWID。
+
+修正之後，刪除路徑不得再落到退路：
+
+```bash
+pvesm free netapp1:vm-9997-disk-0 2>&1 | grep -c 'dmsetup remove --force'   # 預期：0
+```
+
+0.2.29 之前，該警告**每一次**刪除都會出現。
+
+### 36.2 污染模式（不需 ONTAP）
+
+`pvedaemon`、`pveproxy`、`vzdump`、`pct` 都是 `#!/usr/bin/perl -T`；`qm`、`pvesm` 與本測試套件都不是。測試全綠在這裡不代表任何事。
+
+```bash
+head -1 /usr/bin/pvedaemon /usr/bin/pveproxy /usr/bin/vzdump /usr/sbin/pct
+# 預期：四個都是 "#!/usr/bin/perl -T"
+```
+
+用**真正被污染**的 storage ID 驅動密碼與狀態檔的輔助函式（從檔案讀入的值才會被污染，字面常數不會，所以測試夾具本身就是關鍵）：
+
+```perl
+#!/usr/bin/perl
+# 執行方式：perl -T thistest.pl  —— 開關必須下在命令列；
+# 只寫在 shebang 上會讓 Perl 拒絕啟動。
+use lib '/root/jt-pve-storage-netapp/lib';
+use PVE::Storage::Custom::NetAppONTAPPlugin;
+use Scalar::Util qw(tainted);
+open(my $fh, '<', '/tmp/sid.txt') or die $!; my $sid = <$fh>; chomp $sid;
+print "tainted: ", (tainted($sid) ? "YES" : "no"), "\n";     # 預期：YES
+# 預期：全部 ok。0.2.29 之前 _set_ontap_password 會以
+# "Insecure dependency in unlink while running with -T switch" 中止。
+```
+
+Proxmox VE 不可能產生的值必須被**拒絕**，而不是被改寫成其他儲存的檔名：
+
+```bash
+# 預期：三者皆被拒絕
+for bad in '../../etc/passwd' 'a/b' ''; do ... _storeid_filename_component($bad) ...; done
+```
+
+### 36.3 備份 fleecing（需要 ONTAP）
+
+`PVE::VZDump::QemuServer` 會在 fleecing 儲存上配置 `vm-<vmid>-fleece-<n>`。0.2.29 之前會以 *Unrecognized PVE volume name format* 中止。
+
+```bash
+pvesm alloc netapp1 9990 vm-9990-fleece-0 1G
+# 預期：successfully created 'netapp1:vm-9990-fleece-0'
+#       —— 不是 vm-9990-disk-0。PVE 選定的名稱必須被完整沿用。
+pvesm list netapp1 | grep fleece      # 預期：一列
+pvesm free netapp1:vm-9990-fleece-0   # 預期：移除，剩餘 0 個 volume
+```
+
+### 36.4 清單要嘛完整、要嘛拒絕自稱完整（需要 ONTAP）
+
+`_get_all_records` 會跟隨 `_links.next`，但「跟隨連結」不等於「完整」—— 一次沒有 next 連結的截斷是看不見的，而殘留清理的 alive set 正是建立在 `lun_list()` 之上。
+
+```bash
+perl -Ilib -e '... for my $m (qw(lun_list volume_list igroup_list)) { $api->$m(...) } ...'
+# 預期：健康的 SVM 上每個清單都能正常返回。
+# 交叉檢查不得誤擋：正常運作時 ONTAP 的 num_records 與筆數一致，
+# 這正是「不一致時值得拒絕」的理由。
+```
+
+### 36.5 中斷的操作（需要 ONTAP）
+
+Proxmox VE 論壇上被問到的：操作跑到一半被砍掉會怎樣。每一列的共通規則是：**操作可以失敗，但不得讓儲存停在後續操作無法復原的狀態**。
+
+| 中斷點 | 預期 |
+|---|---|
+| `vzdump --mode snapshot` 執行中被砍 | 見第 33.3 節。會留下 `vzdump` 快照與 `tmpclone_<vol>_pve_snap_vzdump`；刪除該快照會驅動 `_remove_temp_clone()` —— split、刪除、完整主機端拆除 |
+| `pvesm alloc` 在建立 volume 與對映 LUN 之間被砍 | FlexVol 會殘留；下一次 `alloc` 會取**下一個**磁碟編號而不是碰撞（有上限的重試）。以 `pvesm free` 清掉殘留的 volume |
+| `pvesm free` 在 `lun_unmap_all` 之後被砍 | 本機裝置已消失，FlexVol 仍在。重新執行 `free_image` 是冪等的 —— v0.2.16 讓 `_remove_temp_clone` 在 ONTAP volume 已不存在時乾淨略過 |
+| `qm clone --full` 複製中途被砍 | PVE 自己的錯誤處理會釋放目的端磁碟。事後確認目的儲存上沒有該 VMID 的 `pve_*` volume |
+| `qm resize` 在 ONTAP 已擴充但主機尚未重掃時被砍 | LUN 比 map 大。`activate_volume` 會在下次啟用時調和；`volume_resize` 可安全重跑 |
+| 節點在 LUN 掛載中硬重置 | `deactivate_volume` 完全沒機會執行，WWID 仍被追蹤。殘留清理會在下一輪輪詢處理，並受路徑健康閘門與 300 秒寬限保護 |
+
+一個值得保留的實測案例：0.2.29 測試期間 `tests/sim_export_import.pl` 被 2 分鐘的指令逾時砍掉，留下四個 `pve_*` volume。**測試自己的結束狀態斷言在下次執行時抓到了它** —— 這正是要保住的行為。清乾淨重跑得到 8/8、零殘留。
+
+### 36.6 靜態守門
+
+```bash
+P=lib/PVE/Storage/Custom/NetAppONTAP/Multipath.pm
+S=lib/PVE/Storage/Custom/NetAppONTAPPlugin.pm
+# multipath -f 絕不接受裝置路徑
+grep -cF "MULTIPATH, '-f', \$device" $P          # 預期：0
+grep -cF "MULTIPATH, '-f', \$safe_name" $P       # 預期：1
+grep -c '^sub _map_is_gone' $P                    # 預期：1
+# 只有一個驗證＋untaint 的函式，且不得殘留 s/// 消毒寫法
+grep -c '^sub _storeid_filename_component' $S     # 預期：1
+grep -cF '$safe_storeid =~ s/' $S                 # 預期：0
+# fleecing
+grep -cF "\$voltype eq 'fleece'" $S              # 預期：1
+# 清單完整性
+grep -cF 'refusing to treat this as a complete list' \
+    lib/PVE/Storage/Custom/NetAppONTAP/API.pm     # 預期：1
+```
+
+---
+
 ## 清除
 
 ```bash
@@ -2568,6 +2687,36 @@ pvesm list $STORAGE
 ## 發佈測試結果
 
 每次發佈前都必須通過上述所有測試。結果記錄如下。
+
+### v0.2.29-1 相關專案稽核 + 中斷的操作（2026-08-09）
+
+**狀態：所有測試 PASS**。
+
+**環境**：Proxmox VE 9.2.0／libpve-storage-perl 9.1.6（APIVER 15）／multipath-tools 0.11.1。ONTAP 模擬器 `ontap-sim`，NetApp Release 9.16.1P1，SVM svm1，2 個 iSCSI LIF。
+
+| 測試套件 | 結果 |
+|---------|------|
+| `make test`（Perl 語法，6 個模組） | 6/6 PASS |
+| `tests/audit_fixes.t` | 230/230 PASS |
+| `tests/status_timeout.t` | 20/20 PASS |
+| `tests/stale_sd_reaper.t` | 20/20 PASS |
+| `tests/activate_budget.t` | 8/8 PASS |
+| `tests/sim_functional.pl`（真實 ONTAP） | 13/13 PASS |
+| `tests/sim_snapshot_safety.pl`（真實 ONTAP） | 34/34 PASS |
+| `tests/cleanup_load.pl`（真實 ONTAP） | 6/6 PASS |
+| `tests/sim_export_import.pl`（真實 ONTAP） | 8/8 PASS |
+| **單元測試合計** | **278/278** |
+| **功能測試合計** | **61/61** |
+
+**第 36 節結果**：
+
+- **36.1 PASS，而且該發現在修正前就已於實機上雙向測量**。`multipath -f /dev/mapper/<wwid>` 回應 *device not found*、exit 1，map 仍在；`multipath -f <wwid>` 回傳 0 並移除。修正後 `pvesm free` 完成時**零**次 `dmsetup remove --force` 退路警告，而 0.2.29 之前每一次刪除都會出現一次。
+- **36.2 PASS**。確認 `pvedaemon`、`pveproxy`、`vzdump`、`pct` 皆為 `#!/usr/bin/perl -T`，而 `qm`、`pvesm` 不是。以真正被污染的 storage ID 測試，`_set_ontap_password` 在修正前以 *Insecure dependency in unlink* 中止、修正後成功；`../../etc/passwd`、`a/b` 與空字串皆被拒絕而非改寫。
+- **36.3 PASS**。`pvesm alloc netapp1 9990 vm-9990-fleece-0 1G` 建立出 `netapp1:vm-9990-fleece-0`（修正前名稱會被靜默換成 `vm-9990-disk-0`），列出正確，釋放後剩餘 0 個 volume。
+- **36.4 PASS**。`lun_list`、`volume_list`、`igroup_list` 對真實 SVM 皆正常返回 —— 完整性交叉檢查在正常運作下不會誤擋。
+- **36.5** 依實測行為記錄；其中「中斷的 vzdump」該列即第 33.3 節已驗證過的 v0.2.13／v0.2.14 事故情境。
+
+**備註**：三個功能測試與 `status_timeout.t` 原本以 `_get_api($scfg)` 呼叫而未帶 storeid，必須一併修正，因為 `_get_api` 現在要求它。這是刻意的約定 —— 舊的安靜回退會在「憑證只存在 `/etc/pve/priv`」的儲存上取得 undef 密碼。
 
 ### v0.2.28-1 憑證儲存：ontap-password 改存 /etc/pve/priv/（2026-08-06）
 

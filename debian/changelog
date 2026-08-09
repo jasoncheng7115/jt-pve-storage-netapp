@@ -1,3 +1,37 @@
+jt-pve-storage-netapp (0.2.29-1) stable; urgency=medium
+
+  * Sibling-project audit (jt-pve-storage-synology): three defects
+  * multipath -f was handed a device path, so it never worked
+    - Measured on multipath-tools 0.11.1: `multipath -f /dev/mapper/<wwid>`
+      answers "device not found", exit 1, and leaves the map; only the map
+      NAME works. Every flush this plugin ever issued failed and fell through
+      to the `dmsetup remove --force` fallback, which worked -- so nothing
+      ever looked wrong. multipath_flush() now passes the untainted map name,
+      verifies the map is actually gone rather than trusting the exit status,
+      and returns whether it happened. multipath_remove() had the same defect.
+  * Taint mode: a storage ID reaching a filename
+    - `s///` does NOT untaint; only a capture does. The WWID state and lock
+      files sanitised the storage ID with a substitution and the credential
+      file added in 0.2.28 did not sanitise at all, so file_set_contents,
+      rename and unlink died with "Insecure dependency" under -T. pvedaemon,
+      pveproxy, vzdump and pct are all #!/usr/bin/perl -T; qm, pvesm and the
+      test suite are not, which is why this was invisible. One
+      _storeid_filename_component() now validates against PVE's own storage-ID
+      rule and untaints in the same operation, and refuses a value PVE could
+      not have produced instead of mangling it into another storage's filename.
+  * Proxmox VE 9 backup fleecing is now supported
+    - PVE::VZDump::QemuServer allocates a real volume named
+      vm-<vmid>-fleece-<n> on whichever storage is configured as the fleecing
+      target. The plugin died with "Unrecognized PVE volume name format", and
+      parse_volname would have returned undef. Handled end to end now, with
+      the name PVE chose honoured exactly. (efi-enroll was checked at the same
+      time and is a QEMU storage-daemon id, not a volume, so it is deliberately
+      not handled.)
+  * _get_api now requires a storeid, instead of silently falling back to an
+    undef password on a storage whose credential lives only in /etc/pve/priv.
+
+ -- Jason Cheng <jason@jason.tools>  Sun, 09 Aug 2026 09:30:00 +0800
+
 jt-pve-storage-netapp (0.2.28-1) stable; urgency=medium
 
   * Store ontap-password under /etc/pve/priv/ instead of storage.cfg

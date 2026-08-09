@@ -199,6 +199,14 @@ sub _get_all_records {
     my $resp = $self->get($endpoint, $params);
     push @records, @{$resp->{records}} if $resp->{records};
 
+    # ONTAP reports a total beside the records array. Keep it: the caller treats
+    # what comes back as a COMPLETE list, and a short listing is not a cosmetic
+    # problem here -- the orphan reaper builds its "alive set" from lun_list(),
+    # so under-counting makes live LUNs look deleted. Following _links.next is
+    # not by itself proof of completeness: a truncation that produces no next
+    # link would be invisible. Cross-checked against the total below.
+    my $expected = $resp->{num_records};
+
     # Follow _links.next until exhausted. Bounded to avoid an infinite loop if
     # ONTAP ever returns a self-referential link (safety cap: 1000 pages).
     my $next = $resp->{_links} && $resp->{_links}{next} && $resp->{_links}{next}{href};
@@ -215,8 +223,18 @@ sub _get_all_records {
         $next = $resp->{_links} && $resp->{_links}{next} && $resp->{_links}{next}{href};
     }
     if ($next) {
-        warn "_get_all_records: pagination safety cap reached for '$endpoint'; "
-           . "result may be truncated\n";
+        croak "ONTAP listing for '$endpoint' hit the pagination safety cap "
+            . "(1000 pages) and is truncated; refusing to return a partial list";
+    }
+
+    # A single-page response carries the total for the whole collection, so a
+    # disagreement means we did not get everything. Fail loudly: a caller that
+    # acts on "these are all the LUNs" must never be handed a short list.
+    # Firmware that reports no num_records at all is unaffected.
+    if (defined($expected) && $expected =~ /^\d+$/ && $expected != scalar(@records)) {
+        croak "ONTAP listing for '$endpoint' is incomplete: it reported "
+            . "$expected record(s) but returned " . scalar(@records)
+            . "; refusing to treat this as a complete list";
     }
 
     return \@records;

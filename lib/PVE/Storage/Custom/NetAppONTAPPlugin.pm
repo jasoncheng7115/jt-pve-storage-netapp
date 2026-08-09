@@ -364,6 +364,35 @@ my $TEMP_CLONE_MAX_AGE = 3600;  # 1 hour - cleanup clones older than this
 my $WWID_STATE_DIR = '/var/lib/pve-storage-netapp';
 my $WWID_LOCK_DIR  = '/var/run/pve-storage-netapp';
 
+# Turn a storage ID into something safe to put in a filename -- validating and
+# UNTAINTING in the same operation.
+#
+# This must be one capture. A substitution does NOT untaint: the old code here
+# was `$safe =~ s/[^a-zA-Z0-9_-]/_/g`, which looks sanitised and still carries
+# the taint, so `rename`/`unlink` on the resulting path dies with
+# "Insecure dependency" under -T. That is invisible from `qm` and `pvesm`
+# (plain `#!/usr/bin/perl`) and fires from `pvedaemon`, `pveproxy`, `vzdump`
+# and `pct`, all of which are `#!/usr/bin/perl -T`.
+#
+# The pattern is PVE's own storage-ID rule (JSONSchema::parse_id): at least two
+# characters, starting with a letter, ending alphanumeric, `-`, `_` and `.`
+# allowed between. A value PVE could not have produced is refused rather than
+# mangled into a different storage's filename.
+sub _storeid_filename_component {
+    my ($storeid) = @_;
+
+    die "storage ID is required to build a state file name\n"
+        if !defined($storeid) || !length($storeid);
+
+    my ($safe) = ($storeid =~ /\A([a-z][a-z0-9\-\_\.]*[a-z0-9])\z/i);
+
+    die "refusing to build a file name from storage ID '$storeid'"
+        . " (not a valid Proxmox VE storage ID)\n"
+        if !defined($safe);
+
+    return $safe;
+}
+
 # Translate ONTAP API errors about resource limits into actionable messages.
 # ONTAP raw errors often look like:
 #   "POST /api/storage/volumes failed: 917927: Cannot create volume 'pve_xxx'.
@@ -465,6 +494,12 @@ sub _get_api {
         $scfg->{'ontap-svm'} // 'unknown',
         $status_path ? 'status' : 'data',
     );
+
+    # storeid is REQUIRED: it names the credential file. Without it a migrated
+    # storage (password only in /etc/pve/priv) silently falls back to undef and
+    # fails later as a bare "password is required", far from the actual cause.
+    die "_get_api requires a storeid\n"
+        if !defined($opts{storeid}) || !length($opts{storeid});
 
     my $password = _get_ontap_password($opts{storeid}, $scfg);
 
@@ -592,7 +627,9 @@ our $PRIV_STORAGE_DIR = '/etc/pve/priv/storage';
 
 sub _ontap_password_file {
     my ($storeid) = @_;
-    return "$PRIV_STORAGE_DIR/${storeid}.pw";
+    # Validated and untainted -- this path is passed to file_set_contents and
+    # unlink, both of which die under -T on a tainted value.
+    return "$PRIV_STORAGE_DIR/" . _storeid_filename_component($storeid) . ".pw";
 }
 
 sub _set_ontap_password {
@@ -820,6 +857,17 @@ sub _parse_volname {
             format   => 'raw',
             type     => 'state',
             isBase   => 0,
+        };
+    # Backup fleecing scratch disk: vm-100-fleece-0 (Proxmox VE 9).
+    # PVE::VZDump::QemuServer::vdisk_alloc's it by name on whichever storage is
+    # configured as the fleecing target, so it is an ordinary allocation here.
+    } elsif ($volname =~ /^vm-(\d+)-fleece-(\d+)$/) {
+        return {
+            vmid   => $1,
+            diskid => $2,
+            format => 'raw',
+            type   => 'fleece',
+            isBase => 0,
         };
     }
 
@@ -1231,16 +1279,12 @@ sub _cleanup_temp_clones_for_storage {
 
 sub _wwid_state_file {
     my ($storeid) = @_;
-    my $safe_storeid = $storeid;
-    $safe_storeid =~ s/[^a-zA-Z0-9_-]/_/g;
-    return "$WWID_STATE_DIR/${safe_storeid}-wwids.json";
+    return "$WWID_STATE_DIR/" . _storeid_filename_component($storeid) . "-wwids.json";
 }
 
 sub _wwid_lock_file {
     my ($storeid) = @_;
-    my $safe_storeid = $storeid;
-    $safe_storeid =~ s/[^a-zA-Z0-9_-]/_/g;
-    return "$WWID_LOCK_DIR/${safe_storeid}-wwids.lock";
+    return "$WWID_LOCK_DIR/" . _storeid_filename_component($storeid) . "-wwids.lock";
 }
 
 sub _ensure_wwid_state_dir {
@@ -1736,7 +1780,7 @@ sub _health_state_dir {
 sub _record_status_failure {
     my ($storeid, $reason) = @_;
     my $dir = _health_state_dir();
-    my $file = "$dir/$storeid-failstate";
+    my $file = "$dir/" . _storeid_filename_component($storeid) . "-failstate";
     my $now = time();
 
     my ($first, $count, $last_alert) = (0, 0, 0);
@@ -1790,7 +1834,7 @@ sub _record_status_failure {
 sub _record_status_success {
     my ($storeid) = @_;
     my $dir = _health_state_dir();
-    my $file = "$dir/$storeid-failstate";
+    my $file = "$dir/" . _storeid_filename_component($storeid) . "-failstate";
     if (-e $file) {
         # Read previous state to log recovery if outage exceeded threshold
         my ($first, $count, $last_alert) = (0, 0, 0);
@@ -1829,7 +1873,7 @@ sub _check_aggregate_capacity {
     return unless $aggr_name;
 
     my $dir = _health_state_dir();
-    my $flag = "$dir/$storeid-aggr-warn";
+    my $flag = "$dir/" . _storeid_filename_component($storeid) . "-aggr-warn";
     my $last = (stat($flag))[9] // 0;
     return if (time() - $last) < 3600;  # 1 hour cooldown
 
@@ -1894,7 +1938,7 @@ sub _check_foreign_cluster_namespace {
     my ($api, $storeid, $scfg) = @_;
 
     my $dir = _health_state_dir();
-    my $flag = "$dir/$storeid-foreign-cluster-warn";
+    my $flag = "$dir/" . _storeid_filename_component($storeid) . "-foreign-cluster-warn";
     my $last = (stat($flag))[9] // 0;
     return if (time() - $last) < 86400;    # 24h cooldown
 
@@ -1959,7 +2003,7 @@ sub _check_lif_redundancy {
     return unless $proto eq 'iscsi';  # Only check iSCSI (FC handled by SAN switch)
 
     my $dir = _health_state_dir();
-    my $flag = "$dir/$storeid-lif-warn";
+    my $flag = "$dir/" . _storeid_filename_component($storeid) . "-lif-warn";
     my $last = (stat($flag))[9] // 0;
     return if (time() - $last) < 86400;  # 24 hour cooldown
 
@@ -2149,6 +2193,22 @@ sub alloc_image {
         if ($existing_vol) {
             die "Volume '$ontap_volname' already exists on ONTAP. " .
                 "This may indicate a duplicate cloudinit volume.";
+        }
+    } elsif ($voltype eq 'fleece') {
+        # Backup fleecing scratch disk: vm-{vmid}-fleece-{n} (Proxmox VE 9).
+        # The name is chosen by PVE::VZDump::QemuServer and must be honoured
+        # exactly -- it holds the volume ID for the rest of the backup and frees
+        # it by that name afterwards. There is no free-ID search and no retry on
+        # collision for the same reason.
+        $pve_volname = "vm-${vmid}-fleece-${diskid}";
+        $ontap_volname = pve_volname_to_ontap($storeid, $pve_volname);
+        $lun_path = encode_lun_path($ontap_volname);
+
+        my $existing_vol = $api->volume_get($ontap_volname);
+        if ($existing_vol) {
+            die "Volume '$ontap_volname' already exists on ONTAP. "
+                . "A previous backup's fleecing image was not cleaned up; "
+                . "remove '$storeid:$pve_volname' and retry.\n";
         }
     } else {
         # Standard disk volume: vm-{vmid}-disk-{diskid}
@@ -4137,6 +4197,8 @@ sub parse_volname {
     } elsif ($parsed->{type} eq 'cloudinit') {
         return ('images', $volname, $parsed->{vmid}, undef, undef, 0, $parsed->{format});
     } elsif ($parsed->{type} eq 'state') {
+        return ('images', $volname, $parsed->{vmid}, undef, undef, 0, $parsed->{format});
+    } elsif ($parsed->{type} eq 'fleece') {
         return ('images', $volname, $parsed->{vmid}, undef, undef, 0, $parsed->{format});
     }
 

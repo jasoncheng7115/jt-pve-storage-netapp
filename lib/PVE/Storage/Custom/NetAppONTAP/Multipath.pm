@@ -373,6 +373,22 @@ sub multipath_reload {
 # CRITICAL: multipath -f can hang indefinitely on a device with queue_if_no_path
 # if all paths are failed and there's pending queued I/O. We use a tight timeout
 # and fall back to dmsetup remove --force which bypasses the multipath flush logic.
+# multipath -f takes the MAP NAME, not a device path. Measured on
+# multipath-tools 0.11.1:
+#
+#   multipath -f /dev/mapper/<wwid>   ->  "device not found", exit 1, map stays
+#   multipath -f <wwid>               ->  exit 0, map removed
+#
+# The symlink exists and points at the right dm device; multipath does not accept
+# that form. Passing the path made every flush in this plugin fail and fall
+# through to the dmsetup fallback below -- which worked, so nothing ever looked
+# wrong. Ported from the sibling jt-pve-storage-synology project, then measured
+# here before changing anything.
+#
+# The exit status is not trusted either: the map is looked up again afterwards,
+# because a flush that never happened must not be reported as one that did.
+#
+# Returns 1 if the map is gone afterwards, 0 if it is still present.
 sub multipath_flush {
     my ($device, %opts) = @_;
     my $timeout = $opts{timeout} // 10;
@@ -380,28 +396,35 @@ sub multipath_flush {
     croak "device is required (refusing to flush all maps -- 'multipath -F' is forbidden)"
         unless defined $device && length $device;
 
-    # Try multipath -f with timeout
-    my (undef, undef, $exit) = eval {
-        _run_cmd([MULTIPATH, '-f', $device],
+    # Accept either a map name or a /dev/mapper path; multipath wants the name.
+    my $safe_name = _untaint_device_name(basename($device));
+    croak "refusing to flush an unparseable map name from '$device'"
+        unless defined $safe_name && length $safe_name;
+
+    eval {
+        _run_cmd([MULTIPATH, '-f', $safe_name],
             allow_nonzero => 1, ignore_errors => 1, timeout => $timeout);
     };
-    my $err = $@;
 
-    # If multipath -f hung or failed, fall back to dmsetup remove --force
-    # which doesn't wait for queued I/O.
-    if ($err || (defined $exit && $exit != 0)) {
-        warn "multipath -f $device failed/timed out, trying dmsetup remove --force\n";
-        my $name = basename($device);
-        my $safe_name = _untaint_device_name($name);
-        if ($safe_name) {
-            eval {
-                _run_cmd(['/sbin/dmsetup', 'remove', '--force', '--retry', $safe_name],
-                    allow_nonzero => 1, ignore_errors => 1, timeout => 10);
-            };
-            warn "dmsetup remove also failed for $safe_name: $@" if $@;
-        }
-    }
+    return 1 if _map_is_gone($safe_name);
 
+    # Still there: either multipath -f hung on queued I/O, or it declined.
+    # dmsetup remove --force bypasses the multipath flush logic entirely.
+    warn "multipath -f $safe_name did not remove the map, trying dmsetup remove --force\n";
+    eval {
+        _run_cmd(['/sbin/dmsetup', 'remove', '--force', '--retry', $safe_name],
+            allow_nonzero => 1, ignore_errors => 1, timeout => 10);
+    };
+    warn "dmsetup remove also failed for $safe_name: $@" if $@;
+
+    return _map_is_gone($safe_name) ? 1 : 0;
+}
+
+# Is there still a device-mapper map by this name? Checked against the
+# filesystem rather than a command's exit status.
+sub _map_is_gone {
+    my ($name) = @_;
+    return 0 if -e "/dev/mapper/$name";
     return 1;
 }
 
@@ -423,9 +446,10 @@ sub multipath_remove {
 
     croak "device is required" unless $device;
 
-    # Flush the multipath device first
+    # Flush the multipath device first. Same defect as multipath_flush had: the
+    # map name is what `multipath -f` accepts, never a /dev/mapper path.
     if ($device =~ m|^/dev/mapper/|) {
-        _run_cmd([MULTIPATH, '-f', $device], allow_nonzero => 1);
+        return multipath_flush($device);
     } else {
         # It's a path, remove just the path
         _run_cmd([MULTIPATHD, 'remove', 'path', $device], allow_nonzero => 1);

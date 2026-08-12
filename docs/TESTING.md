@@ -3127,6 +3127,51 @@ grep -cF 'refusing to treat this as a complete list' \
 
 ---
 
+## 37. `alloc_image` refuses an unrecognised name (v0.2.30)
+
+A name the plugin cannot parse used to fall through to "pick a free disk ID",
+so the volume was created under a different name and Proxmox VE was left
+holding a volid that does not exist.
+
+```bash
+# Recognised: the name PVE chose must be honoured exactly
+pvesm alloc netapp1 9960 vm-9960-fleece-0 1G
+# Expected: successfully created 'netapp1:vm-9960-fleece-0'   -- NOT vm-9960-disk-0
+
+# Not recognised: must be REFUSED, and must leave nothing behind
+pvesm alloc netapp1 9960 vm-9960-efi-enroll 1G
+pvesm alloc netapp1 9960 vm-9960-tpmstate9 1G
+# Expected for both: "cannot allocate '<name>' on storage 'netapp1': this plugin
+# does not recognise that volume name. Recognised forms are ..."
+pvesm list netapp1 | tail -n +2 | wc -l          # Expected: 1 (only the fleece one)
+
+pvesm free netapp1:vm-9960-fleece-0
+pvesm list netapp1 | tail -n +2 | wc -l          # Expected: 0
+```
+
+### 37.1 Static guards
+
+```bash
+S=lib/PVE/Storage/Custom/NetAppONTAPPlugin.pm
+grep -cF 'this plugin does not' $S                # Expected: 2 (the die and its test)
+# The refusal must come BEFORE the free-ID search, or the fallthrough is back.
+# Asserted in tests/audit_fixes.t by comparing the two offsets.
+```
+
+### 37.2 Names checked against PVE's own source, not a list
+
+| Name | Handed to `alloc_image`? | Where verified |
+|---|---|---|
+| `vm-<vmid>-cloudinit` | yes | handled since the start |
+| `vm-<vmid>-state-<snapshot>` | yes | handled since the start |
+| `vm-<vmid>-fleece-<n>` | yes | `PVE::VZDump::QemuServer` `vdisk_alloc` (v0.2.29) |
+| `vm-<vmid>-efi-enroll` | **no** | `OVMF.pm` uses it as a QEMU storage-daemon id; `QSD.pm` never calls `vdisk_alloc` |
+| `tpmstate<n>`, `efidisk<n>` | **no** | allocated through `find_free_diskname` like any other disk |
+
+Re-check this table when the Proxmox VE major version changes.
+
+---
+
 ## Cleanup
 
 ```bash
@@ -3152,6 +3197,25 @@ pvesm list $STORAGE
 ## Release Test Results
 
 Each release must pass all tests above before publishing. Results are recorded below.
+
+### v0.2.30-1 alloc_image refuses an unrecognised name (2026-08-12)
+
+**Status: all tests PASS.** Environment: Proxmox VE 9.2.0 / libpve-storage-perl 9.1.6 (APIVER 15); ONTAP simulator rebuilt, NetApp Release 9.16.1P1, SVM svm1.
+
+| Suite | Result |
+|-------|--------|
+| `make test` | 6/6 PASS |
+| `tests/audit_fixes.t` | 243/243 PASS |
+| `tests/status_timeout.t` · `stale_sd_reaper.t` · `activate_budget.t` | 20/20 · 20/20 · 8/8 PASS |
+| `tests/sim_functional.pl` (real ONTAP) | 13/13 PASS |
+| `tests/sim_snapshot_safety.pl` (real ONTAP) | 34/34 PASS |
+| `tests/cleanup_load.pl` (real ONTAP) | 6/6 PASS |
+| `tests/sim_export_import.pl` (real ONTAP) | 8/8 PASS |
+| **Units / Functional** | **291/291 · 61/61** |
+
+Section 37 verified live: `vm-9960-fleece-0` created under exactly that name; `vm-9960-efi-enroll` and `vm-9960-tpmstate9` both refused with the recognised-forms message; storage left at 0 volumes.
+
+**Incidentally confirmed:** `netapp1`, whose password exists **only** in `/etc/pve/priv/storage/netapp1.pw`, authenticated against the **rebuilt** simulator with no operator action -- the 0.2.28 credential path exercised again from a cold start.
 
 ### v0.2.29-1 Sibling-Project Audit + Interrupted Operations (2026-08-09)
 

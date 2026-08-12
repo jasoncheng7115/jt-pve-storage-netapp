@@ -1,3 +1,27 @@
+jt-pve-storage-netapp (0.2.30-1) stable; urgency=medium
+
+  * alloc_image refuses a volume name it cannot parse
+    - Most volume names come back from find_free_diskname, so the plugin
+      chooses them; a few Proxmox VE builds itself and hands to alloc_image
+      already named. An unparsed name used to fall through to "pick a free
+      disk ID", which does not fail: it creates the volume under a name that
+      says it is an ordinary VM disk, and PVE is then holding a volid that
+      does not exist. Measured before this release:
+          pvesm alloc <store> 9990 vm-9990-fleece-0 1G
+          -> successfully created 'vm-9990-disk-0'
+      Refusing covers every name a future Proxmox VE adds without this plugin
+      having heard of it first. Found by auditing the sibling
+      jt-pve-storage-dellemc project, then measured here.
+  * No functional change for names the plugin already recognises:
+    vm-<vmid>-disk-<n>, base-<vmid>-disk-<n>, vm-<vmid>-cloudinit,
+    vm-<vmid>-state-<snapshot> and vm-<vmid>-fleece-<n>.
+  * Documentation: CLAUDE.md records that nothing at process exit runs in a
+    PVE worker (fork_worker ends the child with POSIX::_exit, which skips END
+    blocks, global destruction and buffered output), and states plainly that
+    FC is implemented but has never been exercised against real FC hardware.
+
+ -- Jason Cheng <jason@jason.tools>  Wed, 12 Aug 2026 11:20:00 +0800
+
 jt-pve-storage-netapp (0.2.29-1) stable; urgency=medium
 
   * Sibling-project audit (jt-pve-storage-synology): three defects

@@ -2139,11 +2139,29 @@ sub alloc_image {
 
     if ($name) {
         $parsed = _parse_volname($name);
-        if ($parsed) {
-            $voltype = $parsed->{type} // 'disk';
-            $diskid = $parsed->{diskid} if defined $parsed->{diskid};
-            $snapname = $parsed->{snapname} if defined $parsed->{snapname};
-        }
+
+        # A name we cannot parse must be REFUSED, not quietly replaced.
+        #
+        # Most volume names come back from find_free_diskname, so the plugin
+        # chooses them; a few Proxmox VE builds itself and hands to alloc_image
+        # already named -- today cloudinit, state-<snapshot> and fleece-<n>.
+        # Falling through to "pick a free disk ID" does not fail: it creates the
+        # volume under a name that says it is an ordinary VM disk, and PVE then
+        # holds a volid that does not exist. Measured before 0.2.29:
+        # `pvesm alloc <store> 9990 vm-9990-fleece-0 1G` answered
+        # "successfully created 'vm-9990-disk-0'".
+        #
+        # Refusing here covers every name a future PVE adds, instead of needing
+        # this plugin to have heard of it first.
+        die "cannot allocate '$name' on storage '$storeid': this plugin does not"
+            . " recognise that volume name. Recognised forms are"
+            . " vm-<vmid>-disk-<n>, base-<vmid>-disk-<n>, vm-<vmid>-cloudinit,"
+            . " vm-<vmid>-state-<snapshot> and vm-<vmid>-fleece-<n>.\n"
+            if !$parsed;
+
+        $voltype = $parsed->{type} // 'disk';
+        $diskid = $parsed->{diskid} if defined $parsed->{diskid};
+        $snapname = $parsed->{snapname} if defined $parsed->{snapname};
     }
 
     # For disk type, find free disk ID if not specified

@@ -2,6 +2,30 @@
 
 All notable changes to the NetApp ONTAP Storage Plugin for Proxmox VE are documented here.
 
+## [0.2.30] - 2026-08-12
+
+### `alloc_image` refuses a volume name it cannot parse
+
+Most volume names come back from `find_free_diskname`, so the plugin chooses them. A few Proxmox VE builds itself and hands to `alloc_image` already named. An unparsed name used to fall through to "pick a free disk ID" — which **does not fail**. It creates the volume under a name that says it is an ordinary VM disk, and Proxmox VE is then holding a volid that does not exist. Measured before this release:
+
+```
+pvesm alloc <store> 9990 vm-9990-fleece-0 1G
+-> successfully created 'vm-9990-disk-0'
+```
+
+Refusing covers every name a future Proxmox VE adds, without this plugin having to have heard of it first. Found by auditing the sibling **jt-pve-storage-dellemc** project, then measured here rather than assumed.
+
+Nothing changes for the names already recognised: `vm-<vmid>-disk-<n>`, `base-<vmid>-disk-<n>`, `vm-<vmid>-cloudinit`, `vm-<vmid>-state-<snapshot>` and `vm-<vmid>-fleece-<n>`.
+
+`efi-enroll` was checked again at the same time and is still **not** one of them on Proxmox VE 9.2: `OVMF.pm` uses it as a QEMU storage-daemon id and `QSD.pm` never calls `vdisk_alloc`. `tpmstate<n>` and `efidisk<n>` come through `find_free_diskname` like any other disk. All three are now refused explicitly instead of being silently renamed.
+
+### Documentation
+
+- **Nothing at process exit runs in a Proxmox VE worker.** `PVE::RESTEnvironment::fork_worker` ends the child with `POSIX::_exit`, which skips `END` blocks, global destruction and even the flush of buffered output — and a worker is what runs `qm create`, `qm destroy` and every task that touches a volume. This plugin has no `END` block and no `DESTROY`, and its ONTAP authentication is stateless HTTP Basic, so there is no session to leak; the rule is recorded so nobody adds one later.
+- **FC is implemented but has never been exercised against real FC hardware.** `ontap-protocol` accepts `fc`, `FC.pm` is ~385 lines across 10 functions and the plugin branches on the protocol in 7 places — but this lab has no FC HBA, so every FC defect found so far was found by code review, not by running it. Said plainly rather than as a footnote.
+
+**Testing:** `make test` 6/6, units **291/291**, functional against a real ONTAP **61/61**. The refusal was verified live: `vm-9960-fleece-0` was created under exactly that name, `vm-9960-efi-enroll` and `vm-9960-tpmstate9` were refused with a message naming the recognised forms, and nothing was left behind on either side.
+
 ## [0.2.29] - 2026-08-09
 
 Three defects, all found by reading the sibling **jt-pve-storage-synology** project's changelog and then **measuring the same thing here** rather than assuming it transferred.

@@ -2662,6 +2662,49 @@ grep -cF 'refusing to treat this as a complete list' \
 
 ---
 
+## 37. `alloc_image` 拒絕無法辨識的名稱（v0.2.30）
+
+先前無法解析的名稱會落到「挑一個空閒 disk id」，於是 volume 被用另一個名稱建立，而 Proxmox VE 手上握著一個不存在的 volid。
+
+```bash
+# 可辨識：PVE 選定的名稱必須被完整沿用
+pvesm alloc netapp1 9960 vm-9960-fleece-0 1G
+# 預期：successfully created 'netapp1:vm-9960-fleece-0'  —— 不是 vm-9960-disk-0
+
+# 無法辨識：必須被拒絕，且不得留下任何東西
+pvesm alloc netapp1 9960 vm-9960-efi-enroll 1G
+pvesm alloc netapp1 9960 vm-9960-tpmstate9 1G
+# 兩者預期："cannot allocate '<name>' on storage 'netapp1': this plugin
+# does not recognise that volume name. Recognised forms are ..."
+pvesm list netapp1 | tail -n +2 | wc -l          # 預期：1（只有 fleece 那個）
+
+pvesm free netapp1:vm-9960-fleece-0
+pvesm list netapp1 | tail -n +2 | wc -l          # 預期：0
+```
+
+### 37.1 靜態守門
+
+```bash
+S=lib/PVE/Storage/Custom/NetAppONTAPPlugin.pm
+grep -cF 'this plugin does not' $S                # 預期：2（die 本身與其測試）
+# 拒絕必須發生在空號搜尋「之前」，否則 fallthrough 就回來了。
+# 這一點由 tests/audit_fixes.t 比較兩者的位移來斷言。
+```
+
+### 37.2 名稱是查 PVE 原始碼得出的，不是照抄清單
+
+| 名稱 | 會交給 `alloc_image` 嗎？ | 查證位置 |
+|---|---|---|
+| `vm-<vmid>-cloudinit` | 會 | 一開始就已處理 |
+| `vm-<vmid>-state-<snapshot>` | 會 | 一開始就已處理 |
+| `vm-<vmid>-fleece-<n>` | 會 | `PVE::VZDump::QemuServer` 的 `vdisk_alloc`（v0.2.29） |
+| `vm-<vmid>-efi-enroll` | **不會** | `OVMF.pm` 把它當 QEMU storage daemon 的 id；`QSD.pm` 從不呼叫 `vdisk_alloc` |
+| `tpmstate<n>`、`efidisk<n>` | **不會** | 與其他磁碟一樣經由 `find_free_diskname` 配置 |
+
+Proxmox VE 主版本變更時，請重新查證這張表。
+
+---
+
 ## 清除
 
 ```bash
@@ -2687,6 +2730,25 @@ pvesm list $STORAGE
 ## 發佈測試結果
 
 每次發佈前都必須通過上述所有測試。結果記錄如下。
+
+### v0.2.30-1 alloc_image 拒絕無法辨識的名稱（2026-08-12）
+
+**狀態：所有測試 PASS**。環境：Proxmox VE 9.2.0／libpve-storage-perl 9.1.6（APIVER 15）；ONTAP 模擬器已重建，NetApp Release 9.16.1P1，SVM svm1。
+
+| 測試套件 | 結果 |
+|---------|------|
+| `make test` | 6/6 PASS |
+| `tests/audit_fixes.t` | 243/243 PASS |
+| `tests/status_timeout.t`／`stale_sd_reaper.t`／`activate_budget.t` | 20/20／20/20／8/8 PASS |
+| `tests/sim_functional.pl`（真實 ONTAP） | 13/13 PASS |
+| `tests/sim_snapshot_safety.pl`（真實 ONTAP） | 34/34 PASS |
+| `tests/cleanup_load.pl`（真實 ONTAP） | 6/6 PASS |
+| `tests/sim_export_import.pl`（真實 ONTAP） | 8/8 PASS |
+| **單元／功能** | **291/291・61/61** |
+
+第 37 節已於實機驗證：`vm-9960-fleece-0` 以完全相同的名稱建立；`vm-9960-efi-enroll` 與 `vm-9960-tpmstate9` 皆被拒絕並列出可接受形式；儲存最後為 0 個 volume。
+
+**順帶再次證實**：`netapp1` 的密碼**只**存在於 `/etc/pve/priv/storage/netapp1.pw`，在模擬器**重建之後**未經任何人工操作即通過認證 —— 0.2.28 的憑證路徑再一次從冷啟狀態被驗證。
 
 ### v0.2.29-1 相關專案稽核 + 中斷的操作（2026-08-09）
 

@@ -2,6 +2,30 @@
 
 NetApp ONTAP Storage Plugin for Proxmox VE 的所有重要變更都記錄在此。
 
+## [0.2.30] - 2026-08-12
+
+### `alloc_image` 遇到無法解析的名稱會拒絕
+
+多數 volume 名稱來自 `find_free_diskname`，由外掛自行決定；少數則是 Proxmox VE 自己組好、直接交給 `alloc_image`。先前無法解析的名稱會落到「挑一個空閒 disk id」—— 而這**不會失敗**。它會用一個看起來像普通 VM 磁碟的名稱把 volume 建出來，Proxmox VE 之後就握著一個不存在的 volid。本次發布前的實測：
+
+```
+pvesm alloc <store> 9990 vm-9990-fleece-0 1G
+-> successfully created 'vm-9990-disk-0'
+```
+
+改為拒絕之後，一次涵蓋所有未來 Proxmox VE 新增的名稱，不必等這個外掛先聽說過它。此問題來自稽核相關專案 **jt-pve-storage-dellemc**，並在本專案實際測量而非直接沿用結論。
+
+已辨識的名稱行為完全不變：`vm-<vmid>-disk-<n>`、`base-<vmid>-disk-<n>`、`vm-<vmid>-cloudinit`、`vm-<vmid>-state-<snapshot>` 與 `vm-<vmid>-fleece-<n>`。
+
+`efi-enroll` 一併再次查證，在 Proxmox VE 9.2 上仍然**不是**其中之一：`OVMF.pm` 把它當作 QEMU storage daemon 的 id 使用，而 `QSD.pm` 從不呼叫 `vdisk_alloc`。`tpmstate<n>` 與 `efidisk<n>` 則和其他磁碟一樣走 `find_free_diskname`。這三者現在都會被明確拒絕，而不是被靜默改名。
+
+### 文件
+
+- **在 Proxmox VE worker 中，任何「行程結束時」的程式碼都不會執行**。`PVE::RESTEnvironment::fork_worker` 以 `POSIX::_exit` 結束子行程，會跳過 `END` 區塊、global destruction，連緩衝輸出的 flush 都跳過 —— 而 worker 正是執行 `qm create`、`qm destroy` 以及每一個碰到 volume 的工作的東西。本外掛沒有 `END` 區塊也沒有 `DESTROY`，且 ONTAP 認證採用無狀態的 HTTP Basic，因此沒有 session 會洩漏；記下這條規則是為了避免日後有人加上去。
+- **FC 已實作，但從未對真實 FC 硬體執行過**。`ontap-protocol` 接受 `fc`，`FC.pm` 約 385 行、10 個函式，主外掛有 7 處依協定分支 —— 但本實驗室沒有 FC HBA，因此目前所有已知的 FC 缺陷都是靠程式碼審查找到的，不是跑出來的。這一點改為明講，而不是放在註腳。
+
+**測試**：`make test` 6/6、單元測試 **291/291**、對真實 ONTAP 的功能測試 **61/61**。拒絕行為已於實機驗證：`vm-9960-fleece-0` 以完全相同的名稱建立成功，`vm-9960-efi-enroll` 與 `vm-9960-tpmstate9` 被拒絕並列出可接受的名稱形式，兩側皆無殘留。
+
 ## [0.2.29] - 2026-08-09
 
 三個缺陷，全部來自閱讀相關專案 **jt-pve-storage-synology** 的變更記錄，並且**在本專案實際測量**，而不是假設結論可以直接套用。

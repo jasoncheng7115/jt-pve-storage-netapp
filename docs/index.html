@@ -142,7 +142,7 @@
     <div class="hero__glow"></div>
     <div class="hero__glow-left"></div>
     <div class="hero__content">
-        <div class="hero__badge">v0.2.30 <span class="hero__badge-sep"></span> MIT License</div>
+        <div class="hero__badge">v0.2.31 <span class="hero__badge-sep"></span> MIT License</div>
         <h1 class="hero__title">jt-pve-storage-netapp</h1>
         <p class="hero__project-desc">
             <span class="lang-en">NetApp ONTAP SAN/iSCSI/FC Storage Plugin for Proxmox VE</span>
@@ -537,7 +537,7 @@
                 <span class="lang-en">Install the plugin package</span>
                 <span class="lang-zh">安裝 plugin 套件</span>
             </div>
-            <pre><span class="cmd">dpkg</span> <span class="flag">-i</span> jt-pve-storage-netapp_0.2.30-1_all.deb</pre>
+            <pre><span class="cmd">dpkg</span> <span class="flag">-i</span> jt-pve-storage-netapp_0.2.31-1_all.deb</pre>
             <p>
                 <span class="lang-en">The plugin automatically configures multipath and reloads Proxmox VE services (pvedaemon, pvestatd, pveproxy).</span>
                 <span class="lang-zh">Plugin 會自動設定 multipath 並重新載入 Proxmox VE 服務（pvedaemon、pvestatd、pveproxy）。</span>
@@ -611,7 +611,7 @@
                 <span class="lang-en">Install new package</span>
                 <span class="lang-zh">安裝新套件</span>
             </div>
-            <pre><span class="cmd">dpkg</span> <span class="flag">-i</span> jt-pve-storage-netapp_0.2.30-1_all.deb</pre>
+            <pre><span class="cmd">dpkg</span> <span class="flag">-i</span> jt-pve-storage-netapp_0.2.31-1_all.deb</pre>
         </div>
     </div>
     <div class="step">
@@ -1451,6 +1451,15 @@
         <span class="lang-en">Version history. For full details see <a href="https://github.com/jasoncheng7115/jt-pve-storage-netapp/blob/main/CHANGELOG.md">CHANGELOG.md</a>.</span>
         <span class="lang-zh">版本紀錄。完整內容請參閱 <a href="https://github.com/jasoncheng7115/jt-pve-storage-netapp/blob/main/CHANGELOG_zh-TW.md">CHANGELOG_zh-TW.md</a>。</span>
     </p>
+
+    <div class="changelog-entry">
+        <div class="changelog-version">v0.2.31 <span class="changelog-tag changelog-tag--fix">Fix</span></div>
+        <div class="changelog-date">2026-08-12</div>
+        <div class="changelog-summary">
+            <span class="lang-en"><strong>Two Fibre Channel defects, ported from a sibling project that has run FC against a customer&#39;s array. Neither is reachable from this lab, which has no FC HBA &mdash; both are fixed by code and asserted by unit tests, and NOT exercised against real FC hardware.</strong> <strong>1.</strong> The kernel names an FC remote port <code>rport-&lt;host&gt;:&lt;channel&gt;-&lt;remote&gt;</code>, with a colon after the host number. The enumeration filtered on three hyphen-separated numbers, which matches no entry the kernel has ever created, so it could only ever return an empty list and a caller would report an unzoned fabric on a perfectly healthy one. This is a defect no amount of static or unit testing here could have found: it only appears when a real HBA creates the sysfs entries. <strong>2.</strong> A LUN ID above 255 is invisible to a Linux node using an Emulex FC driver, which scans only 0&ndash;255 where ESXi scans 0&ndash;1023 (Dell KB 000199943). ONTAP picks the ID itself, so the plugin warns and names the igroup rather than refusing &mdash; the LUN is mapped and correct, and a QLogic HBA may well see it. iSCSI has no such ceiling and is untouched.</span>
+            <span class="lang-zh"><strong>兩個 Fibre Channel 缺陷，移植自已在客戶陣列上實際運行過 FC 的相關專案。兩者在本實驗室都無法重現（這裡沒有 FC HBA）—— 都是以程式碼修正、以單元測試斷言，並未對真實 FC 硬體執行過。</strong><strong>一、</strong>核心對 FC remote port 的命名是 <code>rport-&lt;host&gt;:&lt;channel&gt;-&lt;remote&gt;</code>，host 號之後是冒號。原本的列舉過濾三個連字號分隔的數字，這匹配不到核心曾建立過的任何一筆，因此只可能回傳空清單，呼叫端便會在完全健康的 fabric 上回報 zoning 有誤。這是本專案再多靜態或單元測試都找不到的缺陷：它只在真實 HBA 建立出 sysfs 項目時才會顯現。<strong>二、</strong>LUN ID 超過 255 時，使用 Emulex FC 驅動程式的 Linux 節點看不到它 —— 該驅動只掃描 0～255，而 ESXi 掃描 0～1023（Dell KB 000199943）。ONTAP 自行決定 LUN ID，因此外掛只發出警告並指出 igroup，而不拒絕 —— 該 LUN 對映正確，QLogic HBA 很可能看得到。iSCSI 沒有這個上限，完全不受影響。</span>
+        </div>
+    </div>
 
     <div class="changelog-entry">
         <div class="changelog-version">v0.2.30 <span class="changelog-tag changelog-tag--fix">Fix</span></div>

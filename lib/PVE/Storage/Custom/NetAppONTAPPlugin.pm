@@ -2378,8 +2378,48 @@ sub alloc_image {
         die "Failed to map LUN: " . _translate_limit_error($err, 'LUN map');
     }
 
+    _warn_high_fc_lun_id($scfg, $api, $lun_path);
+
     # Return PVE volume name
     return $pve_volname;
+}
+
+# FC only: warn when ONTAP assigned this LUN a SCSI logical unit number above
+# 255, because a Linux node with an Emulex HBA will never discover it.
+#
+# ONTAP chooses the LUN ID itself on lun_map (and reuses freed ones), so the
+# plugin cannot prevent a high one -- but a disk that simply never appears on
+# one node while working on another is very hard to diagnose from the host end.
+#
+# The ceiling is the initiator driver's, not the array's: Dell KB 000199943
+# records that ESXi scans LUN ids 0-1023 by default while Linux with the Emulex
+# FC driver scans only 0-255. Ported from the sibling jt-pve-storage-dellemc
+# project, which caps at 255 for the same reason.
+#
+# iSCSI is unaffected -- there is no such scan ceiling -- so this never runs
+# there. It warns and never refuses: the LUN is mapped and correct, and on a
+# QLogic HBA or with a rescan it may well be visible.
+sub _warn_high_fc_lun_id {
+    my ($scfg, $api, $lun_path) = @_;
+
+    return unless ($scfg->{'ontap-protocol'} // 'iscsi') eq 'fc';
+
+    my $maps = eval { $api->get('/protocols/san/lun-maps',
+        { 'lun.name' => $lun_path, fields => 'logical_unit_number,igroup.name' }) };
+    return if $@ || !$maps;
+
+    for my $m (@{$maps->{records} // []}) {
+        my $id = $m->{logical_unit_number};
+        next if !defined($id) || $id !~ /^\d+$/ || $id <= 255;
+        warn "NOTE: ONTAP assigned LUN ID $id to '$lun_path' in igroup '"
+            . ($m->{igroup}{name} // '?') . "'. The Linux Emulex FC driver only"
+            . " scans LUN IDs 0-255, so this disk may never appear on a node"
+            . " using one (Dell KB 000199943). It is mapped correctly on the"
+            . " array; if the device does not appear, free some low LUN IDs on"
+            . " this igroup and re-map.\n";
+    }
+
+    return;
 }
 
 # Is the LUN doing I/O right now, as seen by ONTAP itself?

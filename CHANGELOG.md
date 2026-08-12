@@ -2,6 +2,30 @@
 
 All notable changes to the NetApp ONTAP Storage Plugin for Proxmox VE are documented here.
 
+## [0.2.31] - 2026-08-12
+
+Two FC defects ported from **jt-pve-storage-dellemc**, which has run Fibre Channel against a customer's PowerVault ME4024. **Neither is reachable from this lab** — there is no FC HBA here, so both are fixed by code and asserted by unit tests, and **not exercised against real FC hardware**.
+
+### The kernel's FC remote-port name has a colon after the host number
+
+`/sys/class/fc_remote_ports` entries are `rport-<host>:<channel>-<remote>` — `rport-5:0-3`. `get_fc_targets()` filtered on three **hyphen**-separated numbers, which matches no entry the kernel has ever created, so it could only ever return an empty list and a caller would conclude the fabric was unzoned however well it was zoned. Reported on the sibling project from a **working** ME4024, on every poll.
+
+This plugin never called `get_fc_targets()`, so it was latent rather than live — but a wrong pattern in unused code is the next caller's bug, and this project has been here before (v0.2.4 deleted `get_multipath_wwid` for exactly that reason).
+
+The new `rport_name()` doubles as the taint check: what comes back is what the pattern **matched**, never the string read from the directory. Only a capture untaints, and that name is interpolated into a sysfs path.
+
+**This is a defect no amount of static or unit testing here could have found** — it only shows up when a real HBA creates the sysfs entries. It took someone else's hardware.
+
+### FC: warn when ONTAP assigns a LUN ID above 255
+
+The ceiling belongs to the initiator driver, not the array. [Dell KB 000199943](https://www.dell.com/support/kbdoc/en-us/000199943/) records ESXi scanning LUN IDs 0–1023 by default while **Linux with the Emulex FC driver scans only 0–255**.
+
+ONTAP picks the LUN ID itself on `lun_map` and reuses freed ones, so the plugin cannot prevent a high one — but a disk that simply never appears on one node while working on another is very hard to diagnose from the host end. It now warns, names the igroup, and says what to do.
+
+It **warns and never refuses**: the LUN is mapped and correct, and a QLogic HBA may well see it. iSCSI has no such ceiling and is untouched — the check returns before making any API call unless `ontap-protocol` is `fc`.
+
+**Testing:** `make test` 6/6, units **312/312**, functional against a real ONTAP **61/61**. iSCSI allocation was re-run to confirm no extra API call and no behaviour change. The FC paths themselves remain unverified against hardware.
+
 ## [0.2.30] - 2026-08-12
 
 ### `alloc_image` refuses a volume name it cannot parse

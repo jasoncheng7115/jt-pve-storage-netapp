@@ -1,3 +1,33 @@
+jt-pve-storage-netapp (0.2.31-1) stable; urgency=medium
+
+  * FC: two defects ported from jt-pve-storage-dellemc, which has run FC
+    against a customer's PowerVault ME4024. Neither is reachable from this
+    lab, which has no FC HBA -- both are fixed by code, asserted by unit
+    tests, and NOT exercised against real FC hardware.
+  * The kernel's FC remote-port name has a COLON after the host number
+    - /sys/class/fc_remote_ports entries are rport-<host>:<channel>-<remote>,
+      e.g. 'rport-5:0-3'. get_fc_targets() filtered on three HYPHEN-separated
+      numbers, which matches no entry the kernel has ever created, so it could
+      only ever return an empty list -- and a caller would conclude the fabric
+      was unzoned however well it was zoned. Reported on the sibling project
+      from a working ME4024. This plugin never called get_fc_targets(), so it
+      was latent rather than live, but a wrong pattern in unused code is the
+      next caller's bug. The new rport_name() doubles as the taint check: what
+      comes back is what the pattern matched, never the directory entry.
+  * FC: warn when ONTAP assigns a LUN ID above 255
+    - The ceiling is the initiator driver's, not the array's: Dell KB
+      000199943 records ESXi scanning LUN IDs 0-1023 by default while Linux
+      with the Emulex FC driver scans only 0-255. ONTAP picks the ID itself on
+      lun_map and reuses freed ones, so the plugin cannot prevent a high one --
+      but a disk that never appears on one node while working on another is
+      very hard to diagnose from the host end. It warns, names the igroup and
+      says what to do, and never refuses: the LUN is mapped and correct, and a
+      QLogic HBA may well see it.
+    - iSCSI has no such ceiling and is untouched: the check returns before
+      making any API call unless ontap-protocol is 'fc'.
+
+ -- Jason Cheng <jason@jason.tools>  Wed, 12 Aug 2026 14:10:00 +0800
+
 jt-pve-storage-netapp (0.2.30-1) stable; urgency=medium
 
   * alloc_image refuses a volume name it cannot parse

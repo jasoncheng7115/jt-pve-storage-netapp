@@ -2,6 +2,30 @@
 
 NetApp ONTAP Storage Plugin for Proxmox VE 的所有重要變更都記錄在此。
 
+## [0.2.31] - 2026-08-12
+
+兩個 FC 缺陷，移植自 **jt-pve-storage-dellemc** —— 該專案的 Fibre Channel 已在客戶的 PowerVault ME4024 上實際運行過。**兩者在本實驗室都無法重現**（這裡沒有 FC HBA），因此都是以程式碼修正、以單元測試斷言，**並未對真實 FC 硬體執行過**。
+
+### 核心的 FC remote port 名稱在 host 號之後是冒號
+
+`/sys/class/fc_remote_ports` 的項目格式是 `rport-<host>:<channel>-<remote>` —— 例如 `rport-5:0-3`。`get_fc_targets()` 過濾的是三個**連字號**分隔的數字，這匹配不到核心曾經建立過的任何一筆，因此它只可能回傳空清單，而呼叫端就會判定 fabric 沒有正確 zoning —— 無論 zoning 其實多正確。相關專案是從一台**運作正常的** ME4024 上回報的，而且每次輪詢都出現。
+
+本外掛從未呼叫過 `get_fc_targets()`，所以它是潛伏而非已發作 —— 但無用程式碼裡的錯誤樣式，就是下一個呼叫者的 bug，而本專案已經歷過一次（v0.2.4 正是為此刪掉了 `get_multipath_wwid`）。
+
+新的 `rport_name()` 同時兼作污染檢查：回傳的是樣式**匹配出來**的字串，絕不是從目錄讀到的原始字串。只有 capture 會 untaint，而這個名稱會被插進 sysfs 路徑。
+
+**這是本專案再多靜態或單元測試都找不到的缺陷** —— 它只在真實 HBA 建立出 sysfs 項目時才會顯現，是靠別人的硬體撞出來的。
+
+### FC：ONTAP 指派的 LUN ID 超過 255 時發出警告
+
+這個上限屬於 initiator 驅動程式，而不是儲存陣列。[Dell KB 000199943](https://www.dell.com/support/kbdoc/en-us/000199943/) 記載 ESXi 預設掃描 LUN ID 0～1023，而 **Linux 搭配 Emulex FC 驅動程式只掃描 0～255**。
+
+ONTAP 在 `lun_map` 時自行決定 LUN ID，並會重複使用釋出的編號，因此外掛無法阻止它配出較高的編號 —— 但「一顆磁碟在某個節點上永遠不出現、在別的節點卻正常」這種狀況，從主機端極難診斷。現在會發出警告、指出是哪個 igroup，並說明該怎麼處理。
+
+它**只警告、絕不拒絕**：該 LUN 對映正確無誤，而 QLogic HBA 很可能看得到。iSCSI 沒有這個上限，完全不受影響 —— 除非 `ontap-protocol` 為 `fc`，否則檢查在發出任何 API 呼叫之前就返回。
+
+**測試**：`make test` 6/6、單元測試 **312/312**、對真實 ONTAP 的功能測試 **61/61**。已重跑 iSCSI 配置確認沒有多餘的 API 呼叫、行為完全不變。FC 路徑本身仍未經硬體驗證。
+
 ## [0.2.30] - 2026-08-12
 
 ### `alloc_image` 遇到無法解析的名稱會拒絕

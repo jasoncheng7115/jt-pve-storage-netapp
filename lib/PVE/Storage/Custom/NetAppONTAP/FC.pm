@@ -277,6 +277,30 @@ sub rescan_fc_hosts {
     return $scanned;
 }
 
+# Validate and untaint an fc_remote_ports entry name.
+#
+# The kernel names a remote port rport-<host>:<channel>-<remote>, with a
+# COLON after the host number: 'rport-5:0-3'. This filter used to ask for
+# three HYPHEN-separated numbers, which matches no entry the kernel has ever
+# created -- so get_fc_targets() could only ever return an empty list, and any
+# caller would conclude the fabric was unzoned however well it was zoned.
+#
+# Ported from the sibling jt-pve-storage-dellemc project, where exactly that
+# was reported from a working PowerVault ME4024 over FC. This plugin never
+# called get_fc_targets(), so it was latent rather than live -- but a wrong
+# pattern in unused code is the next caller's bug.
+#
+# It doubles as the taint check: what comes back is what the pattern MATCHED,
+# never the string read from the directory. Only a capture untaints.
+sub rport_name {
+    my ($entry) = @_;
+
+    return undef unless defined $entry;
+    my ($name) = $entry =~ /^(rport-\d+:\d+-\d+)\z/;
+
+    return $name;
+}
+
 # Get FC remote port (target) information
 # Returns: arrayref of hashrefs with target details
 sub get_fc_targets {
@@ -285,9 +309,8 @@ sub get_fc_targets {
     return [] unless -d FC_REMOTE_PATH;
 
     opendir(my $dh, FC_REMOTE_PATH) or return [];
-    for my $entry (readdir($dh)) {
-        next if $entry =~ /^\./;
-        next unless $entry =~ /^rport-\d+-\d+-\d+$/;
+    for my $raw (readdir($dh)) {
+        my $entry = rport_name($raw) // next;
 
         my $base = FC_REMOTE_PATH . "/$entry";
 

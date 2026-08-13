@@ -388,6 +388,11 @@ img { max-width: 100%; height: auto; display: block; }
     margin-bottom: 12px;
 }
 .card__icon svg { flex-shrink: 0; }
+/* Related-project cards use two-letter initials instead of an SVG. */
+.card__icon--text { font-weight: 700; font-size: 0.82rem; letter-spacing: 0.03em; }
+/* A card that is itself a link must not pick up the default anchor styling. */
+a.card { text-decoration: none; color: inherit; display: block; }
+a.card:hover .card__title { color: var(--indigo); }
 
 .card:nth-child(3n+1) .card__icon { background: rgba(79,70,229,0.08);  color: var(--indigo); }
 .card:nth-child(3n+2) .card__icon { background: rgba(14,165,233,0.08); color: #0284c7; }

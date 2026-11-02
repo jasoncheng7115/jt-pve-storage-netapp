@@ -267,19 +267,28 @@ grep -n 'volume_delete' lib/PVE/Storage/Custom/NetAppONTAPPlugin.pm
 # 19.1.2 沒有 basename() 在 /sys/block/ 存取附近
 grep -n 'basename' lib/PVE/Storage/Custom/NetAppONTAP/Multipath.pm | \
     grep -v '_resolve_block_device_name'
-# 預期：只剩 get_scsi_devices_by_serial 一個 match (它直接用 /sys/block/sd*
-# 名稱,安全)
+# 預期（0.2.32）：`use File::Basename` 那一行，加上以下位置，全部安全——
+#   _resolve_block_device_name  （resolver 本身，在 readlink 之後）
+#   multipath_flush、cleanup_lun_devices  （交給 multipath/dmsetup 的 map 名稱）
+#   get_scsi_devices_by_serial  （by-id 連結名稱）
+#   remove_scsi_device、rescan_scsi_device  （接收 /dev/sdX，本來就是核心名稱）
+#   另有 is_device_in_use 裡的一行註解（那則 CRITICAL 說明）
+# 出現「新的」位置必須人工確認：它是否會拿可能來自 /dev/mapper/<wwid> 的名稱
+# 去存取 /sys/block/<name>/？（預期值寫「一個 match」寫了好幾個版本，實際數量
+# 早已增加——要逐一確認，不要只數數量。）
 
 # 19.1.3 get_multipath_wwid 已刪除
 grep -n 'get_multipath_wwid' lib/PVE/Storage/Custom/NetAppONTAP/Multipath.pm
 # 預期：zero matches (v0.2.4 已刪除)
 
 # 19.1.4 沒有 bare system() (anti-hang)
-grep -nE '(^|[^_a-z])system\s*\(' lib/PVE/Storage/Custom/**/*.pm
+#（兩個目錄都明確列出：bash 沒開 globstar 時，Custom/**/*.pm 只會展開成
+# NetAppONTAP/*.pm，於是最大的 NetAppONTAPPlugin.pm 直到 0.2.32 之前都沒被檢查到。）
+grep -nE '(^|[^_a-z])system\s*\(' lib/PVE/Storage/Custom/*.pm lib/PVE/Storage/Custom/NetAppONTAP/*.pm
 # 預期：zero matches
 
 # 19.1.5 沒有 bare open() 寫 /sys/
-grep -n "open.*'>'.*'/sys/" lib/PVE/Storage/Custom/**/*.pm
+grep -n "open.*'>'.*'/sys/" lib/PVE/Storage/Custom/*.pm lib/PVE/Storage/Custom/NetAppONTAP/*.pm
 # 預期：zero matches
 ```
 
@@ -1090,11 +1099,17 @@ grep -rn 'glob.*dev.disk' lib/PVE/Storage/Custom/NetAppONTAP/*.pm
 # For each: check that alarm(5) appears within 3 lines before it
 # (Manual review -- verify each glob is inside an eval { alarm(5); ... alarm(0); } block)
 
-# Quick count check
-GLOB_COUNT=$(grep -c 'glob.*dev.disk' lib/PVE/Storage/Custom/NetAppONTAP/ISCSI.pm lib/PVE/Storage/Custom/NetAppONTAP/Multipath.pm 2>/dev/null)
-ALARM_COUNT=$(grep -c 'alarm(5)' lib/PVE/Storage/Custom/NetAppONTAP/ISCSI.pm lib/PVE/Storage/Custom/NetAppONTAP/Multipath.pm 2>/dev/null)
-echo "glob calls: $GLOB_COUNT, alarm wraps: $ALARM_COUNT"
-# Expected: alarm count >= glob count
+# 逐一檢查：每個 glob 前 3 行內必須有 alarm(5)。
+#（0.2.32 換掉。舊的檢查拿 glob 數量跟 alarm 數量比，在正確的程式上也會失敗——
+# Multipath.pm 有兩個 glob 共用「一個」alarm；而且 `grep -c` 帶兩個檔案時輸出的是
+# 「檔名:數量」兩行，不是可以比較的數字。）
+for f in lib/PVE/Storage/Custom/NetAppONTAP/ISCSI.pm lib/PVE/Storage/Custom/NetAppONTAP/Multipath.pm; do
+  awk -v F="$f" '/alarm\(5\)/ { a = NR }
+    /glob.*dev.disk/ { if (a && NR - a <= 3) ok++; else { bad++; print F ":" NR ": glob without alarm(5)" } }
+    END { printf "%s: %d wrapped, %d unwrapped\n", F, ok, bad + 0 }' "$f"
+done
+# 預期：ISCSI.pm: 2 wrapped, 0 unwrapped
+#       Multipath.pm: 3 wrapped, 0 unwrapped
 ```
 
 ---
@@ -2705,6 +2720,104 @@ Proxmox VE 主版本變更時，請重新查證這張表。
 
 ---
 
+## 38. status() 路徑的健康檢查：不再每次輪詢都查、控制器重開時不誤報（0.2.32）
+
+兩項都是 2026-11-02 一位客戶的 FAS 更新 ONTAP 韌體後發現的。
+
+1. `_check_lif_redundancy` 與 `_check_aggregate_capacity` 在 `status()` 裡執行，也就是每台節點約每 10 秒一次，而它們只有在**發現問題**時才寫入冷卻記號。系統正常時，兩者每次輪詢都會查 ONTAP——每項檢查、每次輪詢、每台節點多一個 REST 呼叫，對象正是 v0.2.21 時 mgwd 被輪詢壓垮的那台 FAS。
+2. LIF 檢查只憑一次查詢結果就發警告。其中一台控制器重開期間，ONTAP 只回傳還活著那台的 LIF，客戶正確的配置（4 個 LIF，每台控制器 2 個，已用 `network interface show` 確認）被報成 `SVM has 2 iSCSI LIFs but all share home_node`。這項檢查之所以剛好在那 10 分鐘內執行，原因就是第 1 點。
+
+修正後的行為：
+
+| 檢查 | 狀態檔 | 頻率 |
+|---|---|---|
+| LIF 冗餘 | `<storeid>-lif-check`（mtime = 上次查詢時間）、`<storeid>-lif-suspect`（上次結果有問題） | 每 24 小時一次；查到有問題時 1 小時後再查，**仍有問題才警告**；查到正常即清除 suspect 狀態；查詢失敗不改變任何狀態 |
+| Aggregate 容量 | `<storeid>-aggr-check`（mtime = 上次查詢時間） | 不論結果，每小時一次；>=90% 發 WARNING，>=95% 發 CRITICAL |
+
+兩者都在呼叫 ONTAP **之前**寫入記號。舊的 `-lif-warn`／`-aggr-warn` 檔不再被讀取；它們在 tmpfs 上，下次開機就會消失。
+
+### 38.1 單元測試（不需要 ONTAP）
+
+```bash
+prove tests/health_checks.t
+# 預期：All tests successful. Tests=49
+```
+
+涵蓋：正常的 SVM 每 24 小時只查一次；客戶的情境（一次看到 2 個 LIF 在同一台、1 小時後是 2+2）不發警告；真正的 2 個 LIF 在同一台、以及只有 1 個 LIF，都在第二次確認後警告，訊息帶有「Seen on two checks at least 60 minutes apart」；警告後不會每小時重複；查詢失敗既不警告、也不會每次輪詢重試，且不會清掉 suspect 狀態；FC 完全不查詢；aggregate 在 50% 時每小時只查一次、92% 發 WARNING、96% 發 CRITICAL、沒設 `ontap-aggregate` 時略過。時間以把檔案 mtime 往回調來模擬，完全不需要 sleep。
+
+**反向對照**——同一個測試檔對 0.2.31 的程式碼必須失敗：
+
+```bash
+D=$(mktemp -d); git -C github archive 0.2.31-1 lib | tar -x -C $D
+mkdir $D/tests && cp tests/health_checks.t $D/tests/
+(cd $D && perl tests/health_checks.t 2>/dev/null | grep -c '^not ok')
+# 預期：21（包含 #8/#9：客戶那則誤報；#4/#37：每次輪詢都查）
+rm -rf $D
+```
+
+### 38.2 Taint mode
+
+`pvestatd` 不是 `-T`，但 `pvedaemon` 也會走到 `status()`。兩項檢查都用 storage ID 組檔名：
+
+```bash
+D=$(mktemp -d); perl -T -Ilib -e '
+package A; sub new{bless{},shift}
+sub iscsi_get_lifs_with_home_node{[{home_node=>"n1"},{home_node=>"n1"}]}
+sub aggregate_get{{space=>{block_storage=>{size=>100,used=>50}}}}
+package main; use PVE::Storage::Custom::NetAppONTAPPlugin;
+no warnings qw(redefine once);
+*PVE::Storage::Custom::NetAppONTAPPlugin::_health_state_dir = sub { $ARGV[1] =~ /^(.*)$/; $1 };
+PVE::Storage::Custom::NetAppONTAPPlugin::_check_lif_redundancy(A->new, $ARGV[0], {});
+PVE::Storage::Custom::NetAppONTAPPlugin::_check_aggregate_capacity(A->new, $ARGV[0], {"ontap-aggregate"=>"a"});
+print "taint ok\n";' netapp1 $D; ls $D; rm -rf $D
+# 預期：taint ok
+#       netapp1-aggr-check  netapp1-lif-check  netapp1-lif-suspect
+```
+
+### 38.3 實機、真 ONTAP（pvestatd）
+
+模擬器只有一台控制器，它的 LIF 配置確實有問題——正好可以端到端觀察確認延遲。
+
+```bash
+S=netapp1; R=/var/run/pve-storage-netapp
+systemctl restart pvestatd          # 不要用 reload，見 v0.2.22
+rm -f "${R:?}"/"${S:?}"-lif-check "${R:?}"/"${S:?}"-lif-suspect "${R:?}"/"${S:?}"-aggr-check
+sleep 30
+ls $R/ | grep -E "^$S-(lif|aggr)-(check|suspect)\$"
+# 預期：netapp1-aggr-check  netapp1-lif-check  netapp1-lif-suspect
+journalctl -t pve-storage-netapp --since "-1min" | grep -c 'LIF'
+# 預期：0（第一次查到有問題「不」回報）
+
+# 之後的輪詢不得更動記號（修正前：每項檢查每次輪詢一個 REST 呼叫）
+a=$(stat -c %Y $R/$S-lif-check $R/$S-aggr-check); sleep 60
+b=$(stat -c %Y $R/$S-lif-check $R/$S-aggr-check); [ "$a" = "$b" ] && echo STABLE
+# 預期：STABLE
+
+# 把時間快轉 1 小時，不用真的等
+touch -d '-61 min' $R/$S-lif-check $R/$S-lif-suspect
+sleep 30
+journalctl -t pve-storage-netapp --since "-1min" | grep 'LIF'
+# 預期："... SVM has 1 iSCSI LIF ..." 或 "... all share home_node ..."
+#       結尾為 "(Seen on two checks at least 60 minutes apart.)"
+ls $R/$S-lif-suspect 2>/dev/null || echo cleared
+# 預期：cleared
+```
+
+在兩台控制器的系統上照同樣步驟執行，預期完全**沒有**警告，也沒有 `-lif-suspect` 檔。控制器重開的情境本身只由 38.1 涵蓋：實驗室沒有可以接管的 HA pair。
+
+### 38.4 靜態守門
+
+```bash
+S=lib/PVE/Storage/Custom/NetAppONTAPPlugin.pm
+grep -cF -- '-lif-warn'  $S      # 預期：0（舊的「只在警告時寫入」記號已移除）
+grep -cF -- '-aggr-warn' $S      # 預期：0
+grep -cF -- '-lif-suspect' $S    # 預期：1
+grep -cF 'Seen on two checks' $S # 預期：2（兩則 LIF 訊息）
+# 兩項檢查「先寫記號、再呼叫 ONTAP」由 tests/health_checks.t 比較位移來斷言。
+```
+
+---
+
 ## 清除
 
 ```bash
@@ -2730,6 +2843,28 @@ pvesm list $STORAGE
 ## 發佈測試結果
 
 每次發佈前都必須通過上述所有測試。結果記錄如下。
+
+### v0.2.32-1 status() 路徑的健康檢查（2026-11-02）
+
+**狀態：所有測試 PASS**。環境：Proxmox VE 9.2（pve-manager 9.2.10）／libpve-storage-perl 9.1.8（APIVER 15）；ONTAP 模擬器於 2026-11-02 重建，改用 DHCP 範圍外的新位址，NetApp Release 9.16.1P1，SVM svm1，單一控制器。
+
+| 測試套件 | 結果 |
+|---------|------|
+| `make test` | 6/6 PASS |
+| `tests/audit_fixes.t` | 264/264 PASS |
+| `tests/status_timeout.t`／`stale_sd_reaper.t`／`activate_budget.t` | 20/20／20/20／8/8 PASS |
+| `tests/health_checks.t`（新增） | 49/49 PASS；**對 0.2.31 失敗 21 項**（反向對照） |
+| `tests/sim_functional.pl`（真實 ONTAP） | 13/13 PASS |
+| `tests/sim_snapshot_safety.pl`（真實 ONTAP） | 34/34 PASS |
+| `tests/cleanup_load.pl`（真實 ONTAP） | 6/6 PASS |
+| `tests/sim_export_import.pl`（真實 ONTAP） | 8/8 PASS |
+| **單元／功能** | **361/361・61/61** |
+
+第 38 節照原文執行：38.1、38.2、38.4 兩種語言版本的輸出都與預期值一致。**38.3 以 `pvestatd` 端到端執行**（裝上開發版程式碼、重啟 `pvestatd`、PID 已改變）：單控制器模擬器第一次回傳有問題的結果時，建立了 `netapp1-lif-suspect` 且沒有任何記錄；輪詢 60 秒期間兩個檢查記號都沒有變動；把記號往回調 61 分鐘後，下一次輪詢記錄了 `... 2 iSCSI LIFs but all share home_node 'ontap-sim-01' ... (Seen on two checks at least 60 minutes apart.)`，並清除了 suspect 狀態。
+
+靜態守門 19.1 與 21 照原文重跑。其中四項本身有誤，已在本版修正（都沒有掩蓋程式缺陷——每個位置都已人工確認）：21.4 拿兩個總數比較，在正確的程式上也會失敗；19.1.4／19.1.5 使用 `**/*.pm`，漏掉了 `NetAppONTAPPlugin.pm`；19.1.2 預期 1 筆，實際有 7 個安全的位置。
+
+三支寫死管理位址的功能測試腳本已改指向重建後模擬器的新位址；`netapp1`（密碼只存在 `/etc/pve/priv`）在模擬器重建後未經任何人工操作即通過認證，與 0.2.30 時相同。
 
 ### v0.2.30-1 alloc_image 拒絕無法辨識的名稱（2026-08-12）
 

@@ -1,3 +1,26 @@
+jt-pve-storage-netapp (0.2.32-1) stable; urgency=medium
+
+  * Status-path health checks: two defects found on a customer FAS after an
+    ONTAP firmware update. No data-path change.
+  * LIF redundancy warning fired on a correct layout during a controller reboot
+    - while one controller rebooted, ONTAP answered with only the surviving
+      node's LIFs, and a correct 2+2 layout was reported as "2 iSCSI LIFs but
+      all share home_node". A bad answer is now re-checked an hour later and
+      reported only if still bad; the message says so.
+  * LIF and aggregate checks queried ONTAP on every poll on a healthy system
+    - both stamped their cooldown only when they found a problem, so the
+      cooldown never engaged while everything was fine: one REST call per
+      check, per ~10s status() poll, per node. Both now stamp the check time
+      BEFORE querying, whatever the result (LIF daily, aggregate hourly).
+  * volume_has_feature: corrected a comment that claimed clone_image splits
+    the FlexClone. It never did; comment only.
+  * Tests: new tests/health_checks.t (49; fails 21 against 0.2.31), units
+    361/361, functional against real ONTAP 61/61, TESTING.md Section 38.
+    Static guards 19.1.2/19.1.4/19.1.5/21.4 corrected (wrong expectations,
+    and a `**` glob that skipped the main module).
+
+ -- Jason Cheng <jason@jason.tools>  Mon, 02 Nov 2026 22:00:00 +0800
+
 jt-pve-storage-netapp (0.2.31-1) stable; urgency=medium
 
   * FC: two defects ported from jt-pve-storage-dellemc, which has run FC

@@ -1865,7 +1865,7 @@ sub _record_status_success {
 }
 
 # Check aggregate capacity and emit syslog WARNING if approaching full.
-# Cooldown: 1 hour per storage to avoid log flooding.
+# Runs at most once an hour per storage, whatever the result.
 # Thresholds: 90% WARNING, 95% ERROR.
 sub _check_aggregate_capacity {
     my ($api, $storeid, $scfg) = @_;
@@ -1873,9 +1873,15 @@ sub _check_aggregate_capacity {
     return unless $aggr_name;
 
     my $dir = _health_state_dir();
-    my $flag = "$dir/" . _storeid_filename_component($storeid) . "-aggr-warn";
+    my $flag = "$dir/" . _storeid_filename_component($storeid) . "-aggr-check";
     my $last = (stat($flag))[9] // 0;
-    return if (time() - $last) < 3600;  # 1 hour cooldown
+    return if (time() - $last) < 3600;  # 1 hour between checks
+
+    # Stamp BEFORE querying and regardless of the outcome. Until 0.2.32 the stamp
+    # was written only when the aggregate was >= 90%, so on a healthy aggregate
+    # this ran on every ~10s status() poll on every node -- one REST call per
+    # poll that only ever answered "fine" (the v0.2.21 N+1 lesson again).
+    if (open(my $fh, '>', $flag)) { close($fh); }
 
     my $aggr = eval { $api->aggregate_get($aggr_name); };
     return unless $aggr && $aggr->{space} && $aggr->{space}{block_storage};
@@ -1886,9 +1892,6 @@ sub _check_aggregate_capacity {
 
     my $pct = int($used * 100 / $total);
     return if $pct < 90;
-
-    # Touch flag file to record warning
-    if (open(my $fh, '>', $flag)) { close($fh); }
 
     my $level = $pct >= 95 ? "err" : "warning";
     my $level_text = $pct >= 95 ? "CRITICAL" : "WARNING";
@@ -1997,16 +2000,41 @@ sub _check_foreign_cluster_namespace {
     };
 }
 
+# iSCSI LIF redundancy: warn when the SVM has fewer than 2 iSCSI LIFs, or when
+# they all share one home node (SAN LIFs do not move during takeover).
+#
+# This judges CONFIGURATION, so a single observation is not enough to warn on.
+# During a controller reboot -- every ONTAP upgrade or firmware update -- ONTAP
+# can answer with only the surviving node's LIFs, and a correctly built 2+2
+# layout then looks like "2 LIFs on one node" (customer, 2026-11-02). A bad
+# result is therefore re-checked $LIF_CONFIRM_SECS later and reported only if
+# it is still bad; a node reboot is long over by then.
+#
+# The check stamp is written before querying, whatever the result: until 0.2.32
+# it was written only on a problem, so a healthy SVM was queried on every ~10s
+# status() poll on every node -- which is also why it caught the upgrade window.
+my $LIF_CHECK_SECS   = 86400;  # normal interval, and after a warning
+my $LIF_CONFIRM_SECS = 3600;   # re-check delay after a bad result
+
 sub _check_lif_redundancy {
     my ($api, $storeid, $scfg) = @_;
     my $proto = $scfg->{'ontap-protocol'} // 'iscsi';
     return unless $proto eq 'iscsi';  # Only check iSCSI (FC handled by SAN switch)
 
     my $dir = _health_state_dir();
-    my $flag = "$dir/" . _storeid_filename_component($storeid) . "-lif-warn";
-    my $last = (stat($flag))[9] // 0;
-    return if (time() - $last) < 86400;  # 24 hour cooldown
+    my $base = "$dir/" . _storeid_filename_component($storeid);
+    my $stamp   = "$base-lif-check";    # mtime: last time ONTAP was asked
+    my $suspect = "$base-lif-suspect";  # exists: the last answer was bad; mtime: since when
 
+    my $now = time();
+    my $last = (stat($stamp))[9] // 0;
+    my $interval = -e $suspect ? $LIF_CONFIRM_SECS : $LIF_CHECK_SECS;
+    return if ($now - $last) < $interval;
+
+    if (open(my $fh, '>', $stamp)) { close($fh); }
+
+    # A failed query tells us nothing: keep whatever state we had and try again
+    # at the next interval.
     my $lifs = eval { $api->iscsi_get_lifs_with_home_node(); };
     return unless $lifs && ref($lifs) eq 'ARRAY';
 
@@ -2018,17 +2046,30 @@ sub _check_lif_redundancy {
     my $node_count = scalar(keys %home_nodes);
 
     # Healthy: 2+ LIFs distributed across 2+ home_nodes
-    return if $count >= 2 && $node_count >= 2;
+    if ($count >= 2 && $node_count >= 2) {
+        unlink $suspect;
+        return;
+    }
 
-    if (open(my $fh, '>', $flag)) { close($fh); }
+    # First bad answer: could be a controller mid-reboot. Ask again later.
+    if (!-e $suspect) {
+        if (open(my $fh, '>', $suspect)) { close($fh); }
+        return;
+    }
+    my $since = (stat($suspect))[9] // $now;
+    return if ($now - $since) < $LIF_CONFIRM_SECS;
+
+    # Confirmed. Back to the daily cadence, which re-confirms before warning again.
+    unlink $suspect;
 
     my $msg;
     if ($count < 2) {
         $msg = sprintf(
             "WARNING: Storage '%s' SVM has only %d iSCSI LIF -- no path redundancy. " .
             "Recommend at least 2 LIFs on different controllers for HA. " .
-            "Note: SAN LIFs do not auto-migrate during takeover.",
-            $storeid, $count);
+            "Note: SAN LIFs do not auto-migrate during takeover. " .
+            "(Seen on two checks at least %d minutes apart.)",
+            $storeid, $count, $LIF_CONFIRM_SECS / 60);
     } else {
         # 2+ LIFs but all on same home_node
         my @nodes = keys %home_nodes;
@@ -2036,8 +2077,9 @@ sub _check_lif_redundancy {
             "WARNING: Storage '%s' SVM has %d iSCSI LIFs but all share home_node '%s'. " .
             "A single controller failure will take all LIFs offline. " .
             "SAN LIFs do not auto-migrate during takeover. " .
-            "Distribute LIFs across both controllers for HA.",
-            $storeid, $count, $nodes[0]);
+            "Distribute LIFs across both controllers for HA. " .
+            "(Seen on two checks at least %d minutes apart.)",
+            $storeid, $count, $nodes[0], $LIF_CONFIRM_SECS / 60);
     }
 
     eval {
@@ -4209,9 +4251,17 @@ sub volume_snapshot_list {
 sub volume_has_feature {
     my ($class, $scfg, $feature, $storeid, $volname, $snapname, $running, $opts) = @_;
 
-    # For clone feature, we support FlexClone for all cases
-    # When cloning from snapshot, clone_image does FlexClone + Split (independent volume)
-    # When cloning from template, clone_image does FlexClone only (linked clone)
+    # 'clone' is the LINKED clone path (PVE::Storage::vdisk_clone). Supported for
+    # every case -- from a snapshot, from a template's '__pve_base__', or from the
+    # current volume -- because clone_image() answers all three with one
+    # volume_clone.
+    #
+    # It does NOT split: the result stays a space-efficient FlexClone and KEEPS
+    # ITS PARENT SNAPSHOT PINNED for as long as the clone exists, so that snapshot
+    # cannot be deleted (verified on real ONTAP, docs/TESTING.md 31.6). Splitting
+    # here would be wrong -- it copies the clone's whole delta and turns
+    # `qm destroy` of a linked clone into a minutes-to-hours operation. Split
+    # belongs only to the read-only temp clones in _remove_temp_clone().
     if ($feature eq 'clone') {
         return 1;  # Always allow - we handle all clone scenarios via FlexClone
     }

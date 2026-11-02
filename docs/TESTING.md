@@ -431,19 +431,29 @@ grep -n 'volume_delete' lib/PVE/Storage/Custom/NetAppONTAPPlugin.pm
 # 19.1.2 No basename() near /sys/block/ access
 grep -n 'basename' lib/PVE/Storage/Custom/NetAppONTAP/Multipath.pm | \
     grep -v '_resolve_block_device_name'
-# Expected: only one match in get_scsi_devices_by_serial (uses /sys/block/sd*
-# names directly which is safe).
+# Expected (0.2.32): the `use File::Basename` line plus these sites, all safe --
+#   _resolve_block_device_name  (the resolver itself, after readlink)
+#   multipath_flush, cleanup_lun_devices  (map NAME handed to multipath/dmsetup)
+#   get_scsi_devices_by_serial  (by-id link name)
+#   remove_scsi_device, rescan_scsi_device  (take /dev/sdX, already a kernel name)
+#   plus one comment line in is_device_in_use (the CRITICAL note)
+# A NEW site must be checked by hand: does it reach /sys/block/<name>/ with a
+# name that could come from /dev/mapper/<wwid>? (The expected value said "one
+# match" for many releases while the real count grew -- re-check, don't count.)
 
 # 19.1.3 get_multipath_wwid removed
 grep -n 'get_multipath_wwid' lib/PVE/Storage/Custom/NetAppONTAP/Multipath.pm
 # Expected: zero matches (function deleted in v0.2.4)
 
 # 19.1.4 No bare system() calls (anti-hang)
-grep -nE '(^|[^_a-z])system\s*\(' lib/PVE/Storage/Custom/**/*.pm
+# (Both directories are listed explicitly: bash without globstar expands
+# Custom/**/*.pm to NetAppONTAP/*.pm only, which skipped NetAppONTAPPlugin.pm --
+# the largest module -- until 0.2.32.)
+grep -nE '(^|[^_a-z])system\s*\(' lib/PVE/Storage/Custom/*.pm lib/PVE/Storage/Custom/NetAppONTAP/*.pm
 # Expected: zero matches (all replaced with run_command or _run_cmd)
 
 # 19.1.5 No bare open() to /sys/
-grep -n "open.*'>'.*'/sys/" lib/PVE/Storage/Custom/**/*.pm
+grep -n "open.*'>'.*'/sys/" lib/PVE/Storage/Custom/*.pm lib/PVE/Storage/Custom/NetAppONTAP/*.pm
 # Expected: zero matches (all use sysfs_write_with_timeout)
 ```
 
@@ -1335,11 +1345,17 @@ grep -rn 'glob.*dev.disk' lib/PVE/Storage/Custom/NetAppONTAP/*.pm
 # For each: check that alarm(5) appears within 3 lines before it
 # (Manual review -- verify each glob is inside an eval { alarm(5); ... alarm(0); } block)
 
-# Quick count check
-GLOB_COUNT=$(grep -c 'glob.*dev.disk' lib/PVE/Storage/Custom/NetAppONTAP/ISCSI.pm lib/PVE/Storage/Custom/NetAppONTAP/Multipath.pm 2>/dev/null)
-ALARM_COUNT=$(grep -c 'alarm(5)' lib/PVE/Storage/Custom/NetAppONTAP/ISCSI.pm lib/PVE/Storage/Custom/NetAppONTAP/Multipath.pm 2>/dev/null)
-echo "glob calls: $GLOB_COUNT, alarm wraps: $ALARM_COUNT"
-# Expected: alarm count >= glob count
+# Per-glob check: each glob must have alarm(5) within the 3 lines before it.
+# (Replaced in 0.2.32. The old check compared a glob count with an alarm count,
+# which fails on correct code -- Multipath.pm runs two globs under ONE alarm --
+# and `grep -c` over two files prints "file:N" lines, not a number to compare.)
+for f in lib/PVE/Storage/Custom/NetAppONTAP/ISCSI.pm lib/PVE/Storage/Custom/NetAppONTAP/Multipath.pm; do
+  awk -v F="$f" '/alarm\(5\)/ { a = NR }
+    /glob.*dev.disk/ { if (a && NR - a <= 3) ok++; else { bad++; print F ":" NR ": glob without alarm(5)" } }
+    END { printf "%s: %d wrapped, %d unwrapped\n", F, ok, bad + 0 }' "$f"
+done
+# Expected: ISCSI.pm: 2 wrapped, 0 unwrapped
+#           Multipath.pm: 3 wrapped, 0 unwrapped
 ```
 
 ---
@@ -1389,58 +1405,23 @@ journalctl -t pve-storage-netapp --since "3 minutes ago" -p info | grep "reachab
 # Expected: "Storage 'netapp1' reachable again after Ns outage (failure count: N)"
 ```
 
-### 22.3 LIF redundancy warning (unit test with mock API)
+### 22.3 LIF redundancy warning
 
-Verifies `_check_lif_redundancy` warns when SVM has fewer than 2 iSCSI LIFs.
+**Superseded by Section 38 (0.2.32).** The commands that stood here mocked
+`iscsi_get_portals()`, which `_check_lif_redundancy` stopped calling in v0.2.11
+when it moved to `iscsi_get_lifs_with_home_node()`. The mock call died inside the
+check's `eval`, the check returned silently, and the "Expected" warning could never
+appear -- every result recorded for 22.3 after v0.2.11 was not produced by these
+commands. They also predate the 0.2.32 confirmation delay, so even a corrected
+mock would now stay quiet on the first call. Run `prove tests/health_checks.t`
+(Section 38.1) instead.
 
-```bash
-# Clear cooldown flag
-rm -f /var/run/pve-storage-netapp/test-lif-warn
+### 22.4 Aggregate capacity warning
 
-perl -I/usr/share/perl5 -e '
-package MockAPI;
-sub new { bless {}, shift }
-sub iscsi_get_portals { return [{target=>"x", address=>"1.2.3.4"}]; }  # 1 LIF only
-
-package main;
-use PVE::Storage::Custom::NetAppONTAPPlugin;
-my $api = MockAPI->new;
-my $scfg = { "ontap-protocol" => "iscsi" };
-PVE::Storage::Custom::NetAppONTAPPlugin::_check_lif_redundancy($api, "test", $scfg);
-'
-
-# Check syslog
-journalctl -t pve-storage-netapp --since "30 seconds ago" -p warning
-# Expected: "WARNING: Storage 'test' SVM has only 1 iSCSI LIF -- no path redundancy"
-```
-
-### 22.4 Aggregate capacity warning (unit test)
-
-Verifies `_check_aggregate_capacity` warns at >=90% and emits CRITICAL at >=95%.
-
-```bash
-# Clear cooldown
-rm -f /var/run/pve-storage-netapp/test-aggr-warn
-
-# Test 95% (should be CRITICAL/err)
-perl -I/usr/share/perl5 -e '
-package MockAPI;
-sub new { bless {}, shift }
-sub aggregate_get {
-    return { space => { block_storage => { size => 100_000_000_000, used => 95_000_000_000 } } };
-}
-
-package main;
-use PVE::Storage::Custom::NetAppONTAPPlugin;
-my $api = MockAPI->new;
-my $scfg = { "ontap-aggregate" => "aggr1" };
-PVE::Storage::Custom::NetAppONTAPPlugin::_check_aggregate_capacity($api, "test", $scfg);
-'
-
-# Check syslog
-journalctl -t pve-storage-netapp --since "30 seconds ago" -p err
-# Expected: "CRITICAL: Storage 'test' aggregate 'aggr1' is at 95% capacity"
-```
+**Superseded by Section 38 (0.2.32).** The cooldown file is now `<storeid>-aggr-check`
+(it records the last check, not the last warning), so the `rm -f ...-aggr-warn`
+step no longer resets anything. The 90% WARNING and 95% CRITICAL thresholds are
+asserted in `tests/health_checks.t`.
 
 ### 22.5 In-flight operation detection (postinst)
 
@@ -3172,6 +3153,124 @@ Re-check this table when the Proxmox VE major version changes.
 
 ---
 
+## 38. Status-path health checks: no per-poll queries, no warning on a controller reboot (0.2.32)
+
+Both found on a customer FAS on 2026-11-02, after an ONTAP firmware update.
+
+1. `_check_lif_redundancy` and `_check_aggregate_capacity` run inside `status()`,
+   i.e. every ~10s on every node, and stamped their cooldown only when they **found**
+   a problem. On a healthy system each therefore queried ONTAP on every poll -- one
+   extra REST call per check, per poll, per node, against the same FAS whose mgwd
+   collapsed under polling load in v0.2.21.
+2. The LIF check warned on a single observation. While one controller rebooted,
+   ONTAP answered with only the surviving node's LIFs, and the customer's correct
+   layout (4 LIFs, 2 per controller, verified with `network interface show`) was
+   reported as `SVM has 2 iSCSI LIFs but all share home_node`. Defect 1 is why the
+   check happened to run inside that 10-minute window at all.
+
+Behaviour now:
+
+| Check | State file(s) | Cadence |
+|---|---|---|
+| LIF redundancy | `<storeid>-lif-check` (mtime = last query), `<storeid>-lif-suspect` (last answer was bad) | once per 24h; after a bad answer, re-checked 1h later and warned **only if still bad**; a good answer clears the suspect state; a failed query changes nothing |
+| Aggregate capacity | `<storeid>-aggr-check` (mtime = last query) | once per hour, whatever the result; warns at >=90%, CRITICAL at >=95% |
+
+Both stamps are written **before** the ONTAP call. The old `-lif-warn` / `-aggr-warn`
+files are no longer read; they live on tmpfs and disappear at the next reboot.
+
+### 38.1 Unit tests (no ONTAP needed)
+
+```bash
+prove tests/health_checks.t
+# Expected: All tests successful. Tests=49
+```
+
+Covers: healthy SVM queried once per 24h; the customer's sequence (2 LIFs on one node
+seen once, 2+2 an hour later) produces no warning; a genuine 2-on-one-node and a single
+LIF are both warned once the second check agrees, with "Seen on two checks at least 60
+minutes apart" in the message; no hourly repeat after a warning; a failed query neither
+warns nor is retried every poll, and does not clear a suspect state; FC is never queried;
+aggregate queried once per hour at 50%, warns at 92%, CRITICAL at 96%, skipped without
+`ontap-aggregate`. Time is simulated by moving file mtimes back, so nothing sleeps.
+
+**Negative control** -- the same test file against the 0.2.31 code must fail:
+
+```bash
+D=$(mktemp -d); git -C github archive 0.2.31-1 lib | tar -x -C $D
+mkdir $D/tests && cp tests/health_checks.t $D/tests/
+(cd $D && perl tests/health_checks.t 2>/dev/null | grep -c '^not ok')
+# Expected: 21   (includes #8/#9: the customer's false warning, and #4/#37: per-poll queries)
+rm -rf $D
+```
+
+### 38.2 Taint mode
+
+`pvestatd` is not `-T`, but `pvedaemon` reaches `status()` too. Both checks build their
+filenames from the storage ID:
+
+```bash
+D=$(mktemp -d); perl -T -Ilib -e '
+package A; sub new{bless{},shift}
+sub iscsi_get_lifs_with_home_node{[{home_node=>"n1"},{home_node=>"n1"}]}
+sub aggregate_get{{space=>{block_storage=>{size=>100,used=>50}}}}
+package main; use PVE::Storage::Custom::NetAppONTAPPlugin;
+no warnings qw(redefine once);
+*PVE::Storage::Custom::NetAppONTAPPlugin::_health_state_dir = sub { $ARGV[1] =~ /^(.*)$/; $1 };
+PVE::Storage::Custom::NetAppONTAPPlugin::_check_lif_redundancy(A->new, $ARGV[0], {});
+PVE::Storage::Custom::NetAppONTAPPlugin::_check_aggregate_capacity(A->new, $ARGV[0], {"ontap-aggregate"=>"a"});
+print "taint ok\n";' netapp1 $D; ls $D; rm -rf $D
+# Expected: taint ok
+#           netapp1-aggr-check  netapp1-lif-check  netapp1-lif-suspect
+```
+
+### 38.3 Real node, real ONTAP (pvestatd)
+
+The simulator has ONE controller, so its LIF layout is genuinely bad -- which makes it
+the right place to watch the confirmation delay end to end.
+
+```bash
+S=netapp1; R=/var/run/pve-storage-netapp
+systemctl restart pvestatd          # NOT reload -- see v0.2.22
+rm -f "${R:?}"/"${S:?}"-lif-check "${R:?}"/"${S:?}"-lif-suspect "${R:?}"/"${S:?}"-aggr-check
+sleep 30
+ls $R/ | grep -E "^$S-(lif|aggr)-(check|suspect)\$"
+# Expected: netapp1-aggr-check  netapp1-lif-check  netapp1-lif-suspect
+journalctl -t pve-storage-netapp --since "-1min" | grep -c 'LIF'
+# Expected: 0   (first bad answer is NOT reported)
+
+# The stamps must NOT move on later polls (was: one REST call per poll per check)
+a=$(stat -c %Y $R/$S-lif-check $R/$S-aggr-check); sleep 60
+b=$(stat -c %Y $R/$S-lif-check $R/$S-aggr-check); [ "$a" = "$b" ] && echo STABLE
+# Expected: STABLE
+
+# Fast-forward the hour instead of waiting it out
+touch -d '-61 min' $R/$S-lif-check $R/$S-lif-suspect
+sleep 30
+journalctl -t pve-storage-netapp --since "-1min" | grep 'LIF'
+# Expected: "... SVM has 1 iSCSI LIF ..." or "... all share home_node ..."
+#           ending "(Seen on two checks at least 60 minutes apart.)"
+ls $R/$S-lif-suspect 2>/dev/null || echo cleared
+# Expected: cleared
+```
+
+On a 2-controller system run the same steps but expect **no** warning at all and no
+`-lif-suspect` file. The controller-reboot case itself is covered by 38.1 only: the lab
+has no HA pair to take over.
+
+### 38.4 Static guards
+
+```bash
+S=lib/PVE/Storage/Custom/NetAppONTAPPlugin.pm
+grep -cF -- '-lif-warn'  $S      # Expected: 0  (old warn-only stamp gone)
+grep -cF -- '-aggr-warn' $S      # Expected: 0
+grep -cF -- '-lif-suspect' $S    # Expected: 1
+grep -cF 'Seen on two checks' $S # Expected: 2  (both LIF messages)
+# "stamp before the ONTAP call" in both checks is asserted in tests/health_checks.t
+# by comparing offsets.
+```
+
+---
+
 ## Cleanup
 
 ```bash
@@ -3197,6 +3296,28 @@ pvesm list $STORAGE
 ## Release Test Results
 
 Each release must pass all tests above before publishing. Results are recorded below.
+
+### v0.2.32-1 Status-path health checks (2026-11-02)
+
+**Status: all tests PASS.** Environment: Proxmox VE 9.2 (pve-manager 9.2.10) / libpve-storage-perl 9.1.8 (APIVER 15); ONTAP simulator rebuilt 2026-11-02 on new addresses outside the DHCP pool, NetApp Release 9.16.1P1, SVM svm1, single controller.
+
+| Suite | Result |
+|-------|--------|
+| `make test` | 6/6 PASS |
+| `tests/audit_fixes.t` | 264/264 PASS |
+| `tests/status_timeout.t` · `stale_sd_reaper.t` · `activate_budget.t` | 20/20 · 20/20 · 8/8 PASS |
+| `tests/health_checks.t` (new) | 49/49 PASS; **21 fail against 0.2.31** (negative control) |
+| `tests/sim_functional.pl` (real ONTAP) | 13/13 PASS |
+| `tests/sim_snapshot_safety.pl` (real ONTAP) | 34/34 PASS |
+| `tests/cleanup_load.pl` (real ONTAP) | 6/6 PASS |
+| `tests/sim_export_import.pl` (real ONTAP) | 8/8 PASS |
+| **Units / Functional** | **361/361 · 61/61** |
+
+Section 38 run as written: 38.1, 38.2 and 38.4 match their expected values in both languages. **38.3 end to end under `pvestatd`** (dev code installed, `pvestatd` restarted, PID changed): the first bad answer from the 1-controller simulator created `netapp1-lif-suspect` and logged nothing; both check stamps were unchanged across 60s of polling; after moving the stamps back 61 minutes the next poll logged `... 2 iSCSI LIFs but all share home_node 'ontap-sim-01' ... (Seen on two checks at least 60 minutes apart.)` and cleared the suspect state.
+
+Static guards 19.1 and 21 re-run as written. Four were wrong and are corrected in this release (none hid a code defect -- each site was checked by hand): 21.4 compared two totals and failed on correct code; 19.1.4/19.1.5 globbed `**/*.pm`, which skipped `NetAppONTAPPlugin.pm`; 19.1.2 expected one match where there are seven safe sites.
+
+The three functional scripts with a hard-coded management address were pointed at the rebuilt simulator's new one; `netapp1` (password in `/etc/pve/priv` only) authenticated against the rebuilt simulator with no operator action, as in 0.2.30.
 
 ### v0.2.30-1 alloc_image refuses an unrecognised name (2026-08-12)
 

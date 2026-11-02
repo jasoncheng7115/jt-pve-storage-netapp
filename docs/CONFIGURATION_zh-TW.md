@@ -1018,11 +1018,14 @@ pvesm add netappontap storage-dev  --ontap-cluster-name pve-dev ...
 
 單一 iSCSI LIF 是單點故障。**iSCSI / SAN LIF 在 takeover 時不會自動遷移到 partner controller**，只有 NAS LIF 才會自動 failover。若只有一個 iSCSI LIF 且該 controller 故障，所有 I/O 會停止直到 controller 恢復。冗餘必須由「多個 LIF 分散在兩個 controller 上」加上「host 端 multipath (MPIO) 透過 ALUA 切換路徑」來達成。
 
-當外掛偵測到 SVM 的 iSCSI LIF 少於 2 個時，會發出 syslog WARNING（24 小時冷卻）：
+當外掛偵測到 SVM 的 iSCSI LIF 少於 2 個，或全部 LIF 都在同一個 home node 時，會發出 syslog WARNING：
 
 ```
-WARNING: Storage 'netapp1' SVM has only 1 iSCSI LIF -- no path redundancy.
+WARNING: Storage 'netapp1' SVM has only 1 iSCSI LIF -- no path redundancy. ...
+WARNING: Storage 'netapp1' SVM has 2 iSCSI LIFs but all share home_node 'node-01'. ...
 ```
+
+每台節點每 24 小時檢查一次。自 0.2.32 起，查到有問題時會在 1 小時後再查一次，仍有問題才回報；因此 ONTAP 升級或韌體更新期間控制器重開（此時 ONTAP 可能只列出還活著那台的 LIF）不會再觸發這個警告。你看到的警告都已經確認過兩次、間隔至少 1 小時，訊息中也會註明（「Seen on two checks at least 60 minutes apart」）。
 
 ### 建議的 LIF 配置
 

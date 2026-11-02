@@ -2,6 +2,32 @@
 
 All notable changes to the NetApp ONTAP Storage Plugin for Proxmox VE are documented here.
 
+## [0.2.32] - 2026-11-02
+
+Two defects in the health checks that run inside `status()`, found on a customer FAS after an ONTAP firmware update. No change to any data path.
+
+### The LIF redundancy warning fired on a correct layout during a controller reboot
+
+The customer's only plugin message after the update was `SVM has 2 iSCSI LIFs but all share home_node`. `network interface show` on the cluster showed the real layout: 4 iSCSI LIFs, 2 per controller, all up. While one controller rebooted, ONTAP answered with only the surviving node's two LIFs, and the check judged the configuration from that single answer.
+
+A bad answer is now treated as a suspicion: the check asks again an hour later and warns only if the answer is still bad. A controller reboot is long over by then. The warning text now says it was seen on two checks at least 60 minutes apart, so an operator knows it is not a passing state. A real misconfiguration is still reported, one hour later than before.
+
+### Two health checks queried ONTAP on every poll while everything was healthy
+
+`_check_lif_redundancy` and `_check_aggregate_capacity` wrote their cooldown file only when they **found** a problem. On a healthy system the cooldown therefore never engaged, and each check made one REST call on every ~10s `status()` poll on every node. This was the same FAS whose management service collapsed under polling load in v0.2.21. It is also why the LIF check happened to run inside a 10-minute controller reboot at all.
+
+Both now record the check time **before** querying, whatever the result: the LIF check runs once a day per node, the aggregate check once an hour. The rule was already in place for the check added in v0.2.24 and had never been applied back to these two.
+
+### Test plan
+
+`docs/TESTING.md` 22.3 could never produce its expected output: its mock implemented `iscsi_get_portals()`, which the LIF check stopped calling in v0.2.11, so the check died silently inside its `eval`. It is retired in favour of Section 38 and a real unit test.
+
+### Also
+
+- A comment in `volume_has_feature` claimed that cloning from a snapshot splits the FlexClone. It never did: a linked clone keeps its parent snapshot pinned for as long as it exists. Comment only, no behaviour change.
+
+**Testing:** `make test` 6/6, units **361/361** (new `tests/health_checks.t`, 49; it fails 21 against 0.2.31, including the customer's false warning), functional against a real ONTAP **61/61**, and Section 38.3 end to end under `pvestatd` on the single-controller simulator: first bad answer silent, stamps unchanged across polls, warning after the one-hour re-check.
+
 ## [0.2.31] - 2026-08-12
 
 Two FC defects ported from **jt-pve-storage-dellemc**, which has run Fibre Channel against a customer's PowerVault ME4024. **Neither is reachable from this lab** — there is no FC HBA here, so both are fixed by code and asserted by unit tests, and **not exercised against real FC hardware**.

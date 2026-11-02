@@ -1019,11 +1019,18 @@ For production deployments, configure the ONTAP SVM to survive a controller fail
 
 A single iSCSI LIF is a single point of failure. **iSCSI/SAN LIFs do NOT auto-migrate to the partner controller** during a takeover -- only NAS LIFs do. If you have only one iSCSI LIF and the controller hosting it fails, all I/O stops until the controller is brought back. Redundancy MUST come from having multiple LIFs distributed across both controllers, with host-side multipath (MPIO) handling path selection via ALUA.
 
-The plugin emits a syslog WARNING (with 24-hour cooldown) if it detects an SVM with fewer than 2 iSCSI LIFs:
+The plugin emits a syslog WARNING if the SVM has fewer than 2 iSCSI LIFs, or if all of them share one home node:
 
 ```
-WARNING: Storage 'netapp1' SVM has only 1 iSCSI LIF -- no path redundancy.
+WARNING: Storage 'netapp1' SVM has only 1 iSCSI LIF -- no path redundancy. ...
+WARNING: Storage 'netapp1' SVM has 2 iSCSI LIFs but all share home_node 'node-01'. ...
 ```
+
+The check runs once every 24 hours per node. Since 0.2.32 a bad result is re-checked one
+hour later and reported only if it is still bad, so a controller reboot during an ONTAP
+upgrade or firmware update -- when ONTAP may list only the surviving node's LIFs -- no
+longer produces this warning. A warning you do see has been observed twice, at least an
+hour apart, and says so ("Seen on two checks at least 60 minutes apart").
 
 ### Recommended LIF layout
 

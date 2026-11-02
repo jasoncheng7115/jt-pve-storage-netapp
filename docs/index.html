@@ -146,7 +146,7 @@
     <div class="hero__glow"></div>
     <div class="hero__glow-left"></div>
     <div class="hero__content">
-        <div class="hero__badge">v0.2.31 <span class="hero__badge-sep"></span> MIT License</div>
+        <div class="hero__badge">v0.2.32 <span class="hero__badge-sep"></span> MIT License</div>
         <h1 class="hero__title">jt-pve-storage-netapp</h1>
         <p class="hero__project-desc">
             <span class="lang-en">NetApp ONTAP SAN/iSCSI/FC Storage Plugin for Proxmox VE</span>
@@ -541,7 +541,7 @@
                 <span class="lang-en">Install the plugin package</span>
                 <span class="lang-zh">安裝 plugin 套件</span>
             </div>
-            <pre><span class="cmd">dpkg</span> <span class="flag">-i</span> jt-pve-storage-netapp_0.2.31-1_all.deb</pre>
+            <pre><span class="cmd">dpkg</span> <span class="flag">-i</span> jt-pve-storage-netapp_0.2.32-1_all.deb</pre>
             <p>
                 <span class="lang-en">The plugin automatically configures multipath and reloads Proxmox VE services (pvedaemon, pvestatd, pveproxy).</span>
                 <span class="lang-zh">Plugin 會自動設定 multipath 並重新載入 Proxmox VE 服務（pvedaemon、pvestatd、pveproxy）。</span>
@@ -615,7 +615,7 @@
                 <span class="lang-en">Install new package</span>
                 <span class="lang-zh">安裝新套件</span>
             </div>
-            <pre><span class="cmd">dpkg</span> <span class="flag">-i</span> jt-pve-storage-netapp_0.2.31-1_all.deb</pre>
+            <pre><span class="cmd">dpkg</span> <span class="flag">-i</span> jt-pve-storage-netapp_0.2.32-1_all.deb</pre>
         </div>
     </div>
     <div class="step">
@@ -1455,6 +1455,15 @@
         <span class="lang-en">Version history. For full details see <a href="https://github.com/jasoncheng7115/jt-pve-storage-netapp/blob/main/CHANGELOG.md">CHANGELOG.md</a>.</span>
         <span class="lang-zh">版本紀錄。完整內容請參閱 <a href="https://github.com/jasoncheng7115/jt-pve-storage-netapp/blob/main/CHANGELOG_zh-TW.md">CHANGELOG_zh-TW.md</a>。</span>
     </p>
+
+    <div class="changelog-entry">
+        <div class="changelog-version">v0.2.32 <span class="changelog-tag changelog-tag--fix">Fix</span></div>
+        <div class="changelog-date">2026-11-02</div>
+        <div class="changelog-summary">
+            <span class="lang-en"><strong>Two defects in the health checks that run on every storage status poll, found on a customer system after an ONTAP firmware update. No data-path change.</strong> <strong>1.</strong> The iSCSI LIF redundancy warning fired on a correct layout (4 LIFs, 2 per controller) because, while one controller rebooted, ONTAP answered with only the surviving node&#39;s LIFs. A bad answer is now re-checked an hour later and reported only if it is still bad; the warning says it was seen on two checks at least 60 minutes apart. <strong>2.</strong> The LIF and aggregate checks recorded their cooldown only when they found a problem, so on a healthy system each made one ONTAP REST call on every poll on every node. Both now record the check time before querying, whatever the result: LIF once a day, aggregate once an hour.</span>
+            <span class="lang-zh"><strong>每次輪詢 storage 狀態時執行的健康檢查有兩個缺陷，是客戶更新 ONTAP 韌體後發現的。資料路徑沒有變更。</strong><strong>一、</strong>iSCSI LIF 冗餘警告在正確的配置（4 個 LIF、每台控制器 2 個）上誤報：其中一台控制器重開時，ONTAP 只回傳還活著那台的 LIF。現在查到有問題會在 1 小時後再查一次，仍有問題才回報，警告也會註明已在間隔至少 60 分鐘的兩次檢查中都看到。<strong>二、</strong>LIF 與 aggregate 檢查只在發現問題時才記錄冷卻，因此系統正常時，每台節點每次輪詢都會各打一次 ONTAP REST。兩者現在不論結果，都在查詢之前記錄檢查時間：LIF 每天一次，aggregate 每小時一次。</span>
+        </div>
+    </div>
 
     <div class="changelog-entry">
         <div class="changelog-version">v0.2.31 <span class="changelog-tag changelog-tag--fix">Fix</span></div>
